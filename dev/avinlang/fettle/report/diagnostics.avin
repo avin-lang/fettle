@@ -1,0 +1,55 @@
+module dev.avinlang.fettle.report
+
+import dev.avinlang.fettle.syntax.{Diagnostic, Span}
+
+// A diagnostic rendered with an excerpt of its source, `text` being the file its span is in:
+//
+//   error[E0207]: the field `mode` of `file` is a `mode`, but this is a `string`
+//     --> roles/web.fettle:17:12
+//      |
+//   17 |     mode = "0600"
+//      |            ^^^^^^ a string
+//      |
+//   help: a mode is written as an octal literal: `mode = 0o600`
+//
+// Secondary spans in the same file follow with their own excerpt, marked with `-`; one in another
+// file is a note naming its place.
+render(d: Diagnostic, text: string) -> string
+  val out = StringWriter()
+  val level = if d.warning then "warning" else "error"
+  var widest = d.span.start.line
+  for (s, _) in d.secondary
+    if s.file == d.span.file && s.start.line > widest then widest = s.start.line
+  val gutter = " ".repeat(s"$widest".byteLength)
+  out.write(s"$level[${d.code}]: ${d.message}\n")
+  out.write(s"$gutter--> ${d.span.place}\n")
+  out.write(s"$gutter |\n")
+  excerpt(out, text, d.span, '^', d.label, gutter)
+  for (s, label) in d.secondary
+    if s.file == d.span.file
+      excerpt(out, text, s, '-', label, gutter)
+    else
+      out.write(s"$gutter = note: ${s.place}: $label\n")
+  for note in d.notes
+    out.write(s"$gutter = note: $note\n")
+  if !d.help.isEmpty
+    out.write(s"$gutter |\n")
+    out.write(s"help: ${d.help}\n")
+  out.text
+
+// The source line `span` begins on, with a marker under the span's characters on that line.
+private excerpt(out: StringWriter, text: string, span: Span, mark: char, label: string, gutter: string)
+  val lineText = lineAt(text, span.start.line)
+  val number = s"${span.start.line}".padStart(gutter.byteLength)
+  out.write(s"$number | $lineText\n")
+  val width = lineText.count(_ -> true)
+  val from = span.start.column - 1
+  val until = if span.end.line == span.start.line then span.end.column - 1 else width
+  val length = if until > from then until - from else 1
+  val labelText = if label.isEmpty then "" else s" $label"
+  out.write(s"$gutter | ${" ".repeat(from)}${s"$mark".repeat(length)}$labelText\n")
+
+// Line `n` of `text`, counted from 1, without its line end; empty past the last line.
+lineAt(text: string, n: int) -> string
+  val lines = text.split("\n")
+  if 1 <= n <= lines.length then lines(n - 1).stripSuffix("\r") else ""

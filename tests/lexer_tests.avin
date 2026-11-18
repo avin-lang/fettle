@@ -1,0 +1,140 @@
+module tests
+
+import dev.avinlang.fettle.syntax.{Diagnostic, DurationLit, ModeLit, SizeLit, Token, lex}
+
+// The tokens of `text`, shown and joined by spaces, without the `EOF` every lexing ends with.
+toks(text: string) -> string
+  val r = lex("t.fettle", text)
+  r.tokens.filter(t -> t.shown != "EOF").map(t -> t.shown).mkString(" ")
+
+// Each diagnostic of `text` as `line:column code message`.
+errs(text: string) -> string
+  val r = lex("t.fettle", text)
+  r.diagnostics.map(d -> s"${d.span.start.line}:${d.span.start.column} ${d.code} ${d.message}").mkString("; ")
+
+@test("a flat file is words and line ends")
+flat()
+  assertEq(toks("module roles\nval x = 1\n"), "module roles NEWLINE val x = 1 NEWLINE")
+  assertEq(toks("val x = 1"), "val x = 1 NEWLINE")
+  assertEq(toks(""), "")
+  assertEq(toks("\n\n  \n"), "")
+  assertEq(errs("module roles\nval x = 1\n"), "")
+
+@test("a block indented two spaces opens with INDENT and closes with DEDENT")
+blocks()
+  assertEq(toks("role r()\n  package \"nginx\"\n"), "role r ( ) NEWLINE INDENT package \"nginx\" NEWLINE DEDENT")
+  assertEq(toks("a\n  b\n    c\nd\n"), "a NEWLINE INDENT b NEWLINE INDENT c NEWLINE DEDENT DEDENT d NEWLINE")
+  assertEq(toks("a\n  b\n    c\n  d\ne"), "a NEWLINE INDENT b NEWLINE INDENT c NEWLINE DEDENT d NEWLINE DEDENT e NEWLINE")
+
+@test("blank lines and comment lines do not count, wherever they are indented")
+blankLines()
+  assertEq(toks("a\n\n  // note\n      \n  b // trailing\n\n// end\n"), "a NEWLINE INDENT b NEWLINE DEDENT")
+  assertEq(toks("// only a comment"), "")
+
+@test("indentation by other than two spaces a level is an error at the line")
+badIndentation()
+  assertEq(errs("a\n    b\n"), "2:1 E0102 this line is indented 4 spaces past the line above, and a block is indented 2")
+  assertEq(errs("a\n b\n"), "2:1 E0102 this line is indented 1 spaces past the line above, and a block is indented 2")
+  assertEq(errs("a\n  b\n    c\n   d\n"), "4:1 E0103 this line's indentation, 3 spaces, lines up with no enclosing block")
+  assertEq(errs("a\n\tb\n"), "2:1 E0101 indentation uses a tab")
+
+@test("indentation errors are each reported and lexing carries on")
+manyIndentationErrors()
+  assertEq(errs("a\n    b\nc\n   d\ne\n"), "2:1 E0102 this line is indented 4 spaces past the line above, and a block is indented 2; 4:1 E0102 this line is indented 3 spaces past the line above, and a block is indented 2")
+  assertEq(toks("a\n    b\nc\n"), "a NEWLINE INDENT b NEWLINE DEDENT c NEWLINE")
+
+@test("inside brackets a line end is white space")
+brackets()
+  assertEq(toks("val team = [\n  a,\n    b,\n]\nx"), "val team = [ a , b , ] NEWLINE x NEWLINE")
+  assertEq(toks("f(\n  1,\n  2\n)\n"), "f ( 1 , 2 ) NEWLINE")
+  assertEq(errs("f(1, [2)\n"), "1:8 E0106 `)` does not close `[`; 1:2 E0104 `(` is never closed")
+  assertEq(errs("f(1))\n"), "1:5 E0105 `)` closes nothing")
+  assertEq(errs("val x = (1\n"), "1:9 E0104 `(` is never closed")
+
+@test("a deeper line beginning with a dot continues the line above")
+continuation()
+  assertEq(toks("a\n  p = cmd(\"x\")\n    .stdin(\"y\")\nb"), "a NEWLINE INDENT p = cmd ( \"x\" ) . stdin ( \"y\" ) NEWLINE DEDENT b NEWLINE")
+  assertEq(toks("a\n..b"), "a NEWLINE .. b NEWLINE")
+
+@test("operators of two and three characters are one token")
+symbols()
+  assertEq(toks("a -> b == c != d <= e >= f && g || h .. i ..< j"), "a -> b == c != d <= e >= f && g || h .. i ..< j NEWLINE")
+  assertEq(toks("x: List[int]? = none"), "x : List [ int ] ? = none NEWLINE")
+  assertEq(errs("a # b"), "1:3 E0107 `#` cannot appear in a program")
+
+@test("numbers, modes, durations and sizes")
+numbers()
+  assertEq(toks("443 1_000 0o750 0o0 30s 10m 250ms 2h 1d 512MiB 1GiB 3kB 8B"), "443 1000 0o750 0o0 30s 10m 250ms 2h 1d 512MiB 1GiB 3kB 8B NEWLINE")
+  val r = lex("t.fettle", "30s 10m 512MiB 2kB")
+  assertEq(r.tokens.map(t -> t match
+    DurationLit(ms, _, _) -> s"$ms"
+    SizeLit(b, _, _) -> s"$b"
+    _ -> "").filter(s -> !s.isEmpty).mkString(" "), "30000 600000 536870912 2000")
+  val m = lex("t.fettle", "0o644 0o1777777")
+  assertEq(m.tokens.map(t -> t match
+    ModeLit(v, _) -> s"$v"
+    _ -> "").filter(s -> !s.isEmpty).mkString(" "), "420 524287")
+
+@test("a number's mistakes: bad octal digits, unknown units, overflow")
+badNumbers()
+  assertEq(errs("0o78"), "1:1 E0108 `8` is not an octal digit")
+  assertEq(errs("0o"), "1:1 E0108 `0o` needs octal digits after it")
+  assertEq(errs("5x"), "1:1 E0110 `x` is not a unit")
+  assertEq(errs("5Mib"), "1:1 E0110 `Mib` is not a unit")
+  assertEq(errs("9223372036854775807"), "")
+  assertEq(errs("9223372036854775808"), "1:1 E0109 this number is too large")
+  assertEq(errs("9999999999999999d"), "1:1 E0109 the duration `9999999999999999d` is too large")
+  assertEq(errs("99999999999TiB"), "1:1 E0109 the size `99999999999TiB` is too large")
+
+@test("strings decode their escapes")
+strings()
+  assertEq(toks("\"a\\tb\\n\\\\\\\"\\$\""), "\"a\\tb\\n\\\\\\\"\\$\" NEWLINE")
+  assertEq(toks("\"\""), "\"\" NEWLINE")
+  assertEq(toks("\"\\u{e9}\\u{1F600}\""), "\"é\u{1F600}\" NEWLINE")
+  assertEq(toks("\"été — ok\""), "\"été — ok\" NEWLINE")
+  assertEq(errs("\"\\q\""), "1:2 E0112 `\\q` is not an escape")
+  assertEq(errs("\"\\u{110000}\""), "1:2 E0112 this is not a Unicode code point")
+  assertEq(errs("\"\\u{d800}\""), "1:2 E0112 this is not a Unicode code point")
+  assertEq(errs("\"\\u{}\""), "1:2 E0112 this is not a Unicode code point")
+
+@test("an unclosed string is one error at its quote, and the next line still lexes")
+unclosedString()
+  assertEq(errs("val a = \"abc\nval b = 1\n"), "1:9 E0111 this string is not closed on its line")
+  assertEq(toks("val a = \"abc\nval b = 1\n"), "val a = \"abc\" NEWLINE val b = 1 NEWLINE")
+
+@test("interpolation holds the tokens of an expression")
+interpolation()
+  assertEq(toks("\"${tls.path}/${site.domain}.crt\""), "\"${tls . path}/${site . domain}.crt\" NEWLINE")
+  assertEq(toks("\"${a}${b}\""), "\"${a}${b}\" NEWLINE")
+  assertEq(toks("\"x ${f(\"y\", {k: 1})} z\""), "\"x ${f ( \"y\" , { k : 1 } )} z\" NEWLINE")
+  assertEq(toks("\"${\"in ${deep}\"}\""), "\"${\"in ${deep}\"}\" NEWLINE")
+  assertEq(toks("\"$x $ {y} 5$\""), "\"\\$x \\$ {y} 5\\$\" NEWLINE")
+  assertEq(toks("\"\\${x}\""), "\"\\${x}\" NEWLINE")
+
+@test("interpolation's mistakes: empty, unclosed, unclosed at the line end")
+badInterpolation()
+  assertEq(errs("\"${}\""), "1:2 E0114 `${}` holds no expression")
+  assertEq(errs("\"${a\"\nb"), "1:5 E0111 this string is not closed on its line; 1:2 E0113 `${` is never closed")
+  assertEq(errs("\"${a\nb\""), "1:2 E0113 `${` is never closed; 2:2 E0111 this string is not closed on its line")
+  assertEq(toks("\"${a\nb"), "\"${a}\" NEWLINE b NEWLINE")
+
+@test("sh strings are their own token; a name sh is a word")
+shellStrings()
+  assertEq(toks("sh\"ls ${dir} | wc -l\""), "sh\"ls ${dir} | wc -l\" NEWLINE")
+  assertEq(toks("sh x shx\"a\""), "sh x shx \"a\" NEWLINE")
+
+@test("triple-quoted text drops its first line end and the closing line's margin")
+multiline()
+  assertEq(toks("val t = \"\"\"\n  a\n    b ${x}\n  \"\"\"\n"), "val t = \"\"\"a\\n  b ${x}\"\"\" NEWLINE")
+  assertEq(toks("\"\"\"one line\"\"\""), "\"\"\"one line\"\"\" NEWLINE")
+  assertEq(toks("\"\"\"\n\"\"\""), "\"\"\"\"\"\" NEWLINE")
+  assertEq(toks("a\n  val t = \"\"\"\n    x\n    \"\"\"\n  b\n"), "a NEWLINE INDENT val t = \"\"\"x\"\"\" NEWLINE b NEWLINE DEDENT")
+  assertEq(errs("\"\"\"\nabc"), "1:1 E0111 this text is not closed")
+
+@test("spans count lines from 1 and columns in characters")
+spans()
+  val r = lex("f.fettle", "a\n  été b")
+  val b = r.tokens.filter(t -> t.shown == "b").head
+  assertEq(b.extent.place, "f.fettle:2:7")
+  assertEq(b.extent.start.offset, 10)
+  assertEq(b.extent.end.column, 8)

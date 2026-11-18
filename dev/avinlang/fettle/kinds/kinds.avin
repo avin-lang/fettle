@@ -1,0 +1,98 @@
+module dev.avinlang.fettle.kinds
+
+// The schemas of phase 1's resource kinds: each kind's title, fields with their types and defaults,
+// which fields may hold a secret, and the actions a trigger may name. Providers come with the engine.
+
+// The type of a field, as the checker compares it.
+data FieldType
+  StringT
+  IntT
+  BoolT
+  PathT
+  ModeT
+  DurationT
+  SizeT
+  ListT(element: FieldType)
+  // A `Command` (`validate`, `run`, a guard).
+  CommandT
+  // The text of a file: a `string`, or a `secret` where the field is secret-capable.
+  ContentT
+
+// One field: its name, its type, whether a secret may stand in it, and its default as written in
+// the design (empty where the field is unset unless given).
+data FieldSpec(name: string, kind: FieldType, secret: bool = false, default: string = "")
+
+// A kind: its name, the type of its title, its reference type's name (`File`), its fields and its
+// actions.
+data KindSpec(name: string, title: FieldType, refType: string, fields: List[FieldSpec], actions: List[string] = [])
+
+impl KindSpec
+  field(name: string) -> Option[FieldSpec] = fields.find(f -> f.name == name)
+
+  hasAction(action: string) -> bool = actions.contains(action)
+
+val packageKind: KindSpec = KindSpec("package", StringT, "Package", [
+  FieldSpec("present", BoolT, false, "true"),
+  FieldSpec("version", StringT),
+  FieldSpec("refresh", DurationT)
+])
+
+val serviceKind: KindSpec = KindSpec("service", StringT, "Service", [
+  FieldSpec("running", BoolT),
+  FieldSpec("enabled", BoolT)
+], ["start", "stop", "restart", "reload"])
+
+val userKind: KindSpec = KindSpec("user", StringT, "User", [
+  FieldSpec("present", BoolT, false, "true"),
+  FieldSpec("uid", IntT),
+  FieldSpec("group", StringT),
+  FieldSpec("groups", ListT(StringT)),
+  FieldSpec("shell", PathT),
+  FieldSpec("home", PathT),
+  FieldSpec("system", BoolT, false, "false"),
+  FieldSpec("authorizedKeys", ListT(StringT)),
+  FieldSpec("password", ContentT, true)
+])
+
+val groupKind: KindSpec = KindSpec("group", StringT, "Group", [
+  FieldSpec("present", BoolT, false, "true"),
+  FieldSpec("gid", IntT),
+  FieldSpec("system", BoolT, false, "false")
+])
+
+val fileKind: KindSpec = KindSpec("file", PathT, "File", [
+  FieldSpec("content", ContentT, true),
+  FieldSpec("source", PathT),
+  FieldSpec("owner", StringT),
+  FieldSpec("group", StringT),
+  FieldSpec("mode", ModeT),
+  FieldSpec("validate", CommandT),
+  FieldSpec("present", BoolT, false, "true")
+])
+
+val directoryKind: KindSpec = KindSpec("directory", PathT, "Directory", [
+  FieldSpec("owner", StringT),
+  FieldSpec("group", StringT),
+  FieldSpec("mode", ModeT),
+  FieldSpec("present", BoolT, false, "true"),
+  FieldSpec("purge", BoolT, false, "false")
+])
+
+val symlinkKind: KindSpec = KindSpec("symlink", PathT, "Symlink", [
+  FieldSpec("target", PathT),
+  FieldSpec("present", BoolT, false, "true")
+])
+
+val commandKind: KindSpec = KindSpec("command", StringT, "Command", [
+  FieldSpec("run", CommandT),
+  FieldSpec("creates", PathT),
+  FieldSpec("unless", CommandT),
+  FieldSpec("onlyIf", CommandT),
+  FieldSpec("always", BoolT, false, "false")
+], ["run"])
+
+// Every built-in kind of phase 1, in the order the design lists them.
+val builtinKinds: List[KindSpec] = [packageKind, serviceKind, userKind, groupKind, fileKind, directoryKind, symlinkKind, commandKind]
+
+// The built-in kind named `name`.
+kindNamed(name: string) -> Option[KindSpec] = builtinKinds.find(k -> k.name == name)

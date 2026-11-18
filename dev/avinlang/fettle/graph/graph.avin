@@ -1,0 +1,252 @@
+module dev.avinlang.fettle.graph
+
+import avin.collections.mutable.{Map as Table}
+import dev.avinlang.fettle.syntax.{Diagnostic, Span}
+
+// One resource of a host's desired state: its identity, its fields in the order its kind declares
+// them, where it was declared, and the user it runs as (`as "postgres"`), empty for the default.
+data Node(id: ResourceId, fields: List[(string, Value)], span: Span, user: string)
+
+impl Node
+  // The field `name`, if the resource sets it.
+  field(name: string) -> Option[Value] = fields.find((k, _) -> k == name).map((_, v) -> v)
+
+// Why one resource comes after another.
+data Why
+  // A field of `to` names `from` (`tls.path`).
+  Reference(field: string)
+  // `from` is the directory `to`'s path is in.
+  Parent
+  // `from` is the user or group named by `to`'s field.
+  Owner(field: string)
+  // `from` is a group the user `to` lists.
+  Member
+  // `from` is the managed target of the symlink `to`.
+  Target
+  // `after from` in `to`'s declaration.
+  After
+  // `on from -> action` in `to`'s declaration.
+  Trigger(action: string)
+
+// `to` comes after `from`, because of `why`, as written at `span`.
+data Edge(from: int, to: int, why: Why, span: Span)
+
+// `on sources -> action` on `target`: the action runs once, after every source, if any changed.
+data TriggerEdge(sources: List[int], target: int, action: string, span: Span)
+
+// A host's desired state: its resources in the order they are to be applied, the ordering edges
+// between them (indices into `nodes`), and its triggers.
+data Graph(nodes: Vector[Node], edges: Vector[Edge], triggers: Vector[TriggerEdge])
+
+impl Why
+  shown -> string = self match
+    Reference(f) -> s"its field `$f` refers to it"
+    Parent -> "it is in that directory"
+    Owner(f) -> s"its `$f` names it"
+    Member -> "the user is in that group"
+    Target -> "the link points at it"
+    After -> "`after` says so"
+    Trigger(a) -> s"it triggers `$a`"
+
+// The graph as `fettle graph` prints it: one line per resource in order, its fields indented under
+// it, then the edges and the triggers.
+showGraph(g: Graph) -> string
+  val out = StringWriter()
+  var i = 0
+  for n in g.nodes
+    val who = if n.user.isEmpty then "" else s" as ${quote(n.user)}"
+    out.write(s"${i + 1}. ${n.id.kind} ${quote(n.id.title)}$who\n")
+    for (k, v) in n.fields
+      out.write(s"     $k = ${v.shown}\n")
+    i += 1
+  if !g.edges.isEmpty
+    out.write("edges:\n")
+    for e in g.edges
+      out.write(s"  ${g.nodes(e.from).id.shown} -> ${g.nodes(e.to).id.shown}: ${e.why.shown}\n")
+  if !g.triggers.isEmpty
+    out.write("triggers:\n")
+    for t in g.triggers
+      val sources = t.sources.map(s -> g.nodes(s).id.shown).mkString(", ")
+      out.write(s"  $sources -> ${g.nodes(t.target).id.shown} ${t.action}\n")
+  out.text
+
+// Builds one host's graph from the resources evaluation declares, in the order it declares them.
+class GraphBuilder
+  private val nodes = Buffer[Node]()
+  private val index = Table[ResourceId, int]()
+  private val edges = Buffer[Edge]()
+  private val triggers = Buffer[TriggerEdge]()
+  val diagnostics = Buffer[Diagnostic]()
+
+  // Adds a resource, merging it with an identical earlier declaration of the same identity; one
+  // that differs is an error showing both positions and the fields that differ. Answers its index.
+  add(node: Node) -> int
+    index.get(node.id) match
+      Some(i) ->
+        val earlier = nodes(i)
+        val differing = differences(earlier, node)
+        if !differing.isEmpty
+          diagnostics += Diagnostic("E0401", s"`${node.id.shown}` is declared twice with different fields", node.span, s"differs in ${differing.mkString(", ")}", differing.map(f -> s"`$f`: ${shownField(earlier, f)} there, ${shownField(node, f)} here"), "declare it once, or make both declarations agree", false, [(earlier.span, "first declared here")])
+        i
+      None ->
+        val i = nodes.length
+        nodes += node
+        index(node.id) = i
+        i
+
+  // The index of the resource `id`, if it was declared.
+  find(id: ResourceId) -> Option[int] = index.get(id)
+
+  // Orders `to` after `from`.
+  order(from: int, to: int, why: Why, span: Span)
+    if from != to && !edges.exists(e -> e.from == from && e.to == to && e.why == why)
+      edges += Edge(from, to, why, span)
+
+  // Adds a trigger on `target` from `sources`, which also orders `target` after each of them.
+  trigger(sources: List[int], target: int, action: string, span: Span)
+    triggers += TriggerEdge(sources, target, action, span)
+    for s in sources
+      order(s, target, Trigger(action), span)
+
+  // The graph: known relationships added, every resource ordered after what it needs and otherwise
+  // in declaration order, and every ordering cycle reported with each of its edges.
+  finish() -> Graph
+    addKnownRelationships()
+    val n = nodes.length
+    val incoming = Buffer[int]()
+    for _ in 0..<n
+      incoming += 0
+    for e in edges
+      incoming(e.to) = incoming(e.to) + 1
+    val placed = Buffer[bool]()
+    for _ in 0..<n
+      placed += false
+    val order = Buffer[int]()
+    var progress = true
+    while progress
+      progress = false
+      // The earliest declared resource whose predecessors are all placed.
+      var k = 0
+      while k < n
+        if !placed(k) && incoming(k) == 0
+          placed(k) = true
+          order += k
+          for e in edges
+            if e.from == k then incoming(e.to) = incoming(e.to) - 1
+          progress = true
+          break
+        k += 1
+    if order.length < n
+      reportCycle(placed)
+      for k in 0..<n
+        if !placed(k) then order += k
+    // Renumber everything by the order.
+    val position = Buffer[int]()
+    for _ in 0..<n
+      position += 0
+    var p = 0
+    for k in order
+      position(k) = p
+      p += 1
+    Graph(
+      order.map(k -> nodes(k)).toVector,
+      edges.map(e -> Edge(position(e.from), position(e.to), e.why, e.span)).toVector,
+      triggers.map(t -> TriggerEdge(t.sources.map(s -> position(s)), position(t.target), t.action, t.span)).toVector
+    )
+
+  // Reports one cycle among the resources not placed: each edge with why it exists.
+  private reportCycle(placed: Buffer[bool])
+    var start = 0
+    while placed(start)
+      start += 1
+    // Walk backwards along unplaced edges until a resource repeats.
+    val path = Buffer[int]()
+    val seen = Table[int, int]()
+    var at = start
+    while !seen.contains(at)
+      seen(at) = path.length
+      path += at
+      at = edges.find(e -> e.to == at && !placed(e.from)).map(e -> e.from).getOrElse(at)
+    val found = path.slice(seen(at), path.length).reverse
+    // Begin the cycle at its earliest declared resource, so a report is the same however it is found.
+    val least = found.indexOf(found.min)
+    val cycle = found.slice(least, found.length) ++ found.slice(0, least)
+    val links = Buffer[Edge]()
+    for i in 0..<cycle.length
+      val from = cycle(i)
+      val to = cycle((i + 1) % cycle.length)
+      edges.find(e -> e.from == from && e.to == to) match
+        Some(e) -> links += e
+        None -> ()
+    val first = if links.isEmpty then nodes(start).span else links(0).span
+    val names = cycle.map(k -> nodes(k).id.shown).mkString(" -> ")
+    diagnostics += Diagnostic("E0402", s"the resources form an ordering cycle: $names -> ${nodes(cycle(0)).id.shown}", first, "the cycle", [], "remove one of these orderings", false, links.map(e -> (e.span, s"`${nodes(e.to).id.shown}` after `${nodes(e.from).id.shown}`: ${e.why.shown}")).toList)
+
+  // Puppet's autorequire: a path after its parent directory, an owner after its user and group, a
+  // user after its groups, a symlink after its managed target.
+  private addKnownRelationships()
+    var k = 0
+    for node in nodes
+      val kind = node.id.kind
+      if kind == "file" || kind == "directory" || kind == "symlink"
+        parentDirectory(node.id.title) match
+          Some(i) -> order(i, k, Parent, node.span)
+          None -> ()
+        for f in ["owner", "group"]
+          node.field(f) match
+            Some(StrV(name)) ->
+              val wanted = if f == "owner" then "user" else "group"
+              find(ResourceId(wanted, name)) match
+                Some(i) -> order(i, k, Owner(f), node.span)
+                None -> ()
+            _ -> ()
+      if kind == "symlink"
+        node.field("target") match
+          Some(PathV(t)) -> for target in [ResourceId("file", t), ResourceId("directory", t)]
+            find(target) match
+              Some(i) -> order(i, k, Target, node.span)
+              None -> ()
+          _ -> ()
+      if kind == "user"
+        val listed = Buffer[string]()
+        node.field("group") match
+          Some(StrV(g)) -> listed += g
+          _ -> ()
+        node.field("groups") match
+          Some(ListV(gs)) -> for g in gs
+            g match
+              StrV(name) -> listed += name
+              _ -> ()
+          _ -> ()
+        for name in listed
+          find(ResourceId("group", name)) match
+            Some(i) -> order(i, k, Member, node.span)
+            None -> ()
+      k += 1
+
+  // The nearest managed directory above `file`, if any.
+  private parentDirectory(file: string) -> Option[int]
+    var dir = file
+    while true
+      val slash = dir.lastIndexOf("/")
+      if slash <= 0 then return find(ResourceId("directory", "/")).filter(_ -> file != "/")
+      dir = dir.slice(0, slash)
+      find(ResourceId("directory", dir)) match
+        Some(i) -> return Some(i)
+        None -> ()
+    None
+
+// The fields in which two declarations of one resource differ, in the order they are declared,
+// with `user` standing for the user they run as.
+private differences(a: Node, b: Node) -> List[string]
+  val out = Buffer[string]()
+  for (k, v) in a.fields
+    if b.field(k) != Some(v) then out += k
+  for (k, _) in b.fields
+    if a.field(k).isEmpty then out += k
+  if a.user != b.user then out += "user"
+  out.toList
+
+private shownField(n: Node, f: string) -> string
+  if f == "user" then return if n.user.isEmpty then "the default user" else quote(n.user)
+  n.field(f).map(v -> v.shown).getOrElse("unset")

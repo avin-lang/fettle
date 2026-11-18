@@ -1,0 +1,95 @@
+module dev.avinlang.fettle.syntax
+
+// What the lexer reads a `.fettle` file into. Line structure is explicit: `Newline` ends a statement,
+// `Indent` opens a block two spaces further in, and `Dedent` closes one. Inside brackets a line end is
+// only white space, so none of the three appear there.
+data Token
+  // A name or a keyword; the parser tells them apart.
+  Word(text: string, span: Span)
+  IntLit(value: long, span: Span)
+  // `0o640`: a file mode, written in octal.
+  ModeLit(value: long, span: Span)
+  // `30s`, `10m`: a duration, held in milliseconds.
+  DurationLit(millis: long, text: string, span: Span)
+  // `512MiB`: a size, held in bytes.
+  SizeLit(bytes: long, text: string, span: Span)
+  // `"…"` and `"""…"""`: text and the interpolations in it.
+  StringLit(parts: List[Piece], multiline: bool, span: Span)
+  // `sh"…"`: shell text whose interpolations are each quoted as one word.
+  ShellLit(parts: List[Piece], span: Span)
+  // An operator or a piece of punctuation: `->`, `==`, `(`, `,`.
+  Symbol(text: string, span: Span)
+  Newline(span: Span)
+  Indent(span: Span)
+  Dedent(span: Span)
+  EndOfFile(span: Span)
+
+// A piece of a string: text with its escapes decoded, or `${expr}`, the tokens of the expression.
+data Piece
+  Chunk(text: string, span: Span)
+  Hole(tokens: List[Token], span: Span)
+
+impl Token
+  // Where the token stands in its file.
+  extent -> Span = self match
+    Word(_, s) -> s
+    IntLit(_, s) -> s
+    ModeLit(_, s) -> s
+    DurationLit(_, _, s) -> s
+    SizeLit(_, _, s) -> s
+    StringLit(_, _, s) -> s
+    ShellLit(_, s) -> s
+    Symbol(_, s) -> s
+    Newline(s) -> s
+    Indent(s) -> s
+    Dedent(s) -> s
+    EndOfFile(s) -> s
+
+  // The token as a test or a message shows it: `name`, `443`, `"a${…}b"`, `NEWLINE`.
+  shown -> string = self match
+    Word(t, _) -> t
+    IntLit(v, _) -> s"$v"
+    ModeLit(v, _) -> s"0o${octal(v)}"
+    DurationLit(_, t, _) -> t
+    SizeLit(_, t, _) -> t
+    StringLit(ps, true, _) -> s"\"\"\"${showParts(ps)}\"\"\""
+    StringLit(ps, false, _) -> s"\"${showParts(ps)}\""
+    ShellLit(ps, _) -> s"sh\"${showParts(ps)}\""
+    Symbol(t, _) -> t
+    Newline(_) -> "NEWLINE"
+    Indent(_) -> "INDENT"
+    Dedent(_) -> "DEDENT"
+    EndOfFile(_) -> "EOF"
+
+// The pieces of a string as `shown` writes them: text escaped back, each hole as `${tokens}`.
+showParts(parts: List[Piece]) -> string
+  val out = StringWriter()
+  for p in parts
+    p match
+      Chunk(t, _) -> out.write(escaped(t))
+      Hole(ts, _) -> out.write(s"$${${ts.map(t -> t.shown).mkString(" ")}}")
+  out.text
+
+// `text` with its line ends, tabs, quotes, backslashes and dollar signs escaped.
+escaped(text: string) -> string
+  val out = StringWriter()
+  for c in text.charIterator()
+    c match
+      '\n' -> out.write("\\n")
+      '\t' -> out.write("\\t")
+      '\r' -> out.write("\\r")
+      '"' -> out.write("\\\"")
+      '\\' -> out.write("\\\\")
+      '$' -> out.write("\\$")
+      _ -> out.writeChar(c)
+  out.text
+
+// `v` in octal digits.
+octal(v: long) -> string
+  if v == 0 then return "0"
+  var n = v
+  var digits = ""
+  while n > 0
+    digits = s"${n % 8}$digits"
+    n = n / 8
+  digits

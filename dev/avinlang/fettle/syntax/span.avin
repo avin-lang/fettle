@@ -1,0 +1,30 @@
+module dev.avinlang.fettle.syntax
+
+// A place in a source file: its byte offset, counted from 0, and its line and column, both counted
+// from 1, the column in characters.
+data Pos(offset: int, line: int, column: int)
+
+// A stretch of a source file, from `start` up to `end`, which is just past its last character. The
+// file is named as it was given, relative to the project where it was found there.
+data Span(file: string, start: Pos, end: Pos)
+
+impl Span
+  // The span from this one's start to `other`'s end, both in one file.
+  through(other: Span) -> Span = Span(file, start, other.end)
+
+  // `file:line:column` of its start.
+  place -> string = s"$file:${start.line}:${start.column}"
+
+// A diagnostic: what is wrong, where, and what may help. `code` names the kind of mistake (`E0207`),
+// `label` is the short text under the primary span, `notes` are further facts and `help` a suggested
+// change. A warning does not stop `fettle check` from succeeding.
+data Diagnostic(
+  code: string,
+  message: string,
+  span: Span,
+  label: string = "",
+  notes: List[string] = [],
+  help: string = "",
+  warning: bool = false,
+  secondary: List[(Span, string)] = []
+)

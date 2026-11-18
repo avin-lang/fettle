@@ -1,0 +1,30 @@
+module tests
+
+import dev.avinlang.fettle.syntax.{Diagnostic, Pos, Span, lex}
+import dev.avinlang.fettle.report.{lineAt, render}
+
+@test("a diagnostic renders with its line, a marker under its span, its label and its help")
+rendering()
+  val text = "role r()\n  file \"/x\"\n    mode = \"0600\"\n"
+  val span = Span("roles/web.fettle", Pos(30, 3, 12), Pos(36, 3, 18))
+  val d = Diagnostic("E0207", "the field `mode` of `file` is a `mode`, but this is a `string`", span, "a string", [], "a mode is written as an octal literal: `mode = 0o600`")
+  assertEq(render(d, text), "error[E0207]: the field `mode` of `file` is a `mode`, but this is a `string`\n --> roles/web.fettle:3:12\n  |\n3 |     mode = \"0600\"\n  |            ^^^^^^ a string\n  |\nhelp: a mode is written as an octal literal: `mode = 0o600`\n")
+
+@test("a lexical error renders against its file")
+lexicalRendering()
+  val text = "val a = \"abc\n"
+  val d = lex("t.fettle", text).diagnostics(0)
+  assertEq(render(d, text), "error[E0111]: this string is not closed on its line\n --> t.fettle:1:9\n  |\n1 | val a = \"abc\n  |         ^^^^ string begins here\n  |\nhelp: end it with `\"`, or use `\"\"\"` for text over several lines\n")
+
+@test("a warning says so, and secondary spans and notes follow the primary one")
+secondary()
+  val text = "a\nb\n"
+  val d = Diagnostic("E0401", "twice", Span("f", Pos(2, 2, 1), Pos(3, 2, 2)), "here", ["a note"], "", true, [(Span("f", Pos(0, 1, 1), Pos(1, 1, 2)), "first")])
+  assertEq(render(d, text), "warning[E0401]: twice\n --> f:2:1\n  |\n2 | b\n  | ^ here\n1 | a\n  | - first\n  = note: a note\n")
+
+@test("lines are counted from 1, and a line past the end is empty")
+lines()
+  assertEq(lineAt("a\r\nb", 1), "a")
+  assertEq(lineAt("a\nb", 2), "b")
+  assertEq(lineAt("a", 3), "")
+  assertEq(lineAt("a", 0), "")

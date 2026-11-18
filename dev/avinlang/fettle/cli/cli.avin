@@ -1,0 +1,44 @@
+module dev.avinlang.fettle.cli
+
+import avin.fs
+import dev.avinlang.fettle.syntax.{Diagnostic, lex}
+import dev.avinlang.fettle.report.{render}
+
+val usage: string = "usage: fettle check [dir]"
+
+// Runs the command `args` names, answering the exit status.
+main(args: Vector[string]) -> int
+  if args.isEmpty
+    eprintln(usage)
+    return 2
+  args(0) match
+    "check" -> check(if args.length > 1 then args(1) else ".")
+    _ ->
+      eprintln(s"fettle: unknown command `${args(0)}`\n$usage")
+      2
+
+// `fettle check [dir]`: every `.fettle` file in `dir`, its lexical diagnostics rendered with
+// excerpts.
+check(dir: string) -> int
+  val names: Vector[string] = fs.listDir(dir) match
+    Ok(es) -> es
+    Err(e) ->
+      eprintln(s"fettle: $e")
+      return 1
+  var errors = 0
+  for f in names
+    if f.endsWith(".fettle")
+      errors += checkFile(if dir == "." then f else s"$dir/$f")
+  if errors > 0 then 1 else 0
+
+// The number of errors in one file, each rendered on standard error.
+private checkFile(name: string) -> int = fs.readText(name) match
+  Err(e) ->
+    eprintln(s"fettle: $e")
+    1
+  Ok(text) ->
+    var errors = 0
+    for d in lex(name, text).diagnostics
+      eprint(render(d, text))
+      if !d.warning then errors += 1
+    errors

@@ -1,0 +1,33 @@
+module tests
+
+import dev.avinlang.fettle.kinds.{ContentT, ModeT, PathT, builtinKinds, kindNamed}
+
+@test("phase 1's kinds are known by name, and nothing else is")
+kindNames()
+  assertEq(builtinKinds.map(k -> k.name).mkString(" "), "package service user group file directory symlink command")
+  assertEq(kindNamed("file").isDefined, true)
+  assertEq(kindNamed("sysctl").isDefined, false)
+  assertEq(kindNamed("File").isDefined, false)
+
+@test("a file's title is a path, its mode a mode, and its content may hold a secret")
+fileSchema()
+  val f = kindNamed("file").get
+  assertEq(f.title == PathT, true)
+  assertEq(f.field("mode").get.kind == ModeT, true)
+  assertEq(f.field("content").get.kind == ContentT, true)
+  assertEq(f.field("content").get.secret, true)
+  assertEq(f.field("owner").get.secret, false)
+  assertEq(f.field("prot").isDefined, false)
+
+@test("only a service and a command offer actions to a trigger")
+actions()
+  assertEq(kindNamed("service").get.hasAction("reload"), true)
+  assertEq(kindNamed("service").get.hasAction("run"), false)
+  assertEq(kindNamed("file").get.hasAction("reload"), false)
+  assertEq(kindNamed("command").get.actions.mkString(" "), "run")
+  assertEq(builtinKinds.filter(k -> !k.actions.isEmpty).map(k -> k.name).mkString(" "), "service command")
+
+@test("only a file's content and a user's password may hold a secret")
+secretFields()
+  val secretCapable = builtinKinds.flatMap(k -> k.fields.filter(f -> f.secret).map(f -> s"${k.name}.${f.name}"))
+  assertEq(secretCapable.mkString(" "), "user.password file.content")

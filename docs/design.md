@@ -849,3 +849,35 @@ functions, `if`, `for`, `match`, typed vars); `become` and `def` as hidden globa
     resource needs it; a host with no `become` runs as the login user.
 15. **The inventory is static in v1**; phase 3 reads a local command's JSON against a declared type,
     so it stays checked.
+
+### Decided during phase 1a
+
+Each of these settles something the sections above leave open, in their direction. Review with the
+user.
+
+1. **A line continues the one above only when it is indented further and begins with `.`** (a call
+   chain, as `pgDatabase`'s `probe` in 2.4). Inside `(`, `[` and `{` line ends are white space.
+   Review with the user.
+2. **Indentation errors:** a tab, a block indented other than two spaces past its opener, and a
+   line that lines up with no open block are each an error at the line, and lexing carries on.
+   Review with the user.
+3. **Duration and size units** are `ms`, `s`, `m`, `h`, `d`, and `B`, `kB`, `MB`, `GB`, `TB`,
+   `KiB`, `MiB`, `GiB`, `TiB`, written right after the digits; any other letters there are an
+   error. Digits may be grouped with `_` (`1_000`). Review with the user.
+4. **String escapes** are `\n \t \r \0 \\ \" \$` and `\u{…}` (one to six hex digits, not a
+   surrogate). A `$` not followed by `{` is text. A one-line string, and an interpolation in it,
+   ends with its line. Review with the user.
+5. **`"""…"""` text** drops a line end right after the opening quotes; the closing quotes alone on
+   their line set a margin, which is taken off every line, and the line end before them is dropped.
+   Review with the user.
+6. **`sh"…"`** is one token only when `sh` touches the quote; `sh "…"` is the name `sh` and a
+   string. Review with the user.
+7. **Ordering ties**: resources with no ordering between them keep declaration order, by a stable
+   topological sort; declaration order is the tie-break, not an edge, so an `after` against it never
+   makes a cycle. A cycle is reported once, starting at its earliest declared resource. Review with
+   the user.
+8. **Known relationships** use the nearest managed directory above a path, the `owner` and `group`
+   fields of files and directories, a user's `group` and `groups`, and a symlink's `target` when a
+   `file` or `directory` of that path is declared. Review with the user.
+9. **A duplicate declaration that runs as another user (`as`) conflicts**, as a field difference
+   does. Review with the user.

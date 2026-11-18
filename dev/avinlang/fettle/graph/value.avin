@@ -1,0 +1,111 @@
+module dev.avinlang.fettle.graph
+
+// A value of the language, as evaluation computes it and a resource's fields hold it.
+data Value
+  StrV(text: string)
+  IntV(value: long)
+  BoolV(value: bool)
+  // An absolute, normalised path.
+  PathV(text: string)
+  ModeV(value: long)
+  DurationV(millis: long)
+  SizeV(bytes: long)
+  ListV(items: List[Value])
+  // Entries in the order they were written; keys are strings or ints.
+  MapV(entries: List[(Value, Value)])
+  SetV(items: List[Value])
+  NoneV
+  // A record: its type's name and its fields in declaration order.
+  RecordV(typeName: string, fields: List[(string, Value)])
+  // A variant of an algebraic type, with its fields in declaration order.
+  VariantV(typeName: string, variant: string, fields: List[(string, Value)])
+  // A secret: where its bytes come from (`env HOME`, `file ~/k`, `literal`), never the bytes.
+  SecretV(source: string)
+  // A command: the program, its arguments, and its standard input if any.
+  CommandV(program: string, args: List[Value], stdin: Option[Value], shell: bool)
+  // A reference to a resource of the graph.
+  RefV(id: ResourceId)
+  // A group of resources a role call made: what `after` on it orders after.
+  GroupV(ids: List[ResourceId])
+
+// A resource's identity on a host: its kind and title (`package nginx`).
+data ResourceId(kind: string, title: string)
+
+impl ResourceId
+  shown -> string = s"$kind $title"
+
+impl Value
+  // The value as the graph prints it: strings quoted, a secret as `(secret)`, a mode in octal.
+  shown -> string = self match
+    StrV(t) -> quote(t)
+    IntV(v) -> s"$v"
+    BoolV(b) -> s"$b"
+    PathV(p) -> p
+    ModeV(m) -> s"0o${octalDigits(m)}"
+    DurationV(ms) -> durationText(ms)
+    SizeV(b) -> sizeText(b)
+    ListV(items) -> s"[${items.map(v -> v.shown).mkString(", ")}]"
+    MapV(es) -> s"{${es.map((k, v) -> s"${k.shown}: ${v.shown}").mkString(", ")}}"
+    SetV(items) -> s"set[${items.map(v -> v.shown).mkString(", ")}]"
+    NoneV -> "none"
+    RecordV(t, fs) -> s"$t(${fs.map((k, v) -> s"$k = ${v.shown}").mkString(", ")})"
+    VariantV(_, v, fs) -> if fs.isEmpty then v else s"$v(${fs.map((_, x) -> x.shown).mkString(", ")})"
+    SecretV(_) -> "(secret)"
+    CommandV(p, args, stdin, sh) ->
+      val head = if sh then "sh" else "cmd"
+      val input = stdin match
+        Some(i) -> s".stdin(${i.shown})"
+        None -> ""
+      s"$head(${(StrV(p) :: args).map(a -> a.shown).mkString(", ")})$input"
+    RefV(id) -> s"<${id.shown}>"
+    GroupV(ids) -> s"<${ids.map(i -> i.shown).mkString(", ")}>"
+
+  // Whether the value holds a secret anywhere in it.
+  holdsSecret -> bool = self match
+    SecretV(_) -> true
+    ListV(items) -> items.exists(v -> v.holdsSecret)
+    SetV(items) -> items.exists(v -> v.holdsSecret)
+    MapV(es) -> es.exists((k, v) -> k.holdsSecret || v.holdsSecret)
+    RecordV(_, fs) -> fs.exists((_, v) -> v.holdsSecret)
+    VariantV(_, _, fs) -> fs.exists((_, v) -> v.holdsSecret)
+    CommandV(_, args, stdin, _) -> args.exists(v -> v.holdsSecret) || stdin.exists(v -> v.holdsSecret)
+    _ -> false
+
+// `text` in double quotes with its quotes, backslashes and line ends escaped.
+quote(text: string) -> string
+  val out = StringWriter()
+  out.writeChar('"')
+  for c in text.charIterator()
+    c match
+      '"' -> out.write("\\\"")
+      '\\' -> out.write("\\\\")
+      '\n' -> out.write("\\n")
+      '\t' -> out.write("\\t")
+      _ -> out.writeChar(c)
+  out.writeChar('"')
+  out.text
+
+octalDigits(v: long) -> string
+  if v == 0 then return "0"
+  var n = v
+  var digits = ""
+  while n > 0
+    digits = s"${n % 8}$digits"
+    n = n / 8
+  digits
+
+// A duration in the largest unit that divides it: `30s`, `10m`, `250ms`.
+durationText(ms: long) -> string
+  if ms == 0 then return "0s"
+  if ms % 86400000 == 0 then return s"${ms / 86400000}d"
+  if ms % 3600000 == 0 then return s"${ms / 3600000}h"
+  if ms % 60000 == 0 then return s"${ms / 60000}m"
+  if ms % 1000 == 0 then s"${ms / 1000}s" else s"${ms}ms"
+
+// A size in the largest binary unit that divides it: `512MiB`, `3B`.
+sizeText(b: long) -> string
+  if b == 0 then return "0B"
+  if b % 1099511627776 == 0 then return s"${b / 1099511627776}TiB"
+  if b % 1073741824 == 0 then return s"${b / 1073741824}GiB"
+  if b % 1048576 == 0 then return s"${b / 1048576}MiB"
+  if b % 1024 == 0 then s"${b / 1024}KiB" else s"${b}B"
