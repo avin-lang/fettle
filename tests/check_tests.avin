@@ -1,7 +1,7 @@
 module tests
 
 import dev.avinlang.fettle.syntax.{Expr, Pattern, SourceFile, Stmt, AltP, Arm, BinaryE, BindP, CallE, CallS, ConnectD, ConnectDecl, Decl, ExprP, FieldE, ForE, ForS, GroupD, GroupDecl, HostDecl, Import, LambdaE, ListE, MatchE, ModeE, NameE, OnS, RoleD, RoleDecl, ShE, StrE, TextP, TupleE, TupleP, ValS, Variant, VariantP, WildP, ApplyD, ApplyDecl}
-import dev.avinlang.fettle.check.{check}
+import dev.avinlang.fettle.check.{check, distance, nearest}
 
 // `data Site(domain: string, root: path = "/srv/www", port: int = 443)`.
 siteData() -> Decl = record("Site", [param("domain", ty("string")), paramD("root", ty("path"), str("/srv/www")), paramD("port", ty("int"), num(443))])
@@ -32,6 +32,29 @@ unknownField()
   assertEq(d.map(x -> s"${x.span.start.line} ${x.code} ${x.message} | ${x.help}").mkString("; "), "3 E0202 `Site` has no field `prot` | did you mean `port`?")
   assertEq(errors(inRole([res("file", str("/x"), [fieldS("mdoe", ModeE(384, sp(4)), 4)], 3)])), "4 E0202 `file` has no field `mdoe`")
   assertEq(errors(inRole([res("pakage", str("x"), [], 5)])), "5 E0201 there is no resource kind `pakage`")
+
+@test("the edit distance counts a swap of two adjacent characters as one edit")
+editDistance()
+  assertEq(distance("prot", "port"), 1)
+  assertEq(distance("prot", "root"), 2)
+  assertEq(distance("ab", "ba"), 1)
+  assertEq(distance("abc", "ca"), 3)
+  assertEq(distance("", ""), 0)
+  assertEq(distance("", "abc"), 3)
+  assertEq(distance("abc", ""), 3)
+  assertEq(distance("same", "same"), 0)
+  assertEq(distance("sit", "site"), 1)
+  assertEq(distance("kitten", "sitting"), 3)
+  assertEq(distance("é", "e"), 1)
+
+@test("the nearest spelling prefers a swap over a substitution, whatever the candidates' order")
+nearestSpelling()
+  assertEq(nearest("prot", ["root", "port"]), Some("port"))
+  assertEq(nearest("prot", ["port", "root"]), Some("port"))
+  assertEq(nearest("mdoe", ["mode", "owner"]), Some("mode"))
+  assertEq(nearest("x", ["y"]), None)
+  assertEq(nearest("zzzzzz", ["domain", "root"]), None)
+  assertEq(nearest("sit", []), None)
 
 @test("a string where a mode is wanted is the design's E0207 with its help")
 modeMismatch()

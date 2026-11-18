@@ -101,10 +101,12 @@ holdsSecret(t: Ty) -> bool = t match
   TupleTy(items) -> items.exists(i -> holdsSecret(i))
   _ -> false
 
-// The edit distance between two names, for "did you mean".
+// The edit distance between two names, for "did you mean": insertions, deletions, substitutions
+// and swaps of two adjacent characters each count one, since a swap is the commonest typing slip.
 distance(a: string, b: string) -> int
   val xs = a.charIterator().toVector
   val ys = b.charIterator().toVector
+  var beforePrevious = Buffer[int]()
   var previous = Buffer[int]()
   for j in 0..ys.length
     previous += j
@@ -113,7 +115,11 @@ distance(a: string, b: string) -> int
     current += i
     for j in 1..ys.length
       val cost = if xs(i - 1) == ys(j - 1) then 0 else 1
-      current += min(min(previous(j) + 1, current(j - 1) + 1), previous(j - 1) + cost)
+      var d = min(min(previous(j) + 1, current(j - 1) + 1), previous(j - 1) + cost)
+      if i > 1 && j > 1 && xs(i - 1) == ys(j - 2) && xs(i - 2) == ys(j - 1)
+        d = min(d, beforePrevious(j - 2) + 1)
+      current += d
+    beforePrevious = previous
     previous = current
   previous(ys.length)
 
