@@ -1,0 +1,42 @@
+module dev.avinlang.fettle.check
+
+import dev.avinlang.fettle.syntax.{DataDecl, NamedT, Param, Pos, Span, Variant}
+
+// Where the language's own declarations are said to be.
+val builtinSpan: Span = Span("<builtin>", Pos(0, 1, 1), Pos(0, 1, 1))
+
+private param(name: string, t: string) -> Param = Param(name, NamedT(t, [], builtinSpan), None, builtinSpan)
+
+private variant(name: string, params: List[Param] = []) -> Variant = Variant(name, params, builtinSpan)
+
+// The fact types of section 5.1, and the inventory's `Become` and `Rollout`.
+val builtinData: List[DataDecl] = [
+  DataDecl("Distro", [], [
+    variant("Debian", [param("version", "int")]),
+    variant("Ubuntu", [param("version", "string")]),
+    variant("Fedora", [param("version", "int")]),
+    variant("Rhel", [param("version", "int")]),
+    variant("Alpine", [param("version", "string")]),
+    variant("Arch"),
+    variant("Macos", [param("version", "string")]),
+    variant("Other", [param("id", "string")])
+  ], builtinSpan),
+  DataDecl("Os", [], [variant("Linux"), variant("Darwin"), variant("FreeBsd")], builtinSpan),
+  DataDecl("Cpu", [], [variant("Amd64"), variant("Arm64")], builtinSpan),
+  DataDecl("Init", [], [variant("Systemd"), variant("OpenRc"), variant("Launchd"), variant("NoInit")], builtinSpan),
+  DataDecl("Become", [], [variant("Sudo"), variant("SudoPassword", [param("password", "secret")]), variant("Doas"), variant("NoBecome")], builtinSpan),
+  DataDecl("Rollout", [], [variant("AllAtOnce"), variant("Batches", [param("size", "int"), param("maxFailures", "int")])], builtinSpan)
+]
+
+// A host's fields and their types, `vars` aside.
+val hostFields: List[(string, Ty)] = [
+  ("name", StrTy), ("address", StrTy), ("os", DataTy("Os")), ("distro", DataTy("Distro")),
+  ("arch", DataTy("Cpu")), ("init", DataTy("Init")), ("cpus", IntTy), ("memory", SizeTy),
+  ("hostname", StrTy), ("user", StrTy), ("root", BoolTy)
+]
+
+// What a `connect`, a group or a host may set besides its vars.
+val connectionFields: List[(string, Ty)] = [
+  ("user", StrTy), ("port", IntTy), ("key", StrTy), ("password", SecretTy), ("become", DataTy("Become")),
+  ("hostKey", StrTy), ("rollout", DataTy("Rollout"))
+]

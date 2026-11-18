@@ -1,0 +1,112 @@
+module tests
+
+import avin.fs
+import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, ApplyDecl, Arm, BinaryE, BindP, CallE, CallS, Decl, Expr, ExprP, FailE, FieldE, ForE, ForS, GroupD, GroupDecl, HostDecl, IfE, ListE, MatchE, ModeE, OnS, Pattern, SourceFile, Stmt, StrE, TextP, TupleE, TupleP, ValS, VariantP, WildP}
+import dev.avinlang.fettle.eval.{Facts, evaluate, readFacts}
+import dev.avinlang.fettle.graph.{showGraph}
+
+facts(name: string) -> Facts = readFacts(fs.readText(s"tests/fixtures/$name.json").getOrElse("")).getOrElse(Facts("", "", "", "", "", 0, 0, "", "", false))
+
+// An inventory of one group `web` holding `web1` and `edge1`, applying `calls` to all of it.
+program(decls: List[Decl], calls: List[Expr]) -> List[SourceFile]
+  val hosts: List[HostDecl] = [HostDecl("web1", str("10.0.0.11"), [], sp(90)), HostDecl("edge1", str("10.0.0.12"), [], sp(91))]
+  val inventory: List[Decl] = [GroupD(GroupDecl("web", "", [], hosts, sp(89))), ApplyD(ApplyDecl("all", "", calls, sp(92)))]
+  [source(decls ++ inventory)]
+
+graphOf(files: List[SourceFile], host: string, fixture: string) -> string
+  val r = evaluate(files, host, facts(fixture))
+  val errs = r.diagnostics.map(d -> s"${d.span.start.line} ${d.code} ${d.message}").mkString("; ")
+  if errs.isEmpty then showGraph(r.graph) else s"errors: $errs"
+
+dot(target: Expr, n: string) -> Expr = FieldE(target, n, sp(1))
+
+@test("fact fixtures read into typed facts")
+readingFacts()
+  val d = facts("debian12")
+  assertEq(s"${d.distro} ${d.version} ${d.init} ${d.memory}", "Debian 12 Systemd 2147483648")
+  assertEq(readFacts("{\"os\": \"Linux\"}").isErr, true)
+  assertEq(readFacts("not json").isErr, true)
+
+// The nginx role of example 2.1 without its template: a TLS directory, a key and a certificate
+// named from it, and nginx reloading when either changes.
+webRole() -> Decl = role("web", [param("domain", ty("string")), param("key", ty("secret"))], [
+  res("package", str("nginx"), [], 2),
+  res("directory", str("/etc/nginx/tls"), [fieldS("mode", ModeE(488, sp(4)))], 3, "tls"),
+  res("file", StrE([ExprP(dot(nm("tls"), "path")), TextP("/"), ExprP(nm("domain")), TextP(".crt")], false, sp(5)), [fieldS("content", str("CERT")), fieldS("mode", ModeE(420, sp(6)))], 5, "crt"),
+  res("file", StrE([ExprP(dot(nm("tls"), "path")), TextP("/"), ExprP(nm("domain")), TextP(".key")], false, sp(7)), [fieldS("content", nm("key")), fieldS("mode", ModeE(384, sp(8)))], 7, "k"),
+  res("service", str("nginx"), [fieldS("running", nm("true")), fieldS("enabled", nm("true")), OnS([nm("crt"), nm("k")], "reload", sp(11))], 9)
+])
+
+@test("a role evaluates into resources in order, with reference edges and a trigger")
+webServer()
+  val files = program([webRole()], [call("web", [str("a.example.com"), CallE(FieldE(nm("secret"), "file", sp(1)), [arg(str("~/k"))], sp(1))])])
+  assertEq(graphOf(files, "web1", "debian12"), "1. package \"nginx\"\n2. directory \"/etc/nginx/tls\"\n     mode = 0o750\n3. file \"/etc/nginx/tls/a.example.com.crt\"\n     content = \"CERT\"\n     mode = 0o644\n4. file \"/etc/nginx/tls/a.example.com.key\"\n     content = (secret)\n     mode = 0o600\n5. service \"nginx\"\n     running = true\n     enabled = true\nedges:\n  directory /etc/nginx/tls -> file /etc/nginx/tls/a.example.com.crt: its field `title` refers to it\n  directory /etc/nginx/tls -> file /etc/nginx/tls/a.example.com.key: its field `title` refers to it\n  file /etc/nginx/tls/a.example.com.crt -> service nginx: it triggers `reload`\n  file /etc/nginx/tls/a.example.com.key -> service nginx: it triggers `reload`\n  directory /etc/nginx/tls -> file /etc/nginx/tls/a.example.com.crt: it is in that directory\n  directory /etc/nginx/tls -> file /etc/nginx/tls/a.example.com.key: it is in that directory\ntriggers:\n  file /etc/nginx/tls/a.example.com.crt, file /etc/nginx/tls/a.example.com.key -> service nginx reload\n")
+
+pair(a: string, b: string) -> Expr = TupleE([str(a), str(b)], sp(1))
+
+vp(n: string) -> Pattern = VariantP(n, [WildP(sp(1))], sp(1))
+
+// Example 2.3's role: the service and config differ by distribution.
+timeRole() -> Decl = role("timeSync", [param("servers", tyOf("List", [ty("string")]))], [
+  ValS(TupleP([BindP("unit", sp(2)), BindP("config", sp(2))], sp(2)), MatchE(dot(nm("host"), "distro"), [
+    Arm(AltP([vp("Debian"), vp("Ubuntu")], sp(3)), pair("chrony", "/etc/chrony/chrony.conf"), sp(3)),
+    Arm(AltP([vp("Fedora"), vp("Rhel")], sp(4)), pair("chronyd", "/etc/chrony.conf"), sp(4)),
+    Arm(vp("Alpine"), pair("chronyd", "/etc/chrony/chrony.conf"), sp(5)),
+    Arm(BindP("other", sp(6)), FailE(StrE([TextP("timeSync does not support "), ExprP(nm("other"))], false, sp(6)), sp(6)), sp(6))
+  ], sp(2)), sp(2)),
+  res("package", str("chrony"), [], 8),
+  res("file", nm("config"), [fieldS("content", call("lines", [ForE(BindP("s", sp(1)), nm("servers"), None, StrE([TextP("server "), ExprP(nm("s")), TextP(" iburst")], false, sp(1)), sp(1))]))], 10, "conf"),
+  res("service", nm("unit"), [OnS([nm("conf")], "restart", sp(13))], 12)
+])
+
+@test("a match on the host's distribution picks per-distribution names")
+perDistribution()
+  val files = program([timeRole()], [call("timeSync", [ListE([str("0.pool.ntp.org")], sp(1))])])
+  assertEq(graphOf(files, "web1", "debian12"), "1. package \"chrony\"\n2. file \"/etc/chrony/chrony.conf\"\n     content = \"server 0.pool.ntp.org iburst\\n\"\n3. service \"chrony\"\nedges:\n  file /etc/chrony/chrony.conf -> service chrony: it triggers `restart`\ntriggers:\n  file /etc/chrony/chrony.conf -> service chrony restart\n")
+  assertEq(graphOf(files, "edge1", "alpine320").contains("3. service \"chronyd\"\n"), true)
+
+@test("fail stops evaluation for the host, at its span")
+failing()
+  val files = program([timeRole()], [call("timeSync", [ListE([], sp(1))])])
+  val other = Facts("Linux", "Arch", "", "Amd64", "Systemd", 1, 1, "h", "root", true)
+  val r = evaluate(files, "web1", other)
+  assertEq(r.diagnostics.map(d -> s"${d.span.start.line} ${d.code} ${d.message}").mkString("; "), "6 E0315 timeSync does not support Arch")
+
+@test("two roles declaring the same resource identically merge; differently, they conflict")
+duplicates()
+  val a = role("a", [], [res("package", str("git"), [], 2)])
+  val b = role("b", [], [res("package", str("git"), [], 4)])
+  assertEq(graphOf(program([a, b], [call("a", []), call("b", [])]), "web1", "debian12"), "1. package \"git\"\n")
+  val c = role("c", [], [res("package", str("git"), [fieldS("version", str("1:2.39"))], 6)])
+  assertEq(graphOf(program([a, c], [call("a", []), call("c", [])]), "web1", "debian12"), "errors: 6 E0401 `package git` is declared twice with different fields")
+
+@test("a loop declares one resource per item, and users come after the groups they list")
+loops()
+  val people = role("people", [param("names", tyOf("List", [ty("string")]))], [
+    ForS(BindP("n", sp(2)), nm("names"), [res("user", nm("n"), [fieldS("groups", ListE([str("admins")], sp(3)))], 3)], sp(2)),
+    res("group", str("admins"), [], 5)
+  ])
+  assertEq(graphOf(program([people], [call("people", [ListE([str("ana"), str("bo")], sp(1))])]), "web1", "debian12"), "1. group \"admins\"\n2. user \"ana\"\n     groups = [\"admins\"]\n3. user \"bo\"\n     groups = [\"admins\"]\nedges:\n  group admins -> user ana: the user is in that group\n  group admins -> user bo: the user is in that group\n")
+
+@test("a role call after a resource orders every resource of the role after it")
+afterGroups()
+  val inner = role("inner", [], [res("package", str("a"), [], 2), res("package", str("b"), [], 3)])
+  val outer = role("outer", [], [res("service", str("s"), [], 6, "svc"), CallS(call("inner", []), [nm("svc")], "", sp(7))])
+  assertEq(graphOf(program([inner, outer], [call("outer", [])]), "web1", "debian12"), "1. service \"s\"\n2. package \"a\"\n3. package \"b\"\nedges:\n  service s -> package a: `after` says so\n  service s -> package b: `after` says so\n")
+
+@test("arithmetic that overflows and a computed relative path are evaluation errors at their spans")
+evaluationErrors()
+  val big = role("big", [], [res("package", StrE([ExprP(BinaryE("*", num(9223372036854775807), num(2), sp(2)))], false, sp(2)), [], 2)])
+  assertEq(graphOf(program([big], [call("big", [])]), "web1", "debian12"), "errors: 2 E0316 this arithmetic overflows a 64-bit int")
+  val rel = role("rel", [param("d", ty("string"))], [res("file", StrE([ExprP(nm("d")), TextP("/x")], false, sp(3)), [], 3)])
+  assertEq(graphOf(program([rel], [call("rel", [str("etc")])]), "web1", "debian12"), "errors: 3 E0313 `etc/x` is not an absolute path")
+
+@test("paths are normalised")
+normalisedPaths()
+  val r = role("r", [], [res("directory", str("/srv//www/./a/../b/"), [], 2)])
+  assertEq(graphOf(program([r], [call("r", [])]), "web1", "debian12"), "1. directory \"/srv/www/b\"\n")
+
+@test("a host the inventory does not hold is an error")
+unknownHost()
+  val r = evaluate(program([], []), "nowhere", facts("debian12"))
+  assertEq(r.diagnostics.map(d -> s"${d.code} ${d.message}").mkString(""), "E0310 no group of the inventory holds a host `nowhere`")

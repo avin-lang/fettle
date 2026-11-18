@@ -1,0 +1,199 @@
+module dev.avinlang.fettle.fmt
+
+import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, Decl, DurationE, Expr, ExprP, FailE, FieldE, FieldS, FnD, ForE, ForS, GroupD, IfE, IfS, Import, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NamedT, NoneE, OnS, OptionalT, Param, Pattern, ResourceS, RoleD, ShE, SizeE, SourceFile, Stmt, StrE, StrPart, TextP, TupleE, TupleP, TypeExpr, UnaryE, ValD, ValS, VariantP, WildP, WithE, octal}
+
+// The canonical text of a file: two spaces a level, one blank line between top-level declarations,
+// nothing aligned, operators spaced, a call's arguments on one line.
+format(f: SourceFile) -> string
+  val out = StringWriter()
+  if !f.moduleName.isEmpty
+    out.write(s"module ${f.moduleName}\n")
+  if !f.imports.isEmpty
+    if !f.moduleName.isEmpty then out.write("\n")
+    for i in f.imports
+      out.write(showImport(i))
+      out.write("\n")
+  var first = f.moduleName.isEmpty && f.imports.isEmpty
+  for d in f.decls
+    if !first then out.write("\n")
+    first = false
+    writeDecl(out, d)
+  out.text
+
+showImport(i: Import) -> string = i.names match
+  [] -> s"import ${i.moduleName}"
+  names -> s"import ${i.moduleName}.{${names.map((n, _) -> n).mkString(", ")}}"
+
+private pad(level: int) -> string = "  ".repeat(level)
+
+private writeDecl(out: StringWriter, d: Decl) = d match
+  DataD(x) ->
+    val head = if x.params.isEmpty && !x.variants.isEmpty then x.name else s"${x.name}(${showParams(x.params)})"
+    out.write(s"data $head\n")
+    for v in x.variants
+      out.write(if v.params.isEmpty then s"  ${v.name}\n" else s"  ${v.name}(${showParams(v.params)})\n")
+  FnD(x) ->
+    out.write(s"${x.name}(${showParams(x.params)}) -> ${showType(x.result)} = ${showExpr(x.body)}\n")
+  RoleD(x) ->
+    val p = if x.isPrivate then "private " else ""
+    out.write(s"${p}role ${x.name}(${showParams(x.params)})\n")
+    writeBlock(out, x.body, 1)
+  ValD(x) -> writeValue(out, s"val ${showPattern(x.pattern)} = ", x.value, 0)
+  ApplyD(x) ->
+    val a = if x.alias.isEmpty then "" else s" as ${x.alias}"
+    x.calls match
+      [c] -> out.write(s"apply ${x.target}$a -> ${showExpr(c)}\n")
+      cs ->
+        out.write(s"apply ${x.target}$a ->\n")
+        for c in cs
+          out.write(s"  ${showExpr(c)}\n")
+  GroupD(x) ->
+    val t = if x.varsType.isEmpty then "" else s": ${x.varsType}"
+    out.write(s"group ${x.name}$t\n")
+    writeBlock(out, x.fields, 1)
+    for h in x.hosts
+      out.write(s"  host ${h.name} at ${showExpr(h.address)}\n")
+      writeBlock(out, h.fields, 2)
+  ConnectD(x) ->
+    out.write(s"connect ${x.target}\n")
+    writeBlock(out, x.fields, 1)
+
+private writeBlock(out: StringWriter, stmts: List[Stmt], level: int)
+  for s in stmts
+    writeStmt(out, s, level)
+
+private writeStmt(out: StringWriter, s: Stmt, level: int) = s match
+  ResourceS(r, name, _) ->
+    val bind = if name.isEmpty then "" else s"val $name = "
+    out.write(s"${pad(level)}$bind${r.kind} ${showExpr(r.title)}\n")
+    writeBlock(out, r.body, level + 1)
+  ValS(p, v, _) -> writeValue(out, s"${pad(level)}val ${showPattern(p)} = ", v, level)
+  CallS(call, after, name, _) ->
+    val bind = if name.isEmpty then "" else s"val $name = "
+    val a = if after.isEmpty then "" else s" after ${after.map(e -> showExpr(e)).mkString(", ")}"
+    out.write(s"${pad(level)}$bind${showExpr(call)}$a\n")
+  IfS(c, t, e, _) ->
+    out.write(s"${pad(level)}if ${showExpr(c)}\n")
+    writeBlock(out, t, level + 1)
+    if !e.isEmpty
+      out.write(s"${pad(level)}else\n")
+      writeBlock(out, e, level + 1)
+  ForS(p, over, body, _) ->
+    out.write(s"${pad(level)}for ${showPattern(p)} in ${showExpr(over)}\n")
+    writeBlock(out, body, level + 1)
+  MatchS(scrutinee, arms, _) ->
+    out.write(s"${pad(level)}match ${showExpr(scrutinee)}\n")
+    for a in arms
+      out.write(s"${pad(level + 1)}${showPattern(a.pattern)} ->\n")
+      writeBlock(out, a.body, level + 2)
+  AsS(user, body, _) ->
+    out.write(s"${pad(level)}as ${showExpr(user)}\n")
+    writeBlock(out, body, level + 1)
+  OnS(sources, action, _) -> out.write(s"${pad(level)}on ${sources.map(e -> showExpr(e)).mkString(", ")} -> $action\n")
+  AfterS(refs, _) -> out.write(s"${pad(level)}after ${refs.map(e -> showExpr(e)).mkString(", ")}\n")
+  FieldS(name, v, _) -> writeValue(out, s"${pad(level)}$name = ", v, level)
+
+// `head` and a value; a `match` puts its arms on the lines under it.
+private writeValue(out: StringWriter, head: string, v: Expr, level: int) = v match
+  MatchE(scrutinee, arms, _) ->
+    out.write(s"${head}match ${showExpr(scrutinee)}\n")
+    for a in arms
+      out.write(s"${pad(level + 1)}${showPattern(a.pattern)} -> ${showExpr(a.body)}\n")
+  _ -> out.write(s"$head${showExpr(v)}\n")
+
+showParams(params: List[Param]) -> string = params.map(p -> p.default match
+  Some(d) -> s"${p.name}: ${showType(p.declared)} = ${showExpr(d)}"
+  None -> s"${p.name}: ${showType(p.declared)}").mkString(", ")
+
+showType(t: TypeExpr) -> string = t match
+  NamedT(n, [], _) -> n
+  NamedT(n, args, _) -> s"$n[${args.map(a -> showType(a)).mkString(", ")}]"
+  OptionalT(inner, _) -> s"${showType(inner)}?"
+
+showPattern(p: Pattern) -> string = p match
+  WildP(_) -> "_"
+  BindP(n, _) -> n
+  VariantP(n, [], _) -> s"$n()"
+  VariantP(n, fs, _) -> s"$n(${fs.map(f -> showPattern(f)).mkString(", ")})"
+  TupleP(items, _) -> s"(${items.map(i -> showPattern(i)).mkString(", ")})"
+  LitP(e, _) -> showExpr(e)
+  AltP(alts, _) -> alts.map(a -> showPattern(a)).mkString(" | ")
+
+// How tightly an operator binds: higher binds tighter.
+precedence(op: string) -> int = op match
+  "||" -> 1
+  "&&" -> 2
+  "==" | "!=" | "<" | "<=" | ">" | ">=" -> 3
+  ".." | "..<" -> 4
+  "+" | "-" -> 5
+  _ -> 6
+
+// The precedence of an expression where it is an operand: an operator's, or above every operator.
+private tightness(e: Expr) -> int = e match
+  BinaryE(op, _, _, _) -> precedence(op)
+  IfE(_, _, _, _) | ForE(_, _, _, _, _) | LambdaE(_, _, _) | MatchE(_, _, _) | FailE(_, _) -> 0
+  _ -> 7
+
+private operand(e: Expr, least: int) -> string =
+  if tightness(e) < least then s"(${showExpr(e)})" else showExpr(e)
+
+showExpr(e: Expr) -> string = e match
+  IntE(v, _) -> s"$v"
+  ModeE(v, _) -> s"0o${octal(v)}"
+  DurationE(_, t, _) -> t
+  SizeE(_, t, _) -> t
+  BoolE(b, _) -> s"$b"
+  NoneE(_) -> "none"
+  StrE(parts, true, _) -> s"\"\"\"${showParts(parts, true)}\"\"\""
+  StrE(parts, false, _) -> s"\"${showParts(parts, false)}\""
+  ShE(parts, _) -> s"sh\"${showParts(parts, false)}\""
+  NameE(n, _) -> n
+  FieldE(t, n, _) -> s"${operand(t, 7)}.$n"
+  CallE(callee, args, _) -> s"${operand(callee, 7)}(${args.map(a -> showArg(a)).mkString(", ")})"
+  ListE(items, _) -> s"[${items.map(i -> showExpr(i)).mkString(", ")}]"
+  MapE(entries, _) -> if entries.isEmpty then "{}" else s"{ ${entries.map((k, v) -> s"${showExpr(k)}: ${showExpr(v)}").mkString(", ")} }"
+  TupleE(items, _) -> s"(${items.map(i -> showExpr(i)).mkString(", ")})"
+  UnaryE(op, x, _) -> s"$op${operand(x, 7)}"
+  BinaryE(op, l, r, _) ->
+    val p = precedence(op)
+    s"${operand(l, p)} $op ${operand(r, p + 1)}"
+  IfE(c, t, f, _) -> s"if ${showExpr(c)} then ${showExpr(t)} else ${showExpr(f)}"
+  MatchE(s, arms, _) -> s"match ${showExpr(s)} { ${arms.map(a -> s"${showPattern(a.pattern)} -> ${showExpr(a.body)}").mkString("; ")} }"
+  ForE(p, over, filter, body, _) ->
+    val f = filter match
+      Some(c) -> s" if ${showExpr(c)}"
+      None -> ""
+    s"for ${showPattern(p)} in ${showExpr(over)}$f yield ${showExpr(body)}"
+  WithE(t, fields, _) -> s"${operand(t, 7)} with { ${fields.map(f -> s"${f.name} = ${showExpr(f.value)}").mkString(", ")} }"
+  LambdaE([p], body, _) -> s"$p -> ${showExpr(body)}"
+  LambdaE(ps, body, _) -> s"(${ps.mkString(", ")}) -> ${showExpr(body)}"
+  FailE(m, _) -> s"fail ${showExpr(m)}"
+
+private showArg(a: Arg) -> string = if a.name.isEmpty then showExpr(a.value) else s"${a.name} = ${showExpr(a.value)}"
+
+// A string's pieces as written: each interpolation as `${expr}`, and in text a quote, a backslash,
+// a tab, a `$` before `{` and, outside `"""…"""`, a line end escaped.
+showParts(parts: List[StrPart], multiline: bool) -> string
+  val out = StringWriter()
+  for p in parts
+    p match
+      TextP(t) ->
+        var previousDollar = false
+        for c in t.charIterator()
+          if previousDollar
+            out.write(if c == '{' then "\\${" else "$")
+            if c == '{'
+              previousDollar = false
+              continue
+          previousDollar = c == '$'
+          c match
+            '$' -> ()
+            '"' -> out.write("\\\"")
+            '\\' -> out.write("\\\\")
+            '\t' -> out.write("\\t")
+            '\r' -> out.write("\\r")
+            '\n' -> if multiline then out.writeChar(c) else out.write("\\n")
+            _ -> out.writeChar(c)
+        if previousDollar then out.write("$")
+      ExprP(x) -> out.write(s"$${${showExpr(x)}}")
+  out.text

@@ -1,0 +1,156 @@
+module dev.avinlang.fettle.syntax
+
+// The syntax tree of a `.fettle` file: what the parser builds, and what the checker, the evaluator
+// and the formatter read. Every node a message can point at carries its span.
+
+// A type as written: `string`, `List[Person]`, `Map[string, int]`, `int?`.
+data TypeExpr
+  NamedT(name: string, args: List[TypeExpr], span: Span)
+  OptionalT(inner: TypeExpr, span: Span)
+
+// A piece of a string literal: text with its escapes decoded, or an interpolated expression.
+data StrPart
+  TextP(text: string)
+  ExprP(expr: Expr)
+
+// An argument of a call, by position or by name (`admin = true`).
+data Arg(name: string, value: Expr, span: Span)
+
+// A field set in a record update (`site with { port = 8443 }`).
+data FieldInit(name: string, value: Expr, span: Span)
+
+data Expr
+  IntE(value: long, span: Span)
+  ModeE(value: long, span: Span)
+  DurationE(millis: long, text: string, span: Span)
+  SizeE(bytes: long, text: string, span: Span)
+  BoolE(value: bool, span: Span)
+  NoneE(span: Span)
+  StrE(parts: List[StrPart], multiline: bool, span: Span)
+  // `sh"…"`.
+  ShE(parts: List[StrPart], span: Span)
+  NameE(name: string, span: Span)
+  // `target.name`.
+  FieldE(target: Expr, name: string, span: Span)
+  CallE(callee: Expr, args: List[Arg], span: Span)
+  ListE(items: List[Expr], span: Span)
+  MapE(entries: List[(Expr, Expr)], span: Span)
+  TupleE(items: List[Expr], span: Span)
+  // `-x`, `!x`.
+  UnaryE(op: string, operand: Expr, span: Span)
+  BinaryE(op: string, left: Expr, right: Expr, span: Span)
+  IfE(cond: Expr, thenE: Expr, elseE: Expr, span: Span)
+  MatchE(scrutinee: Expr, arms: List[Arm], span: Span)
+  // `for p in xs [if cond] yield e`.
+  ForE(pattern: Pattern, over: Expr, filter: Option[Expr], body: Expr, span: Span)
+  WithE(target: Expr, fields: List[FieldInit], span: Span)
+  // `x -> body`, only as an argument of a built-in collection function.
+  LambdaE(params: List[string], body: Expr, span: Span)
+  // `fail "message"`: evaluation stops for this host at this span.
+  FailE(message: Expr, span: Span)
+
+data Pattern
+  WildP(span: Span)
+  // A lone name: a binding, or a variant without fields, which the checker tells apart.
+  BindP(name: string, span: Span)
+  VariantP(name: string, fields: List[Pattern], span: Span)
+  TupleP(items: List[Pattern], span: Span)
+  LitP(value: Expr, span: Span)
+  // `a | b`.
+  AltP(alternatives: List[Pattern], span: Span)
+
+data Arm(pattern: Pattern, body: Expr, span: Span)
+
+// `kind title` and its block: fields, `on … -> action` and `after …`.
+data ResourceDecl(kind: string, title: Expr, body: List[Stmt], span: Span)
+
+// An arm of a `match` in statement position.
+data StmtArm(pattern: Pattern, body: List[Stmt], span: Span)
+
+data Stmt
+  // A resource, bound by `val name =` when `name` is not empty.
+  ResourceS(decl: ResourceDecl, name: string, span: Span)
+  ValS(pattern: Pattern, value: Expr, span: Span)
+  // A role called in statement position, optionally after other resources, optionally bound.
+  CallS(call: Expr, after: List[Expr], name: string, span: Span)
+  IfS(cond: Expr, thenS: List[Stmt], elseS: List[Stmt], span: Span)
+  ForS(pattern: Pattern, over: Expr, body: List[Stmt], span: Span)
+  MatchS(scrutinee: Expr, arms: List[StmtArm], span: Span)
+  AsS(user: Expr, body: List[Stmt], span: Span)
+  OnS(sources: List[Expr], action: string, span: Span)
+  AfterS(refs: List[Expr], span: Span)
+  FieldS(name: string, value: Expr, span: Span)
+
+data Param(name: string, declared: TypeExpr, default: Option[Expr], span: Span)
+
+data Variant(name: string, params: List[Param], span: Span)
+
+data HostDecl(name: string, address: Expr, fields: List[Stmt], span: Span)
+
+// `data Name(params)`, or `data Name` with variants under it.
+data DataDecl(name: string, params: List[Param], variants: List[Variant], span: Span)
+
+data FnDecl(name: string, params: List[Param], result: TypeExpr, body: Expr, span: Span)
+
+data RoleDecl(name: string, params: List[Param], body: List[Stmt], isPrivate: bool, span: Span)
+
+data ValDecl(pattern: Pattern, value: Expr, span: Span)
+
+// `apply target [as h] -> calls`.
+data ApplyDecl(target: string, alias: string, calls: List[Expr], span: Span)
+
+// `group name[: Vars]` with its defaults and its hosts.
+data GroupDecl(name: string, varsType: string, fields: List[Stmt], hosts: List[HostDecl], span: Span)
+
+// `connect target` and its settings.
+data ConnectDecl(target: string, fields: List[Stmt], span: Span)
+
+data Decl
+  DataD(d: DataDecl)
+  FnD(d: FnDecl)
+  RoleD(d: RoleDecl)
+  ValD(d: ValDecl)
+  ApplyD(d: ApplyDecl)
+  GroupD(d: GroupDecl)
+  ConnectD(d: ConnectDecl)
+
+// `import a.b.{X, y}`.
+data Import(moduleName: string, names: List[(string, Span)], span: Span)
+
+// A source file: its module, its imports and its declarations.
+data SourceFile(path: string, moduleName: string, imports: List[Import], decls: List[Decl])
+
+impl Expr
+  // Where the expression stands.
+  extent -> Span = self match
+    IntE(_, s) -> s
+    ModeE(_, s) -> s
+    DurationE(_, _, s) -> s
+    SizeE(_, _, s) -> s
+    BoolE(_, s) -> s
+    NoneE(s) -> s
+    StrE(_, _, s) -> s
+    ShE(_, s) -> s
+    NameE(_, s) -> s
+    FieldE(_, _, s) -> s
+    CallE(_, _, s) -> s
+    ListE(_, s) -> s
+    MapE(_, s) -> s
+    TupleE(_, s) -> s
+    UnaryE(_, _, s) -> s
+    BinaryE(_, _, _, s) -> s
+    IfE(_, _, _, s) -> s
+    MatchE(_, _, s) -> s
+    ForE(_, _, _, _, s) -> s
+    WithE(_, _, s) -> s
+    LambdaE(_, _, s) -> s
+    FailE(_, s) -> s
+
+impl Pattern
+  extent -> Span = self match
+    WildP(s) -> s
+    BindP(_, s) -> s
+    VariantP(_, _, s) -> s
+    TupleP(_, s) -> s
+    LitP(_, s) -> s
+    AltP(_, s) -> s

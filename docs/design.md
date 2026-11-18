@@ -881,3 +881,14 @@ user.
    `file` or `directory` of that path is declared. Review with the user.
 9. **A duplicate declaration that runs as another user (`as`) conflicts**, as a field difference
    does. Review with the user.
+10. **The architecture fact's type is `Cpu`** (`Amd64`, `Arm64`), since `Arch` is already a variant
+    of `Distro`; `Init` is `Systemd | OpenRc | Launchd | NoInit`, `Os` is `Linux | Darwin | FreeBsd`,
+    and `Become` is `Sudo | SudoPassword(secret) | Doas | NoBecome`, so no variant is named `None`
+    beside the value `none`. Review with the user.
+11. **A computed `string` may stand where a `path` is wanted**; the checker checks literals (absolute)
+    and evaluation checks computed values, normalising `//`, `.` and `..`. Review with the user.
+12. **A trigger's target is ordered after its sources**, as the trigger edge itself; `on` names
+    references only, and a name that is not bound is an unknown name, so a trigger on an undeclared
+    resource is refused at `fettle check`. Review with the user.
+13. **Diagnostic codes**: `E01xx` lexical, `E02xx` checker (`W02xx` warnings), `E03xx` evaluation,
+    `E04xx` the graph. Review with the user.

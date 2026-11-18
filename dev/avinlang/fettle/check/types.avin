@@ -1,0 +1,129 @@
+module dev.avinlang.fettle.check
+
+import dev.avinlang.fettle.kinds.{BoolT, CommandT, ContentT, DurationT, FieldType, IntT, ListT, ModeT, PathT, SizeT, StringT}
+
+// A type the checker gives an expression.
+data Ty
+  StrTy
+  IntTy
+  BoolTy
+  PathTy
+  ModeTy
+  DurationTy
+  SizeTy
+  SecretTy
+  CommandTy
+  ListTy(element: Ty)
+  MapTy(key: Ty, value: Ty)
+  SetTy(element: Ty)
+  OptTy(inner: Ty)
+  TupleTy(items: List[Ty])
+  // A `data` type: a record, or an algebraic type when it has variants.
+  DataTy(name: string)
+  // `Host[V]`.
+  HostTy(vars: Ty)
+  // A reference to a resource of `kind`; any resource when `kind` is empty.
+  RefTy(kind: string)
+  // The resources a role call made.
+  GroupTy
+  // A `file`'s content: a `string` or, where the field allows, a `secret`.
+  ContentTy
+  // What `fail` and `none` and an empty list have: fits any type.
+  NothingTy
+  // The type of an expression already reported wrong: fits anything, so one mistake is one error.
+  ErrTy
+
+impl Ty
+  shown -> string = self match
+    StrTy -> "string"
+    IntTy -> "int"
+    BoolTy -> "bool"
+    PathTy -> "path"
+    ModeTy -> "mode"
+    DurationTy -> "duration"
+    SizeTy -> "size"
+    SecretTy -> "secret"
+    CommandTy -> "Command"
+    ListTy(e) -> s"List[${e.shown}]"
+    MapTy(k, v) -> s"Map[${k.shown}, ${v.shown}]"
+    SetTy(e) -> s"Set[${e.shown}]"
+    OptTy(i) -> s"${i.shown}?"
+    TupleTy(items) -> s"(${items.map(t -> t.shown).mkString(", ")})"
+    DataTy(n) -> n
+    HostTy(v) -> s"Host[${v.shown}]"
+    RefTy("") -> "Resource"
+    RefTy(k) -> refName(k)
+    GroupTy -> "a role's resources"
+    ContentTy -> "string or secret"
+    NothingTy -> "Nothing"
+    ErrTy -> "?"
+
+// A reference type's name: `File` for `file`.
+refName(kind: string) -> string = if kind.isEmpty then "Resource" else s"${kind.take(1).toUpper}${kind.drop(1)}"
+
+// Whether a value of `actual` may stand where `expected` is wanted.
+fits(actual: Ty, expected: Ty) -> bool = (actual, expected) match
+  (ErrTy, _) | (_, ErrTy) | (NothingTy, _) -> true
+  (StrTy, ContentTy) | (SecretTy, ContentTy) -> true
+  // A computed string stands for a path; evaluation checks it is absolute, a literal is checked here.
+  (StrTy, PathTy) -> true
+  (RefTy(_), RefTy("")) -> true
+  (GroupTy, RefTy("")) -> true
+  (a, OptTy(i)) -> a == expected || fits(a, i)
+  (ListTy(a), ListTy(b)) -> fits(a, b)
+  (SetTy(a), SetTy(b)) -> fits(a, b)
+  (MapTy(ka, va), MapTy(kb, vb)) -> fits(ka, kb) && fits(va, vb)
+  (TupleTy(xs), TupleTy(ys)) -> xs.length == ys.length && xs.zip(ys).forall((a, b) -> fits(a, b))
+  (HostTy(_), HostTy(DataTy(""))) -> true
+  _ -> actual == expected
+
+// The type a kind's field schema declares.
+fieldTy(t: FieldType) -> Ty = t match
+  StringT -> StrTy
+  IntT -> IntTy
+  BoolT -> BoolTy
+  PathT -> PathTy
+  ModeT -> ModeTy
+  DurationT -> DurationTy
+  SizeT -> SizeTy
+  ListT(e) -> ListTy(fieldTy(e))
+  CommandT -> CommandTy
+  ContentT -> ContentTy
+
+// Whether `t` holds a secret anywhere, so it may not be interpolated, compared or passed as an
+// argument.
+holdsSecret(t: Ty) -> bool = t match
+  SecretTy -> true
+  ListTy(e) -> holdsSecret(e)
+  SetTy(e) -> holdsSecret(e)
+  OptTy(e) -> holdsSecret(e)
+  MapTy(k, v) -> holdsSecret(k) || holdsSecret(v)
+  TupleTy(items) -> items.exists(i -> holdsSecret(i))
+  _ -> false
+
+// The edit distance between two names, for "did you mean".
+distance(a: string, b: string) -> int
+  val xs = a.charIterator().toVector
+  val ys = b.charIterator().toVector
+  var previous = Buffer[int]()
+  for j in 0..ys.length
+    previous += j
+  for i in 1..xs.length
+    val current = Buffer[int]()
+    current += i
+    for j in 1..ys.length
+      val cost = if xs(i - 1) == ys(j - 1) then 0 else 1
+      current += min(min(previous(j) + 1, current(j - 1) + 1), previous(j - 1) + cost)
+    previous = current
+  previous(ys.length)
+
+// The nearest of `candidates` to `name`, if one is near enough to be a likely misspelling.
+nearest(name: string, candidates: Iterable[string]) -> Option[string]
+  var best: Option[string] = None
+  var bestDistance = 3
+  for c in candidates
+    val d = distance(name, c)
+    if d < bestDistance && d < name.byteLength && d <= max(2, name.byteLength / 3)
+      best = Some(c)
+      bestDistance = d
+  best

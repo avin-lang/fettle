@@ -1,0 +1,200 @@
+module tests
+
+import dev.avinlang.fettle.syntax.{Expr, Pattern, SourceFile, Stmt, AltP, Arm, BinaryE, BindP, CallE, CallS, ConnectD, ConnectDecl, Decl, ExprP, FieldE, ForE, ForS, GroupD, GroupDecl, HostDecl, Import, LambdaE, ListE, MatchE, ModeE, NameE, OnS, RoleD, RoleDecl, ShE, StrE, TextP, TupleE, TupleP, ValS, Variant, VariantP, WildP, ApplyD, ApplyDecl}
+import dev.avinlang.fettle.check.{check}
+
+// `data Site(domain: string, root: path = "/srv/www", port: int = 443)`.
+siteData() -> Decl = record("Site", [param("domain", ty("string")), paramD("root", ty("path"), str("/srv/www")), paramD("port", ty("int"), num(443))])
+
+// A role holding `body`, taking a `site: Site` and a `key: secret`.
+inRole(body: List[Stmt]) -> List[SourceFile] =
+  [source([siteData(), role("web", [param("site", ty("Site")), param("key", ty("secret"))], body)])]
+
+field(target: Expr, n: string, line: int = 1) -> Expr = FieldE(target, n, sp(line))
+
+@test("a well-formed role checks clean")
+clean()
+  assertEq(diags(inRole([
+    res("package", str("nginx"), [], 2),
+    res("directory", str("/etc/nginx/tls"), [fieldS("mode", ModeE(488, sp(4)), 4)], 3, "tls"),
+    res("file", StrE([ExprP(field(nm("tls"), "path")), TextP("/"), ExprP(field(nm("site"), "domain")), TextP(".key")], false, sp(5)), [fieldS("content", nm("key"), 6), fieldS("mode", ModeE(384, sp(7)), 7)], 5, "k"),
+    res("service", str("nginx"), [OnS([nm("k")], "reload", sp(9))], 8)
+  ])), "")
+
+@test("an unknown name is an error suggesting the nearest spelling")
+unknownName()
+  val d = check(inRole([res("package", field(nm("sit", 2), "domain"), [], 2)]))
+  assertEq(d.map(x -> s"${x.span.start.line} ${x.code} ${x.message} | ${x.help}").mkString("; "), "2 E0201 there is no value `sit` | did you mean `site`?")
+
+@test("an unknown field is an error suggesting the nearest spelling")
+unknownField()
+  val d = check(inRole([res("package", StrE([ExprP(field(nm("site"), "prot", 3))], false, sp(3)), [], 3)]))
+  assertEq(d.map(x -> s"${x.span.start.line} ${x.code} ${x.message} | ${x.help}").mkString("; "), "3 E0202 `Site` has no field `prot` | did you mean `port`?")
+  assertEq(errors(inRole([res("file", str("/x"), [fieldS("mdoe", ModeE(384, sp(4)), 4)], 3)])), "4 E0202 `file` has no field `mdoe`")
+  assertEq(errors(inRole([res("pakage", str("x"), [], 5)])), "5 E0201 there is no resource kind `pakage`")
+
+@test("a string where a mode is wanted is the design's E0207 with its help")
+modeMismatch()
+  val d = check(inRole([res("file", str("/x"), [fieldS("mode", str("0600", 17), 17)], 16)]))
+  assertEq(d.map(x -> s"${x.span.start.line} ${x.code} ${x.message} | ${x.label} | ${x.help}").mkString("; "), "17 E0207 the field `mode` of `file` is a `mode`, but this is a `string` | a string | a mode is written as an octal literal: `mode = 0o600`")
+
+@test("typed scalar literals are checked: relative paths and modes past 0o7777")
+scalarLiterals()
+  assertEq(errors(inRole([res("file", str("etc/x", 2), [], 2)])), "2 E0220 `etc/x` is not an absolute path")
+  assertEq(errors(inRole([res("file", str("/x"), [fieldS("mode", ModeE(524287, sp(3)), 3)], 2)])), "3 E0221 `0o1777777` is not a file mode: a mode is at most `0o7777`")
+  assertEq(errors(inRole([res("file", str("/x"), [fieldS("mode", ModeE(4095, sp(3)), 3)], 2)])), "")
+  assertEq(errors(inRole([res("file", StrE([ExprP(field(nm("site"), "domain"))], false, sp(2)), [], 2)])), "")
+
+// `match host.distro` with the arms given, each yielding a pair of strings.
+distroMatch(arms: List[Arm]) -> List[SourceFile] =
+  [source([role("timeSync", [], [ValS(TupleP([BindP("unit", sp(2)), BindP("config", sp(2))], sp(2)), MatchE(field(nm("host"), "distro"), arms, sp(2)), sp(2)),
+    res("service", nm("unit"), [], 8), res("file", nm("config"), [], 9)])])]
+
+pair(a: string, b: string, line: int) -> Expr = TupleE([str(a), str(b)], sp(line))
+
+vp(n: string, line: int) -> Pattern = VariantP(n, [WildP(sp(line))], sp(line))
+
+@test("a match on an enum must cover every variant, and the error names those missing")
+exhaustiveness()
+  val arms: List[Arm] = [
+    Arm(AltP([vp("Debian", 3), vp("Ubuntu", 3)], sp(3)), pair("chrony", "/etc/chrony/chrony.conf", 3), sp(3)),
+    Arm(AltP([vp("Fedora", 4), vp("Rhel", 4)], sp(4)), pair("chronyd", "/etc/chrony.conf", 4), sp(4)),
+    Arm(vp("Alpine", 5), pair("chronyd", "/etc/chrony/chrony.conf", 5), sp(5))
+  ]
+  assertEq(errors(distroMatch(arms)), "2 E0204 this `match` does not cover `Arch`, `Macos(_)`, `Other(_)`")
+  assertEq(errors(distroMatch(arms ++ [Arm(BindP("other", sp(6)), pair("x", "/y", 6), sp(6))])), "")
+
+@test("an arm after every value is covered is unreachable")
+unreachable()
+  val arms: List[Arm] = [
+    Arm(BindP("other", sp(3)), pair("a", "/b", 3), sp(3)),
+    Arm(vp("Alpine", 4), pair("c", "/d", 4), sp(4))
+  ]
+  assertEq(errors(distroMatch(arms)), "4 E0205 this arm is never reached: the arms before it cover every value")
+  val again: List[Arm] = [
+    Arm(vp("Alpine", 3), pair("a", "/b", 3), sp(3)),
+    Arm(vp("Alpine", 4), pair("c", "/d", 4), sp(4)),
+    Arm(WildP(sp(5)), pair("e", "/f", 5), sp(5))
+  ]
+  assertEq(errors(distroMatch(again)), "4 E0205 this arm is never reached: the arms before it cover its variants")
+
+@test("a record built without a field that has no default is an error")
+missingFields()
+  val files: List[SourceFile] = [source([siteData(), valD("s", call("Site", [], 3), 3)])]
+  assertEq(errors(files), "3 E0206 `Site` is missing `domain`")
+  assertEq(errors([source([siteData(), valD("s", callArgs("Site", [arg(str("a.example")), named("port", num(8443))], 3), 3)])]), "")
+  assertEq(errors([source([siteData(), valD("s", callArgs("Site", [named("domian", str("a"))], 3), 3)])]), "1 E0202 `Site` has no parameter `domian`; 3 E0206 `Site` is missing `domain`")
+
+// `data WebVars(domain: string, workers: int = 4)`, a group of it, and its hosts.
+inventory(groupFields: List[Stmt], hosts: List[HostDecl]) -> List[SourceFile] =
+  [source([record("WebVars", [param("domain", ty("string")), paramD("workers", ty("int"), num(4))]),
+    GroupD(GroupDecl("web", "WebVars", groupFields, hosts, sp(2)))])]
+
+@test("a host of a group that sets none of a var without a default is an error at the host")
+groupHostVars()
+  val ok = HostDecl("web1", str("10.0.0.11"), [fieldS("domain", str("a.example.com"))], sp(4))
+  val missing = HostDecl("web2", str("10.0.0.12"), [fieldS("workers", num(8))], sp(6))
+  assertEq(errors(inventory([fieldS("workers", num(8), 3)], [ok, missing])), "6 E0208 host `web2` of group `web` sets no `domain`")
+  assertEq(errors(inventory([fieldS("domain", str("d"), 3)], [missing])), "")
+  assertEq(errors(inventory([fieldS("wokers", num(8), 3)], [ok])), "3 E0202 `wokers` is not a connection setting or a field of `WebVars`")
+  assertEq(errors(inventory([fieldS("user", str("deploy"), 3)], [ok])), "")
+
+@test("a secret in a command's arguments or in a string is refused; on standard input it is accepted")
+secretFlow()
+  val inArgs = res("command", str("load"), [fieldS("run", call("cmd", [str("load"), nm("key", 3)], 3), 3), fieldS("always", nm("true"), 4)], 2)
+  assertEq(errors(inRole([inArgs])), "3 E0209 a secret cannot be in a command's argument list")
+  val viaStdin = res("command", str("load"), [fieldS("run", CallE(FieldE(call("cmd", [str("load")]), "stdin", sp(3)), [arg(nm("key"))], sp(3)), 3), fieldS("always", nm("true"), 4)], 2)
+  assertEq(errors(inRole([viaStdin])), "")
+  val inString = res("file", str("/x"), [fieldS("content", StrE([TextP("k="), ExprP(nm("key", 3))], false, sp(3)), 3)], 2)
+  assertEq(errors(inRole([inString])), "3 E0210 a secret cannot be interpolated into a string")
+  val inShell = res("command", str("x"), [fieldS("run", ShE([TextP("echo "), ExprP(nm("key", 3))], sp(3)), 3), fieldS("always", nm("true"))], 2)
+  assertEq(errors(inRole([inShell])), "3 E0210 a secret cannot be interpolated into a string")
+  val compared = res("package", str("x"), [fieldS("present", BinaryE("==", nm("key"), str("k"), sp(3)), 3)], 2)
+  assertEq(errors(inRole([compared])), "3 E0210 a secret cannot be compared")
+  val wrongField = res("file", str("/x"), [fieldS("owner", nm("key", 3), 3)], 2)
+  assertEq(errors(inRole([wrongField])), "3 E0209 a secret cannot be the field `owner` of `file`")
+
+@test("local reads a file that must exist")
+localFiles()
+  val files: List[SourceFile] = [source([valD("cert", call("local", [str("certs/a.crt", 2)], 2), 2)])]
+  assertEq(check(files, f -> false).map(d -> s"${d.span.start.line} ${d.code} ${d.message}").mkString("; "), "2 E0211 `local` reads `certs/a.crt`, which does not exist")
+  assertEq(check(files, f -> f == "certs/a.crt").length, 0)
+
+@test("staged exists only inside a file's validate")
+staged()
+  val inside = res("file", str("/etc/sudoers.d/admins"), [fieldS("validate", call("cmd", [str("visudo"), str("-cf"), nm("staged")]), 3)], 2)
+  assertEq(errors(inRole([inside])), "")
+  val outside = res("file", str("/x"), [fieldS("content", StrE([ExprP(nm("staged", 3))], false, sp(3)), 3)], 2)
+  assertEq(errors(inRole([outside])), "3 E0212 `staged` exists only inside a file's `validate`")
+
+@test("on names resources only, and only an action the target kind offers")
+onAndActions()
+  val notRef = res("service", str("nginx"), [OnS([nm("site", 3)], "reload", sp(3))], 2)
+  assertEq(errors(inRole([notRef])), "3 E0213 `on` names resources, and this is a `Site`")
+  val conf = res("file", str("/etc/a.conf"), [], 2, "conf")
+  val noAction = res("file", str("/etc/b"), [OnS([nm("conf")], "reload", sp(4))], 3)
+  val d = check(inRole([conf, noAction]))
+  assertEq(d.map(x -> s"${x.span.start.line} ${x.code} ${x.message} | ${x.notes.mkString("")}").mkString("; "), "4 E0214 `file` has no action `reload` | `file` offers no actions")
+  val badAction = res("service", str("s"), [OnS([nm("conf")], "relaod", sp(4))], 3)
+  assertEq(check(inRole([conf, badAction])).map(x -> x.help).mkString(""), "did you mean `reload`?")
+  val undeclared = res("service", str("s"), [OnS([nm("cnf", 4)], "reload", sp(4))], 3)
+  assertEq(errors(inRole([conf, undeclared])), "4 E0201 there is no value `cnf`")
+
+@test("calls that form a cycle are an error naming the cycle")
+callCycles()
+  val a = role("a", [], [CallS(call("b", [], 2), [], "", sp(2))], 1)
+  val b = role("b", [], [CallS(call("a", [], 5), [], "", sp(5))], 4)
+  assertEq(errors([source([a, b])]), "2 E0215 these calls form a cycle, and fettle programs do not recurse: a -> b -> a")
+  val recursive = fnD("f", [param("n", ty("int"))], ty("int"), call("f", [nm("n")], 7), 7)
+  assertEq(errors([source([recursive])]), "7 E0215 these calls form a cycle, and fettle programs do not recurse: f -> f")
+  val chain: List[Decl] = [role("x", [], [CallS(call("y", [], 2), [], "", sp(2))]), role("y", [], [res("package", str("p"), [])])]
+  assertEq(errors([source(chain)]), "")
+
+@test("for ranges only over finite collections")
+forCollections()
+  val overInt = ForS(BindP("i", sp(2)), num(3, 2), [res("package", str("p"), [], 3)], sp(2))
+  assertEq(errors(inRole([overInt])), "2 E0219 `for` ranges over a list, a set, a map or a range of ints, not a `int`")
+  val overRange = ForS(BindP("i", sp(2)), BinaryE("..", num(1), num(3), sp(2)), [res("package", StrE([TextP("p"), ExprP(nm("i"))], false, sp(3)), [], 3)], sp(2))
+  assertEq(errors(inRole([overRange])), "")
+  val overList = ForS(BindP("n", sp(2)), ListE([str("a"), str("b")], sp(2)), [res("user", nm("n"), [], 3)], sp(2))
+  assertEq(errors(inRole([overList])), "")
+
+@test("unused values and imports are warnings")
+unused()
+  val d = check(inRole([ValS(BindP("unusedThing", sp(2)), num(1), sp(2)), res("package", str("p"), [], 3)]))
+  assertEq(d.map(x -> s"${x.span.start.line} ${x.code} ${x.message} ${x.warning}").mkString("; "), "2 W0216 `unusedThing` is never used true")
+  val lib = source([siteData()], "roles", [], "roles/web.fettle")
+  val main = source([valD("x", num(1))], "", [Import("roles", [("Site", sp(1))], sp(1))])
+  assertEq(diags([lib, main]), "1 W0217 `Site` is imported and never used")
+
+@test("imports name declarations of other modules, never a private one")
+imports()
+  val lib = source([siteData(), RoleD(RoleDecl("hidden", [], [], true, sp(2)))], "roles", [], "roles/web.fettle")
+  val main = source([valD("s", call("Site", [str("a")]))], "", [Import("roles", [("Site", sp(1)), ("hidden", sp(1)), ("Sight", sp(1))], sp(1))])
+  assertEq(errors([lib, main]), "1 E0232 `hidden` is private to module `roles`; 1 E0201 module `roles` declares no `Sight`")
+  assertEq(errors([source([], "", [Import("rolse", [("Site", sp(1))], sp(1))])]), "1 E0231 there is no module `rolse`")
+
+@test("duplicate literal titles in one role are an error unless identical")
+duplicateTitles()
+  val same: List[Stmt] = [res("package", str("git"), [], 2), res("package", str("git"), [], 3)]
+  assertEq(errors(inRole(same)), "")
+  val differ: List[Stmt] = [res("file", str("/x"), [fieldS("mode", ModeE(384, sp(2)))], 2), res("file", str("/x"), [fieldS("mode", ModeE(420, sp(3)))], 3)]
+  assertEq(errors(inRole(differ)), "3 E0218 `file /x` is declared twice in this role with different fields")
+
+@test("a command with no guard and no trigger is refused unless it says always")
+commandGuard()
+  assertEq(errors(inRole([res("command", str("migrate"), [fieldS("run", call("cmd", [str("migrate")]))], 2)])), "2 E0222 a `command` with no guard runs on every apply")
+  assertEq(errors(inRole([res("command", str("migrate"), [fieldS("run", call("cmd", [str("m")])), fieldS("creates", str("/var/done"))], 2)])), "")
+
+@test("every mistake in a program is reported, not just the first")
+manyErrors()
+  val body: List[Stmt] = [
+    res("file", str("rel", 2), [fieldS("mode", str("600", 3), 3)], 2),
+    res("pakage", str("x"), [], 4),
+    res("package", nm("nope", 5), [], 5)
+  ]
+  assertEq(errors(inRole(body)), "2 E0220 `rel` is not an absolute path; 3 E0207 the field `mode` of `file` is a `mode`, but this is a `string`; 4 E0201 there is no resource kind `pakage`; 5 E0201 there is no value `nope`")
+
+@test("a declaration made twice in one module is an error")
+declaredTwice()
+  assertEq(errors([source([siteData(), record("Site", [], 5)])]), "5 E0230 `Site` is declared twice in module `(root)`")

@@ -1,0 +1,1045 @@
+module dev.avinlang.fettle.check
+
+import avin.collections.mutable.{Map as Table}
+import dev.avinlang.fettle.kinds.{KindSpec, builtinKinds, kindNamed}
+import dev.avinlang.fettle.fmt.{showExpr}
+import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, FnDecl, GroupDecl, HostDecl, RoleDecl, ValDecl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldS, FnD, ForE, ForS, GroupD, IfE, IfS, Import, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NamedT, NoneE, OnS, OptionalT, Param, Pattern, ResourceDecl, ResourceS, RoleD, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, TextP, TupleE, TupleP, TypeExpr, UnaryE, ValD, ValS, Variant, VariantP, WildP, WithE}
+
+// The checker: every file of a project checked together, every mistake reported with its span, and
+// checking carried on past each.
+//
+// Files in one directory share a module; `import m.{X}` names a declaration of the module `m`,
+// which `private` keeps out of reach. The checker resolves names, gives every expression a type and
+// checks it against what is wanted, checks that a `match` on an enum covers every variant and has no
+// arm it cannot reach, that no `fn` or `role` calls itself through any chain of calls, that `for`
+// ranges over a collection, that a secret reaches no string and no command's arguments, and the
+// rest of what section 3.5 of the design refuses.
+
+// Checks `files`, answering every diagnostic in the order found. `exists` says whether a file next
+// to the program exists, for `local(…)`.
+check(files: List[SourceFile], exists: (string) -> bool = _ -> true) -> Vector[Diagnostic]
+  val c = Checker(files, exists)
+  c.run()
+  c.diagnostics.toVector
+
+// A name bound in a scope: a parameter, a `val`, a pattern's binding. `used` is set when it is read.
+class Local(val name: string, val ty: Ty, val span: Span, val warnUnused: bool)
+  var used = false
+
+// The declarations of one module.
+class Module(val name: string)
+  val datas = Table[string, DataDecl]()
+  val fns = Table[string, FnDecl]()
+  val roles = Table[string, RoleDecl]()
+  val vals = Table[string, ValDecl]()
+  val groups = Table[string, GroupDecl]()
+  // Each declared name with where it is declared, to report a second declaration.
+  val declared = Table[string, Span]()
+
+// What a statement may hold where it stands.
+data Where(role: string, inKind: string)
+
+class Checker(val files: List[SourceFile], val exists: (string) -> bool)
+  val diagnostics = Buffer[Diagnostic]()
+  private val modules = Table[string, Module]()
+  // Every variant name, with the type it belongs to.
+  private val variantOf = Table[string, (string, Variant)]()
+  private val allData = Table[string, DataDecl]()
+  // The module the file being checked is in, and the names it imports, each to its module.
+  private var current = Module("")
+  private val imported = Table[string, string]()
+  private val importUses = Table[string, (Span, bool)]()
+  // Top-level vals' types once worked out, and those being worked out.
+  private val valTypes = Table[string, Ty]()
+  private val computing = Buffer[string]()
+  // The calls each fn and role makes, for the cycle check.
+  private val calls = Table[string, Buffer[(string, Span)]]()
+  private var caller = ""
+
+  // --- Reporting ----------------------------------------------------------------------------
+
+  private error(code: string, message: string, span: Span, label: string = "", help: string = "", notes: List[string] = [], secondary: List[(Span, string)] = [])
+    diagnostics += Diagnostic(code, message, span, label, notes, help, false, secondary)
+
+  private warn(code: string, message: string, span: Span, label: string = "", help: string = "")
+    diagnostics += Diagnostic(code, message, span, label, [], help, true)
+
+  private didYouMean(name: string, candidates: Iterable[string]) -> string = nearest(name, candidates) match
+    Some(n) -> s"did you mean `$n`?"
+    None -> ""
+
+  // --- Declarations -------------------------------------------------------------------------
+
+  run()
+    for d in builtinData
+      registerData(d)
+    for f in files
+      val m = modules.getOrElseUpdate(f.moduleName, Module(f.moduleName))
+      for d in f.decls
+        declare(m, d)
+    for f in files
+      current = modules(f.moduleName)
+      imported.clear()
+      importUses.clear()
+      resolveImports(f)
+      for d in f.decls
+        checkDecl(d)
+      for (n, (s, used)) in importUses
+        if !used then warn("W0217", s"`$n` is imported and never used", s, "unused import", "remove it")
+    checkCycles()
+
+  private registerData(d: DataDecl)
+    allData(d.name) = d
+    for v in d.variants
+      variantOf(v.name) = (d.name, v)
+
+  private declare(m: Module, d: Decl)
+    val (name, span) = d match
+      DataD(x) -> (x.name, x.span)
+      FnD(x) -> (x.name, x.span)
+      RoleD(x) -> (x.name, x.span)
+      ValD(x) -> x.pattern match
+        BindP(n, _) -> (n, x.span)
+        _ -> ("", x.span)
+      GroupD(x) -> (x.name, x.span)
+      ApplyD(x) -> ("", x.span)
+      ConnectD(x) -> ("", x.span)
+    if name.isEmpty then return
+    m.declared.get(name) match
+      Some(first) ->
+        error("E0230", s"`$name` is declared twice in module `${moduleLabel(m.name)}`", span, "declared again here", "", [], [(first, "first declared here")])
+        return
+      None -> m.declared(name) = span
+    d match
+      DataD(x) ->
+        m.datas(name) = x
+        registerData(x)
+      FnD(x) -> m.fns(name) = x
+      RoleD(x) -> m.roles(name) = x
+      ValD(x) -> m.vals(name) = x
+      GroupD(x) -> m.groups(name) = x
+      _ -> ()
+
+  private moduleLabel(name: string) -> string = if name.isEmpty then "(root)" else name
+
+  private resolveImports(f: SourceFile)
+    for i in f.imports
+      modules.get(i.moduleName) match
+        None -> error("E0231", s"there is no module `${i.moduleName}`", i.span, "unknown module", didYouMean(i.moduleName, modules.keysIterator().toVector))
+        Some(m) ->
+          for (n, s) in i.names
+            if !m.declared.contains(n)
+              error("E0201", s"module `${i.moduleName}` declares no `$n`", s, "not declared there", didYouMean(n, m.declared.keysIterator().toVector))
+            else if isPrivate(m, n)
+              error("E0232", s"`$n` is private to module `${i.moduleName}`", s, "private")
+            else
+              imported(n) = i.moduleName
+              importUses(n) = (s, false)
+
+  private isPrivate(m: Module, n: string) -> bool = m.roles.get(n).exists(r -> r.isPrivate)
+
+  // The module declaring `name` as the current file sees it: its own, or the one it imports it from.
+  private moduleOf(name: string) -> Option[Module]
+    if current.declared.contains(name) then return Some(current)
+    imported.get(name) match
+      Some(mn) ->
+        importUses.get(name) match
+          Some((s, _)) -> importUses(name) = (s, true)
+          None -> ()
+        modules.get(mn)
+      None -> None
+
+  private findData(name: string) -> Option[DataDecl]
+    moduleOf(name).flatMap(m -> m.datas.get(name)) match
+      Some(d) -> Some(d)
+      None -> builtinData.find(d -> d.name == name)
+
+  private findFn(name: string) -> Option[FnDecl] = moduleOf(name).flatMap(m -> m.fns.get(name))
+
+  private findRole(name: string) -> Option[RoleDecl] = moduleOf(name).flatMap(m -> m.roles.get(name))
+
+  // Every name visible at the top level, for "did you mean".
+  private visibleNames() -> Vector[string]
+    val out = Buffer[string]()
+    out ++= current.declared.keysIterator().toVector
+    out ++= imported.keysIterator().toVector
+    out ++= variantOf.keysIterator().toVector
+    out ++= ["host", "secret", "cmd", "lines", "local", "render", "none", "true", "false"]
+    out.toVector
+
+  // --- Types as written ---------------------------------------------------------------------
+
+  resolveType(t: TypeExpr) -> Ty = t match
+    OptionalT(inner, _) -> OptTy(resolveType(inner))
+    NamedT(n, args, s) ->
+      val resolved = args.map(a -> resolveType(a))
+      (n, resolved) match
+        ("string", []) -> StrTy
+        ("int", []) -> IntTy
+        ("bool", []) -> BoolTy
+        ("path", []) -> PathTy
+        ("mode", []) -> ModeTy
+        ("duration", []) -> DurationTy
+        ("size", []) -> SizeTy
+        ("secret", []) -> SecretTy
+        ("Command", []) -> CommandTy
+        ("List", [e]) -> ListTy(e)
+        ("Set", [e]) -> SetTy(e)
+        ("Map", [k, v]) ->
+          if !(k == StrTy || k == IntTy || k == ErrTy)
+            error("E0203", s"a map's keys are `string` or `int`, not `${k.shown}`", s, "key type")
+          MapTy(k, v)
+        ("Host", [v]) -> HostTy(v)
+        ("Resource", []) -> RefTy("")
+        _ ->
+          if !args.isEmpty && (n == "List" || n == "Set" || n == "Map" || n == "Host")
+            error("E0233", s"`$n` takes ${if n == "Map" then 2 else 1} type arguments, not ${args.length}", s, "type arguments")
+            return ErrTy
+          builtinKinds.find(k -> refName(k.name) == n) match
+            Some(k) -> return RefTy(k.name)
+            None -> ()
+          findData(n) match
+            Some(d) -> DataTy(d.name)
+            None ->
+              error("E0201", s"there is no type `$n`", s, "unknown type", didYouMean(n, ["string", "int", "bool", "path", "mode", "duration", "size", "secret", "List", "Map", "Set"] ++ allData.keysIterator().toVector))
+              ErrTy
+
+  // --- Declarations -------------------------------------------------------------------------
+
+  private checkDecl(d: Decl) = d match
+    DataD(x) ->
+      checkParams(x.params)
+      for v in x.variants
+        checkParams(v.params)
+    FnD(x) ->
+      caller = x.name
+      val env = bindParams(x.params)
+      val r = resolveType(x.result)
+      val t = expr(x.body, env, Some(r))
+      mismatch(t, r, x.body, s"`${x.name}` returns")
+      caller = ""
+    RoleD(x) ->
+      caller = x.name
+      val env = bindParams(x.params)
+      block(x.body, env, Where(x.name, ""))
+      duplicateTitles(x.body)
+      caller = ""
+    ValD(x) -> x.pattern match
+      BindP(n, _) ->
+        valType(n)
+        ()
+      p ->
+        bindPattern(p, expr(x.value, [], None), false)
+        ()
+    ApplyD(x) ->
+      val vars = targetVars(x.target, x.span)
+      val env: List[Local] = if x.alias.isEmpty then [] else [Local(x.alias, HostTy(vars), x.span, false)]
+      for c in x.calls
+        roleCall(c, env, x.span)
+    GroupD(x) -> checkGroup(x.name, x.varsType, x.fields, x.hosts, x.span)
+    ConnectD(x) ->
+      if x.target != "all" && !current.groups.contains(x.target) && !hostNamed(x.target)
+        error("E0201", s"there is no group or host `${x.target}`", x.span, "unknown target")
+      for f in x.fields
+        connectionField(f, None)
+
+  private checkParams(params: List[Param])
+    for p in params
+      val t = resolveType(p.declared)
+      p.default match
+        Some(d) -> mismatch(expr(d, [], Some(t)), t, d, s"the default of `${p.name}`")
+        None -> ()
+
+  private bindParams(params: List[Param]) -> List[Local]
+    var env: List[Local] = []
+    for p in params
+      env = Local(p.name, resolveType(p.declared), p.span, false) :: env
+    env
+
+  // The type of a top-level `val`, worked out on first use.
+  private valType(name: string) -> Ty
+    valTypes.get(name) match
+      Some(t) -> return t
+      None -> ()
+    if computing.contains(name) then return ErrTy
+    val decl = current.vals.get(name).orElse(moduleOf(name).flatMap(m -> m.vals.get(name)))
+    decl match
+      Some(v) ->
+        computing += name
+        val t = expr(v.value, [], None)
+        computing.remove(computing.length - 1)
+        valTypes(name) = t
+        t
+      None -> ErrTy
+
+  // --- Inventory ----------------------------------------------------------------------------
+
+  private hostNamed(name: string) -> bool = current.groups.valuesIterator().exists(g -> g.hosts.exists(h -> h.name == name))
+
+  // The vars type of the hosts `target` names: a group's, or an empty record for `all`.
+  private targetVars(target: string, s: Span) -> Ty
+    if target == "all" then return DataTy("")
+    moduleOf(target).flatMap(m -> m.groups.get(target)) match
+      Some(g) -> if g.varsType.isEmpty then DataTy("") else DataTy(g.varsType)
+      None ->
+        if hostNamed(target) then return DataTy("")
+        error("E0201", s"there is no group or host `$target`", s, "unknown target", didYouMean(target, current.groups.keysIterator().toVector ++ ["all"]))
+        ErrTy
+
+  private connectionField(f: Stmt, vars: Option[DataDecl]) -> Option[string] = f match
+    FieldS(name, value, s) ->
+      connectionFields.find((n, _) -> n == name) match
+        Some((_, t)) ->
+          mismatch(expr(value, [], Some(t)), t, value, s"`$name`")
+          None
+        None -> vars.flatMap(d -> d.params.find(p -> p.name == name)) match
+          Some(p) ->
+            val t = resolveType(p.declared)
+            mismatch(expr(value, [], Some(t)), t, value, s"`$name`")
+            Some(name)
+          None ->
+            val known = Buffer[string]()
+            known ++= connectionFields.map((n, _) -> n)
+            for d in vars.toList
+              known ++= d.params.map(p -> p.name)
+            error("E0202", s"`$name` is not a connection setting${vars.map(d -> s" or a field of `${d.name}`").getOrElse("")}", s, "unknown field", didYouMean(name, known))
+            None
+    _ ->
+      error("E0234", "only settings `name = value` may stand here", stmtSpan(f), "not a setting")
+      None
+
+  private checkGroup(name: string, varsType: string, fields: List[Stmt], hosts: List[HostDecl], s: Span)
+    val vars: Option[DataDecl] = if varsType.isEmpty then None else findData(varsType)
+    if !varsType.isEmpty && vars.isEmpty
+      error("E0201", s"there is no type `$varsType`", s, "unknown vars type")
+    val given = Buffer[string]()
+    for f in fields
+      connectionField(f, vars) match
+        Some(n) -> given += n
+        None -> ()
+    for h in hosts
+      mismatch(expr(h.address, [], Some(StrTy)), StrTy, h.address, "a host's address")
+      val mine = Buffer[string]()
+      for f in h.fields
+        connectionField(f, vars) match
+          Some(n) -> mine += n
+          None -> ()
+      vars match
+        Some(d) ->
+          val missing = d.params.filter(p -> p.default.isEmpty && !given.contains(p.name) && !mine.contains(p.name)).map(p -> p.name)
+          if !missing.isEmpty
+            error("E0208", s"host `${h.name}` of group `$name` sets no ${missing.map(m -> s"`$m`").mkString(", ")}", h.span, "missing vars", s"give it ${missing.map(m -> s"`$m = …`").mkString(", ")} under the host or the group", [s"`$varsType` has no default for ${missing.mkString(", ")}"])
+        None -> ()
+
+  // --- Statements ---------------------------------------------------------------------------
+
+  private stmtSpan(s: Stmt) -> Span = s match
+    ResourceS(_, _, x) -> x
+    ValS(_, _, x) -> x
+    CallS(_, _, _, x) -> x
+    IfS(_, _, _, x) -> x
+    ForS(_, _, _, x) -> x
+    MatchS(_, _, x) -> x
+    AsS(_, _, x) -> x
+    OnS(_, _, x) -> x
+    AfterS(_, x) -> x
+    FieldS(_, _, x) -> x
+
+  // Checks a block of statements; the bindings it makes end with it.
+  private block(stmts: List[Stmt], outer: List[Local], where: Where)
+    var env = outer
+    val mine = Buffer[Local]()
+    for s in stmts
+      val bound = stmt(s, env, where)
+      for l in bound
+        env = l :: env
+        mine += l
+    for l in mine
+      if !l.used && l.warnUnused
+        warn("W0216", s"`${l.name}` is never used", l.span, "unused value", "remove it, or name it `_`")
+
+  // Checks one statement, answering what it binds.
+  private stmt(s: Stmt, env: List[Local], where: Where) -> List[Local] = s match
+    ResourceS(r, name, sp) ->
+      val t = resource(r, env, where)
+      if name.isEmpty then [] else [Local(name, t, sp, true)]
+    ValS(p, value, _) ->
+      val t = expr(value, env, None)
+      bindPattern(p, t, true)
+    CallS(call, after, name, sp) ->
+      if !where.inKind.isEmpty
+        error("E0234", "a role cannot be called inside a resource's block", sp, "role call")
+      roleCall(call, env, sp)
+      for a in after
+        refExpr(a, env, "after")
+      if name.isEmpty then [] else [Local(name, GroupTy, sp, true)]
+    IfS(c, t, e, _) ->
+      mismatch(expr(c, env, Some(BoolTy)), BoolTy, c, "an `if` condition")
+      block(t, env, where)
+      block(e, env, where)
+      []
+    ForS(p, over, body, _) ->
+      val element = forElement(over, env)
+      block(body, bindPattern(p, element, false) ++ env, where)
+      []
+    MatchS(scrutinee, arms, sp) ->
+      val t = expr(scrutinee, env, None)
+      val patterns = arms.map(a -> a.pattern)
+      exhaustive(t, patterns, sp)
+      for a in arms
+        block(a.body, bindPattern(a.pattern, t, false) ++ env, where)
+      []
+    AsS(user, body, _) ->
+      mismatch(expr(user, env, Some(StrTy)), StrTy, user, "`as`")
+      block(body, env, where)
+      []
+    OnS(_, _, sp) ->
+      error("E0234", "`on` belongs in a resource's block", sp, "outside a resource")
+      []
+    AfterS(_, sp) ->
+      error("E0234", "`after` belongs in a resource's block, or after a role call", sp, "outside a resource")
+      []
+    FieldS(name, _, sp) ->
+      error("E0234", s"the field `$name` is set outside any resource", sp, "no resource here")
+      []
+
+  // The type of what `for` ranges over, which must be a finite collection; answers the element.
+  private forElement(over: Expr, env: List[Local]) -> Ty = expr(over, env, None) match
+    ListTy(e) -> e
+    SetTy(e) -> e
+    MapTy(k, v) -> TupleTy([k, v])
+    ErrTy -> ErrTy
+    t ->
+      error("E0219", s"`for` ranges over a list, a set, a map or a range of ints, not a `${t.shown}`", over.extent, s"a ${t.shown}")
+      ErrTy
+
+  // Checks a resource declaration, answering its reference type.
+  private resource(r: ResourceDecl, env: List[Local], where: Where) -> Ty
+    val spec = kindNamed(r.kind) match
+      Some(k) -> k
+      None ->
+        error("E0201", s"there is no resource kind `${r.kind}`", r.span, "unknown kind", didYouMean(r.kind, builtinKinds.map(k -> k.name)))
+        return ErrTy
+    val titleTy = fieldTy(spec.title)
+    mismatch(expr(r.title, env, Some(titleTy)), titleTy, r.title, s"a `${r.kind}`'s title")
+    val set = Buffer[string]()
+    var triggered = false
+    for s in r.body
+      s match
+        FieldS(name, value, sp) ->
+          if set.contains(name)
+            error("E0235", s"`$name` is set twice", sp, "set again here")
+          set += name
+          spec.field(name) match
+            None -> error("E0202", s"`${r.kind}` has no field `$name`", sp, "unknown field", didYouMean(name, spec.fields.map(f -> f.name)))
+            Some(f) ->
+              val wanted = fieldTy(f.kind)
+              val inner = if name == "validate" then Local("staged", PathTy, sp, false) :: env else env
+              val t = expr(value, inner, Some(wanted))
+              if t == SecretTy && !f.secret
+                error("E0209", s"a secret cannot be the field `$name` of `${r.kind}`", value.extent, "a secret", "only a field that may hold a secret, such as `file.content`, takes one")
+              else
+                fieldMismatch(t, wanted, value, r.kind, name)
+        OnS(sources, action, sp) ->
+          triggered = true
+          for src in sources
+            refExpr(src, env, "on")
+          if !spec.hasAction(action)
+            val offered = if spec.actions.isEmpty then s"`${r.kind}` offers no actions" else s"`${r.kind}` offers ${spec.actions.map(a -> s"`$a`").mkString(", ")}"
+            error("E0214", s"`${r.kind}` has no action `$action`", sp, "unknown action", didYouMean(action, spec.actions), [offered])
+        AfterS(refs, _) ->
+          for a in refs
+            refExpr(a, env, "after")
+        other -> stmt(other, env, Where(where.role, r.kind))
+    if r.kind == "command" && !triggered && !set.contains("creates") && !set.contains("unless") && !set.contains("onlyIf") && !set.contains("always")
+      error("E0222", "a `command` with no guard runs on every apply", r.span, "no guard", "give it `creates`, `unless`, `onlyIf` or `on … -> run`, or say `always = true`")
+    RefTy(r.kind)
+
+  // An expression `on` or `after` names: a resource reference, or for `after` a role's group.
+  private refExpr(e: Expr, env: List[Local], what: string)
+    expr(e, env, None) match
+      RefTy(_) | ErrTy -> ()
+      GroupTy -> if what == "on" then error("E0213", "`on` names resources, and this is a role's group", e.extent, "a group")
+      t -> error("E0213", s"`$what` names resources, and this is a `${t.shown}`", e.extent, s"a ${t.shown}", "bind the resource with `val name = kind …` and name it")
+
+  // A role call: the callee must be a role, its arguments its parameters.
+  private roleCall(call: Expr, env: List[Local], s: Span) = call match
+    CallE(NameE(n, ns), args, cs) ->
+      findRole(n) match
+        Some(r) ->
+          noteCall(n, ns)
+          checkArgs(n, r.params, args, env, cs)
+        None ->
+          if findFn(n).isDefined || findData(n).isDefined
+            error("E0236", s"`$n` is not a role, so it cannot be applied", ns, "not a role")
+          else
+            error("E0201", s"there is no role `$n`", ns, "unknown role", didYouMean(n, current.roles.keysIterator().toVector ++ imported.keysIterator().toVector))
+    other ->
+      error("E0236", "only a call of a role may stand here", other.extent, "not a role call")
+
+  private noteCall(callee: string, s: Span)
+    if !caller.isEmpty
+      calls.getOrElseUpdate(caller, Buffer[(string, Span)]()) += (callee, s)
+
+  // Duplicate literal titles in one role's block: an error unless the declarations are identical.
+  private duplicateTitles(stmts: List[Stmt])
+    val seen = Table[string, ResourceDecl]()
+    for s in stmts
+      s match
+        ResourceS(r, _, _) -> r.title match
+          StrE([TextP(t)], _, _) ->
+            val key = s"${r.kind} $t"
+            seen.get(key) match
+              Some(first) ->
+                if declText(first) != declText(r)
+                  error("E0218", s"`$key` is declared twice in this role with different fields", r.span, "declared again here", "declare it once, or make both the same", [], [(first.span, "first declared here")])
+              None -> seen(key) = r
+          _ -> ()
+        _ -> ()
+
+  private declText(r: ResourceDecl) -> string = r.body.map(s -> s match
+    FieldS(n, v, _) -> s"$n=${showExpr(v)}"
+    OnS(src, a, _) -> s"on ${src.map(x -> showExpr(x)).mkString(",")}->$a"
+    AfterS(refs, _) -> s"after ${refs.map(x -> showExpr(x)).mkString(",")}"
+    _ -> "?").mkString(";")
+
+  // --- Patterns -----------------------------------------------------------------------------
+
+  // The names `p` binds when it matches a value of `t`.
+  private bindPattern(p: Pattern, t: Ty, warnUnused: bool) -> List[Local] = p match
+    WildP(_) -> []
+    BindP(n, s) ->
+      if variantOf.contains(n) && enumOf(t) == variantOf(n).0 then [] else [Local(n, t, s, warnUnused)]
+    TupleP(items, s) -> t match
+      TupleTy(ts) if ts.length == items.length -> items.zip(ts).toList.flatMap((i, it) -> bindPattern(i, it, warnUnused))
+      ErrTy -> items.flatMap(i -> bindPattern(i, ErrTy, warnUnused))
+      _ ->
+        error("E0203", s"a pattern of ${items.length} values cannot match a `${t.shown}`", s, "tuple pattern")
+        items.flatMap(i -> bindPattern(i, ErrTy, warnUnused))
+    VariantP(n, fields, s) -> variantOf.get(n) match
+      None ->
+        error("E0201", s"there is no variant `$n`", s, "unknown variant", didYouMean(n, variantOf.keysIterator().toVector))
+        fields.flatMap(f -> bindPattern(f, ErrTy, warnUnused))
+      Some((owner, v)) ->
+        if t != ErrTy && enumOf(t) != owner
+          error("E0203", s"`$n` is a variant of `$owner`, and this matches a `${t.shown}`", s, "wrong variant")
+        if fields.length != v.params.length
+          error("E0237", s"`$n` has ${v.params.length} fields, and this pattern gives ${fields.length}", s, "field count")
+        fields.zip(v.params).toList.flatMap((f, prm) -> bindPattern(f, resolveType(prm.declared), warnUnused))
+    LitP(e, _) ->
+      mismatch(expr(e, [], Some(t)), t, e, "a pattern")
+      []
+    AltP(alts, s) ->
+      val bound = alts.flatMap(a -> bindPattern(a, t, warnUnused))
+      if !bound.isEmpty
+        error("E0238", "a pattern with `|` cannot bind names", s, "binds names", "match each alternative in its own arm")
+      []
+
+  private enumOf(t: Ty) -> string = t match
+    DataTy(n) -> n
+    _ -> ""
+
+  // A `match` covers every value: every variant of an enum, or a catch-all arm; and no arm follows
+  // one that already covers everything it could match.
+  private exhaustive(t: Ty, patterns: List[Pattern], span: Span)
+    val variants: List[Variant] = t match
+      DataTy(n) -> allData.get(n).map(d -> d.variants).getOrElse([])
+      BoolTy -> []
+      _ -> []
+    val covered = Buffer[string]()
+    var all = false
+    for p in patterns
+      if all
+        error("E0205", "this arm is never reached: the arms before it cover every value", p.extent, "unreachable", "remove it")
+        continue
+      val names = coveredBy(p, t)
+      if names.contains("*")
+        all = true
+      else
+        val fresh = names.filter(n -> !covered.contains(n))
+        if fresh.isEmpty && !names.isEmpty
+          error("E0205", "this arm is never reached: the arms before it cover its variants", p.extent, "unreachable", "remove it")
+        covered ++= fresh
+        if !variants.isEmpty && variants.forall(v -> covered.contains(v.name)) then all = true
+        if t == BoolTy && covered.contains("true") && covered.contains("false") then all = true
+    if !all && t != ErrTy
+      if variants.isEmpty
+        error("E0204", s"this `match` on a `${t.shown}` does not cover every value", span, "not exhaustive", "add an arm `_ -> …`")
+      else
+        val missing = variants.filter(v -> !covered.contains(v.name)).map(v -> if v.params.isEmpty then s"`${v.name}`" else s"`${v.name}(${v.params.map(_ -> "_").mkString(", ")})`")
+        error("E0204", s"this `match` does not cover ${missing.mkString(", ")}", span, "not exhaustive", "add an arm for each, or `other -> …`")
+
+  // The variants a pattern covers whatever their fields hold: `*` for every value.
+  private coveredBy(p: Pattern, t: Ty) -> List[string] = p match
+    WildP(_) -> ["*"]
+    BindP(n, _) -> if variantOf.contains(n) && enumOf(t) == variantOf(n).0 then [n] else ["*"]
+    VariantP(n, fields, _) -> if fields.forall(f -> irrefutable(f)) then [n] else []
+    AltP(alts, _) -> alts.flatMap(a -> coveredBy(a, t))
+    LitP(BoolE(b, _), _) -> [s"$b"]
+    TupleP(items, _) -> if items.forall(i -> irrefutable(i)) then ["*"] else []
+    _ -> []
+
+  private irrefutable(p: Pattern) -> bool = p match
+    WildP(_) -> true
+    BindP(n, _) -> !variantOf.contains(n)
+    TupleP(items, _) -> items.forall(i -> irrefutable(i))
+    _ -> false
+
+  // --- Expressions --------------------------------------------------------------------------
+
+  // Reports a type mismatch of `e`, whose type is `actual`, where `expected` is wanted by `what`.
+  private mismatch(actual: Ty, expected: Ty, e: Expr, what: string)
+    if !fits(actual, expected)
+      error("E0203", s"$what is a `${expected.shown}`, but this is a `${actual.shown}`", e.extent, s"a ${actual.shown}")
+
+  private fieldMismatch(actual: Ty, expected: Ty, e: Expr, kind: string, field: string)
+    if fits(actual, expected) then return
+    val help = (expected, e) match
+      (ModeTy, StrE(_, _, _)) -> "a mode is written as an octal literal: `mode = 0o600`"
+      (ModeTy, IntE(v, _)) -> s"a mode is written in octal: `0o…`"
+      (PathTy, _) -> "a path is written as a string literal beginning with `/`"
+      _ -> ""
+    error("E0207", s"the field `$field` of `$kind` is a `${expected.shown}`, but this is a `${actual.shown}`", e.extent, s"a ${actual.shown}", help)
+
+  private lookupLocal(name: string, env: List[Local]) -> Option[Local] = env.find(l -> l.name == name)
+
+  // The type of `e`, checked against `expected` where one is known.
+  expr(e: Expr, env: List[Local], expected: Option[Ty]) -> Ty = e match
+    IntE(_, _) -> IntTy
+    ModeE(v, s) ->
+      if v > 4095
+        error("E0221", s"`0o${octalText(v)}` is not a file mode: a mode is at most `0o7777`", s, "out of range")
+      ModeTy
+    DurationE(_, _, _) -> DurationTy
+    SizeE(_, _, _) -> SizeTy
+    BoolE(_, _) -> BoolTy
+    NoneE(_) -> NothingTy
+    StrE(parts, _, s) ->
+      interpolations(parts, env)
+      if expected == Some(PathTy)
+        literalText(parts) match
+          Some(text) ->
+            if !text.startsWith("/")
+              error("E0220", s"`$text` is not an absolute path", s, "relative path", "a path begins with `/`")
+          None -> ()
+        PathTy
+      else
+        StrTy
+    ShE(parts, _) ->
+      interpolations(parts, env)
+      CommandTy
+    NameE(n, s) -> name(n, s, env)
+    FieldE(target, field, s) -> fieldOf(target, field, s, env)
+    CallE(callee, args, s) -> call(callee, args, s, env, expected)
+    ListE(items, _) ->
+      val wanted = expected match
+        Some(ListTy(t)) -> Some(t)
+        Some(SetTy(t)) -> Some(t)
+        _ -> None
+      var element: Ty = NothingTy
+      for i in items
+        val t = expr(i, env, wanted.orElse(if element == NothingTy then None else Some(element)))
+        if element == NothingTy || element == ErrTy
+          element = t
+        else if !fits(t, element)
+          error("E0203", s"a list's items are all one type: this is a `${t.shown}` in a list of `${element.shown}`", i.extent, s"a ${t.shown}")
+      expected match
+        Some(SetTy(_)) -> SetTy(element)
+        _ -> ListTy(element)
+    MapE(entries, _) ->
+      var kt: Ty = NothingTy
+      var vt: Ty = NothingTy
+      for (k, v) in entries
+        val a = expr(k, env, None)
+        val b = expr(v, env, None)
+        if kt == NothingTy then kt = a else mismatch(a, kt, k, "this map's keys")
+        if vt == NothingTy then vt = b else mismatch(b, vt, v, "this map's values")
+      MapTy(kt, vt)
+    TupleE(items, _) -> TupleTy(items.map(i -> expr(i, env, None)))
+    UnaryE(op, x, s) ->
+      if op == "!"
+        mismatch(expr(x, env, Some(BoolTy)), BoolTy, x, "`!`")
+        BoolTy
+      else
+        mismatch(expr(x, env, Some(IntTy)), IntTy, x, "`-`")
+        IntTy
+    BinaryE(op, l, r, s) -> binary(op, l, r, s, env)
+    IfE(c, t, f, _) ->
+      mismatch(expr(c, env, Some(BoolTy)), BoolTy, c, "an `if` condition")
+      val a = expr(t, env, expected)
+      val b = expr(f, env, expected.orElse(Some(a)))
+      if fits(b, a) then (if a == NothingTy then b else a) else if fits(a, b) then b else
+        error("E0203", s"the branches of an `if` are one type: `${a.shown}` and `${b.shown}`", f.extent, s"a ${b.shown}")
+        ErrTy
+    MatchE(scrutinee, arms, s) ->
+      val t = expr(scrutinee, env, None)
+      exhaustive(t, arms.map(a -> a.pattern), s)
+      var result: Ty = NothingTy
+      for a in arms
+        val bt = expr(a.body, bindPattern(a.pattern, t, false) ++ env, expected.orElse(if result == NothingTy then None else Some(result)))
+        if result == NothingTy || result == ErrTy then result = bt
+        else if !fits(bt, result)
+          error("E0203", s"the arms of a `match` are one type: this is a `${bt.shown}` among `${result.shown}`", a.body.extent, s"a ${bt.shown}")
+      result
+    ForE(p, over, filter, body, _) ->
+      val element = forElement(over, env)
+      val inner = bindPattern(p, element, false) ++ env
+      filter match
+        Some(c) -> mismatch(expr(c, inner, Some(BoolTy)), BoolTy, c, "a `for` filter")
+        None -> ()
+      ListTy(expr(body, inner, None))
+    WithE(target, fields, s) ->
+      val t = expr(target, env, expected)
+      t match
+        DataTy(n) -> allData.get(n) match
+          Some(d) if d.variants.isEmpty ->
+            for f in fields
+              d.params.find(p -> p.name == f.name) match
+                Some(p) ->
+                  val pt = resolveType(p.declared)
+                  mismatch(expr(f.value, env, Some(pt)), pt, f.value, s"the field `${f.name}` of `$n`")
+                None -> error("E0202", s"`$n` has no field `${f.name}`", f.span, "unknown field", didYouMean(f.name, d.params.map(p -> p.name)))
+          _ -> error("E0203", s"`with` copies a record, and `$n` is not one", s, "not a record")
+        ErrTy -> ()
+        other -> error("E0203", s"`with` copies a record, and this is a `${other.shown}`", target.extent, s"a ${other.shown}")
+      t
+    LambdaE(_, _, s) ->
+      error("E0239", "a function is a value only as an argument of a collection function such as `map`", s, "function value")
+      ErrTy
+    FailE(m, _) ->
+      mismatch(expr(m, env, Some(StrTy)), StrTy, m, "`fail`'s message")
+      NothingTy
+
+  private octalText(v: long) -> string
+    if v == 0 then return "0"
+    var n = v
+    var d = ""
+    while n > 0
+      d = s"${n % 8}$d"
+      n = n / 8
+    d
+
+  // The text of a string with no interpolation in it.
+  private literalText(parts: List[StrPart]) -> Option[string] = parts match
+    [] -> Some("")
+    [TextP(t)] -> Some(t)
+    _ -> None
+
+  // Checks a string's interpolations: each may be text-like, never a secret.
+  private interpolations(parts: List[StrPart], env: List[Local])
+    for p in parts
+      p match
+        ExprP(x) ->
+          val t = expr(x, env, None)
+          if holdsSecret(t)
+            error("E0210", "a secret cannot be interpolated into a string", x.extent, "a secret", "pass it as a field that takes a secret, or on a command's standard input with `.stdin(…)`; `secret.concat` joins text to a secret")
+          else if !(t == StrTy || t == IntTy || t == PathTy || t == BoolTy || t == ModeTy || t == DurationTy || t == SizeTy || t == ErrTy || t == NothingTy || t == RefTy("") || t.isData)
+            error("E0203", s"a `${t.shown}` cannot be interpolated into a string", x.extent, s"a ${t.shown}")
+        TextP(_) -> ()
+
+  private name(n: string, s: Span, env: List[Local]) -> Ty
+    lookupLocal(n, env) match
+      Some(l) ->
+        l.used = true
+        return l.ty
+      None -> ()
+    if n == "staged"
+      error("E0212", "`staged` exists only inside a file's `validate`", s, "outside `validate`")
+      return ErrTy
+    if n == "host" then return HostTy(DataTy(""))
+    if n == "none" then return NothingTy
+    if n == "true" || n == "false" then return BoolTy
+    variantOf.get(n) match
+      Some((owner, v)) ->
+        if !v.params.isEmpty
+          error("E0237", s"`$n` has fields: write `$n(…)`", s, "needs fields")
+        return DataTy(owner)
+      None -> ()
+    if moduleOf(n).exists(m -> m.vals.contains(n)) then return valType(n)
+    if findRole(n).isDefined || findFn(n).isDefined
+      error("E0239", s"`$n` is a function value only when called: `$n(…)`", s, "not called")
+      return ErrTy
+    error("E0201", s"there is no value `$n`", s, "unknown name", didYouMean(n, env.map(l -> l.name).toVector ++ visibleNames()))
+    ErrTy
+
+  // The type of `target.field`.
+  private fieldOf(target: Expr, field: string, s: Span, env: List[Local]) -> Ty
+    target match
+      NameE("secret", _) ->
+        error("E0239", s"`secret.$field` is a function: call it", s, "not called")
+        return ErrTy
+      _ -> ()
+    val t = expr(target, env, None)
+    t match
+      ErrTy -> ErrTy
+      DataTy(n) -> allData.get(n) match
+        Some(d) if d.variants.isEmpty -> d.params.find(p -> p.name == field) match
+          Some(p) -> resolveType(p.declared)
+          None ->
+            error("E0202", s"`$n` has no field `$field`", s, "unknown field", didYouMean(field, d.params.map(p -> p.name)))
+            ErrTy
+        _ ->
+          error("E0202", s"`$n` has variants, so its fields are reached by `match`", s, "enum")
+          ErrTy
+      HostTy(vars) ->
+        if field == "vars" then return vars
+        hostFields.find((n, _) -> n == field) match
+          Some((_, ft)) -> ft
+          None ->
+            error("E0202", s"a host has no field `$field`", s, "unknown field", didYouMean(field, hostFields.map((n, _) -> n) ++ ["vars"]))
+            ErrTy
+      RefTy(k) -> kindNamed(k) match
+        Some(spec) ->
+          val titleName = if fieldTy(spec.title) == PathTy then "path" else "name"
+          if field == titleName then return fieldTy(spec.title)
+          spec.field(field) match
+            Some(f) -> fieldTy(f.kind)
+            None ->
+              error("E0202", s"`$k` has no field `$field`", s, "unknown field", didYouMean(field, titleName :: spec.fields.map(f -> f.name)))
+              ErrTy
+        None -> ErrTy
+      CommandTy -> if field == "stdout" || field == "stderr" then StrTy else
+        error("E0202", s"a `Command` has no field `$field`", s, "unknown field")
+        ErrTy
+      other ->
+        error("E0202", s"a `${other.shown}` has no field `$field`", s, "unknown field")
+        ErrTy
+
+  private binary(op: string, l: Expr, r: Expr, s: Span, env: List[Local]) -> Ty
+    val a = expr(l, env, None)
+    val b = expr(r, env, Some(a))
+    if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") && (holdsSecret(a) || holdsSecret(b))
+      error("E0210", "a secret cannot be compared", s, "secret comparison")
+      return BoolTy
+    op match
+      "&&" | "||" ->
+        mismatch(a, BoolTy, l, s"`$op`")
+        mismatch(b, BoolTy, r, s"`$op`")
+        BoolTy
+      "==" | "!=" ->
+        if !fits(b, a) && !fits(a, b)
+          error("E0203", s"`$op` compares values of one type, not `${a.shown}` and `${b.shown}`", s, "different types")
+        BoolTy
+      "<" | "<=" | ">" | ">=" ->
+        if !(fits(a, IntTy) || fits(a, DurationTy) || fits(a, SizeTy) || fits(a, StrTy)) || !fits(b, a)
+          error("E0203", s"`$op` orders ints, durations, sizes or strings, not `${a.shown}` and `${b.shown}`", s, "not ordered")
+        BoolTy
+      ".." | "..<" ->
+        mismatch(a, IntTy, l, "a range's start")
+        mismatch(b, IntTy, r, "a range's end")
+        ListTy(IntTy)
+      "+" ->
+        if a == StrTy && b == StrTy then StrTy
+        else if fits(a, IntTy) && fits(b, IntTy) then IntTy
+        else if a == DurationTy && b == DurationTy then DurationTy
+        else if a == SizeTy && b == SizeTy then SizeTy
+        else
+          a match
+            ListTy(_) -> if fits(b, a) then a else
+              error("E0203", s"`+` joins lists of one type, not `${a.shown}` and `${b.shown}`", s, "different types")
+              ErrTy
+            _ ->
+              if a != ErrTy && b != ErrTy
+                error("E0203", s"`+` adds ints, durations or sizes, or joins strings or lists, not `${a.shown}` and `${b.shown}`", s, "cannot add")
+              ErrTy
+      _ ->
+        mismatch(a, IntTy, l, s"`$op`")
+        mismatch(b, IntTy, r, s"`$op`")
+        IntTy
+
+  // A call: a built-in, a `fn`, a data constructor or variant, or a method of a value.
+  private call(callee: Expr, args: List[Arg], s: Span, env: List[Local], expected: Option[Ty]) -> Ty = callee match
+    NameE("cmd", _) ->
+      if args.isEmpty
+        error("E0240", "`cmd` needs a program", s, "no program")
+      for a in args
+        val t = expr(a.value, env, None)
+        if holdsSecret(t)
+          error("E0209", "a secret cannot be in a command's argument list", a.value.extent, "a secret", "pass it on standard input: `cmd(…).stdin(secret)`")
+        else if !(t == StrTy || t == PathTy || t == IntTy || t == ErrTy)
+          error("E0203", s"a command's arguments are strings or paths, not `${t.shown}`", a.value.extent, s"a ${t.shown}")
+      CommandTy
+    NameE("lines", _) ->
+      for a in args
+        mismatch(expr(a.value, env, Some(ListTy(StrTy))), ListTy(StrTy), a.value, "`lines`'s argument")
+      StrTy
+    NameE("local", _) ->
+      args match
+        [Arg(_, StrE([TextP(file)], _, fs), _)] ->
+          if !exists(file)
+            error("E0211", s"`local` reads `$file`, which does not exist", fs, "no such file", "local files are read relative to the project")
+        _ -> for a in args
+          mismatch(expr(a.value, env, Some(StrTy)), StrTy, a.value, "`local`'s file")
+      StrTy
+    NameE("render", _) ->
+      for a in args
+        val t = expr(a.value, env, None)
+        if holdsSecret(t)
+          error("E0210", "a secret cannot be rendered into a template's text", a.value.extent, "a secret")
+      StrTy
+    FieldE(NameE("secret", _), fn, fs) ->
+      fn match
+        "env" | "file" | "command" | "literal" ->
+          for a in args
+            mismatch(expr(a.value, env, Some(StrTy)), StrTy, a.value, s"`secret.$fn`'s argument")
+          SecretTy
+        "concat" ->
+          for a in args
+            val t = expr(a.value, env, None)
+            if !(t == StrTy || t == SecretTy || t == ErrTy)
+              error("E0203", s"`secret.concat` joins strings and secrets, not a `${t.shown}`", a.value.extent, s"a ${t.shown}")
+          SecretTy
+        _ ->
+          error("E0202", s"`secret` has no function `$fn`", fs, "unknown function", didYouMean(fn, ["env", "file", "command", "literal", "concat"]))
+          ErrTy
+    FieldE(target, method, ms) -> methodCall(target, method, args, ms, env)
+    NameE(n, ns) ->
+      if lookupLocal(n, env).isDefined
+        error("E0239", s"`$n` is a value, not a function", ns, "not callable")
+        return ErrTy
+      findFn(n) match
+        Some(f) ->
+          noteCall(n, ns)
+          checkArgs(n, f.params, args, env, s)
+          return resolveType(f.result)
+        None -> ()
+      if findRole(n).isDefined
+        noteCall(n, ns)
+        roleCall(CallE(callee, args, s), env, s)
+        return GroupTy
+      variantOf.get(n) match
+        Some((owner, v)) ->
+          checkArgs(n, v.params, args, env, s)
+          return DataTy(owner)
+        None -> ()
+      findData(n) match
+        Some(d) ->
+          if !d.variants.isEmpty
+            error("E0237", s"`$n` has variants: construct one of them", ns, "an enum")
+            return ErrTy
+          checkArgs(n, d.params, args, env, s)
+          DataTy(n)
+        None ->
+          error("E0201", s"there is no function `$n`", ns, "unknown name", didYouMean(n, visibleNames()))
+          for a in args
+            expr(a.value, env, None)
+          ErrTy
+    other ->
+      error("E0239", "only a named function can be called", other.extent, "not callable")
+      ErrTy
+
+  // A method of a value: a command's `stdin`, a string's `trim`, a collection's functions.
+  private methodCall(target: Expr, method: string, args: List[Arg], s: Span, env: List[Local]) -> Ty
+    val t = expr(target, env, None)
+    (t, method) match
+      (ErrTy, _) -> ErrTy
+      (CommandTy, "stdin") ->
+        for a in args
+          val at = expr(a.value, env, None)
+          if !(at == StrTy || at == SecretTy || at == ErrTy)
+            error("E0203", s"a command's standard input is a `string` or a `secret`, not a `${at.shown}`", a.value.extent, s"a ${at.shown}")
+        CommandTy
+      (StrTy, "trim") | (StrTy, "toLower") | (StrTy, "toUpper") -> StrTy
+      (StrTy, "length") -> IntTy
+      (ListTy(_), "length") | (SetTy(_), "length") | (MapTy(_, _), "length") -> IntTy
+      (ListTy(e), "contains") -> contains(e, args, env)
+      (SetTy(e), "contains") -> contains(e, args, env)
+      (MapTy(k, _), "keys") -> ListTy(k)
+      (MapTy(_, v), "values") -> ListTy(v)
+      (ListTy(e), "map") -> ListTy(lambda(args, e, env, s))
+      (ListTy(e), "filter") ->
+        mismatch(lambda(args, e, env, s), BoolTy, target, "`filter`'s function")
+        t
+      (ListTy(e), "sortBy") ->
+        lambda(args, e, env, s)
+        t
+      (ListTy(StrTy), "mkString") ->
+        for a in args
+          mismatch(expr(a.value, env, Some(StrTy)), StrTy, a.value, "`mkString`'s separator")
+        StrTy
+      _ ->
+        error("E0202", s"a `${t.shown}` has no function `$method`", s, "unknown function")
+        ErrTy
+
+  private contains(e: Ty, args: List[Arg], env: List[Local]) -> Ty
+    for a in args
+      mismatch(expr(a.value, env, Some(e)), e, a.value, "`contains`'s argument")
+    BoolTy
+
+  // The result type of a one-parameter lambda passed to a collection function, its parameter of type
+  // `element`.
+  private lambda(args: List[Arg], element: Ty, env: List[Local], s: Span) -> Ty = args match
+    [Arg(_, LambdaE([p], body, ls), _)] -> expr(body, Local(p, element, ls, false) :: env, None)
+    _ ->
+      error("E0239", "this function takes one function of one parameter, as `x -> …`", s, "needs a function")
+      ErrTy
+
+  // Checks a call's arguments against `params`: by position, then by name; every parameter without a
+  // default given once.
+  private checkArgs(n: string, params: List[Param], args: List[Arg], env: List[Local], s: Span)
+    val given = Buffer[string]()
+    var position = 0
+    var named = false
+    for a in args
+      if a.name.isEmpty
+        if named
+          error("E0241", "an argument by position cannot follow one by name", a.span, "positional")
+        if position >= params.length
+          error("E0242", s"`$n` takes ${params.length} arguments, and this is one more", a.span, "extra argument")
+          expr(a.value, env, None)
+        else
+          val p = params(position)
+          val pt = resolveType(p.declared)
+          mismatch(expr(a.value, env, Some(pt)), pt, a.value, s"`$n`'s `${p.name}`")
+          given += p.name
+        position += 1
+      else
+        named = true
+        params.find(p -> p.name == a.name) match
+          Some(p) ->
+            if given.contains(p.name)
+              error("E0235", s"`${p.name}` is given twice", a.span, "given again")
+            val pt = resolveType(p.declared)
+            mismatch(expr(a.value, env, Some(pt)), pt, a.value, s"`$n`'s `${p.name}`")
+            given += p.name
+          None ->
+            error("E0202", s"`$n` has no parameter `${a.name}`", a.span, "unknown parameter", didYouMean(a.name, params.map(p -> p.name)))
+            expr(a.value, env, None)
+    val missing = params.filter(p -> p.default.isEmpty && !given.contains(p.name)).map(p -> s"`${p.name}`")
+    if !missing.isEmpty
+      error("E0206", s"`$n` is missing ${missing.mkString(", ")}", s, "missing arguments")
+
+  // --- Call cycles --------------------------------------------------------------------------
+
+  // No `fn` or `role` reaches itself through calls: each cycle is reported once, with each call.
+  private checkCycles()
+    val reported = Buffer[string]()
+    for start in calls.keysIterator().toVector.sorted
+      val path = Buffer[(string, Span)]()
+      findCycle(start, start, path, Buffer[string]()) match
+        Some(cycle) ->
+          val key = cycle.map((n, _) -> n).sorted.mkString(",")
+          if !reported.contains(key)
+            reported += key
+            val names = (start :: cycle.map((n, _) -> n)).mkString(" -> ")
+            error("E0215", s"these calls form a cycle, and fettle programs do not recurse: $names", cycle(0).1, "the cycle begins here", "compute it without recursion, or move it into a command on the host", [], cycle.drop(1).map((n, sp) -> (sp, s"calls `$n`")))
+        None -> ()
+
+  private findCycle(start: string, at: string, path: Buffer[(string, Span)], visited: Buffer[string]) -> Option[List[(string, Span)]]
+    val made: Vector[(string, Span)] = calls.get(at).map(b -> b.toVector).getOrElse(Vector[(string, Span)]())
+    for (callee, s) in made
+      if callee == start
+        return Some((path.toList) ++ [(callee, s)])
+      if !visited.contains(callee)
+        visited += callee
+        path += (callee, s)
+        findCycle(start, callee, path, visited) match
+          Some(c) -> return Some(c)
+          None -> ()
+        path.remove(path.length - 1)
+    None
+
+impl Ty
+  isData -> bool = self match
+    DataTy(_) -> true
+    _ -> false

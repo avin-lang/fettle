@@ -1,0 +1,59 @@
+module tests
+
+import dev.avinlang.fettle.syntax.{Arg, BindP, CallE, DataD, DataDecl, Decl, Expr, FieldS, FnD, FnDecl, Import, IntE, NameE, NamedT, Param, Pos, ResourceDecl, ResourceS, RoleD, RoleDecl, SourceFile, Span, Stmt, StrE, TextP, TypeExpr, ValD, ValDecl, Variant}
+import dev.avinlang.fettle.check.{check}
+
+// Syntax trees built by hand, for the checker, evaluator and formatter, which the parser will feed.
+
+// A span on `line` of `t.fettle`, `length` characters from `column`.
+sp(line: int, column: int = 1, length: int = 1) -> Span = Span("t.fettle", Pos(0, line, column), Pos(0, line, column + length))
+
+nm(n: string, line: int = 1) -> Expr = NameE(n, sp(line))
+
+str(t: string, line: int = 1) -> Expr = StrE([TextP(t)], false, sp(line))
+
+num(v: long, line: int = 1) -> Expr = IntE(v, sp(line))
+
+arg(e: Expr) -> Arg = Arg("", e, sp(1))
+
+named(n: string, e: Expr) -> Arg = Arg(n, e, sp(1))
+
+// `f(args…)` with arguments by position.
+call(f: string, args: List[Expr], line: int = 1) -> Expr = CallE(NameE(f, sp(line)), args.map(a -> arg(a)), sp(line))
+
+callArgs(f: string, args: List[Arg], line: int = 1) -> Expr = CallE(NameE(f, sp(line)), args, sp(line))
+
+ty(n: string) -> TypeExpr = NamedT(n, [], sp(1))
+
+tyOf(n: string, args: List[TypeExpr]) -> TypeExpr = NamedT(n, args, sp(1))
+
+param(n: string, t: TypeExpr, line: int = 1) -> Param = Param(n, t, None, sp(line))
+
+paramD(n: string, t: TypeExpr, d: Expr) -> Param = Param(n, t, Some(d), sp(1))
+
+fieldS(n: string, e: Expr, line: int = 1) -> Stmt = FieldS(n, e, sp(line))
+
+// `kind title` with its block, bound to `name` when it is not empty.
+res(kind: string, title: Expr, body: List[Stmt], line: int = 1, name: string = "") -> Stmt =
+  ResourceS(ResourceDecl(kind, title, body, sp(line)), name, sp(line))
+
+role(n: string, params: List[Param], body: List[Stmt], line: int = 1) -> Decl = RoleD(RoleDecl(n, params, body, false, sp(line)))
+
+record(n: string, params: List[Param], line: int = 1) -> Decl = DataD(DataDecl(n, params, [], sp(line)))
+
+enumD(n: string, variants: List[Variant], line: int = 1) -> Decl = DataD(DataDecl(n, [], variants, sp(line)))
+
+fnD(n: string, params: List[Param], result: TypeExpr, body: Expr, line: int = 1) -> Decl = FnD(FnDecl(n, params, result, body, sp(line)))
+
+valD(n: string, e: Expr, line: int = 1) -> Decl = ValD(ValDecl(BindP(n, sp(line)), e, sp(line)))
+
+source(decls: List[Decl], moduleName: string = "", imports: List[Import] = [], file: string = "t.fettle") -> SourceFile =
+  SourceFile(file, moduleName, imports, decls)
+
+// The diagnostics of checking `files`, each as `line code message`.
+diags(files: List[SourceFile]) -> string =
+  check(files).map(d -> s"${d.span.start.line} ${d.code} ${d.message}").mkString("; ")
+
+// Only the errors, warnings left out.
+errors(files: List[SourceFile]) -> string =
+  check(files).filter(d -> !d.warning).map(d -> s"${d.span.start.line} ${d.code} ${d.message}").mkString("; ")

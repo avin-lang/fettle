@@ -1,0 +1,1 @@
+{"os": "Linux", "distro": "Alpine", "version": "3.20", "arch": "Arm64", "init": "OpenRc", "cpus": 1, "memory": 1073741824, "hostname": "edge1", "user": "root", "root": true}

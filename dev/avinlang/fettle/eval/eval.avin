@@ -1,0 +1,584 @@
+module dev.avinlang.fettle.eval
+
+import avin.collections.mutable.{Map as Table}
+import dev.avinlang.json.{Json, Long as JLong, Obj, Str as JStr, Bool as JBool, parse as parseJson}
+import dev.avinlang.fettle.check.{builtinData}
+import dev.avinlang.fettle.kinds.{KindSpec, PathT, kindNamed}
+import dev.avinlang.fettle.graph.{After, BoolV, CommandV, DurationV, Graph, GraphBuilder, GroupV, IntV, ListV, MapV, ModeV, Node, NoneV, PathV, RecordV, RefV, Reference, ResourceId, SecretV, SetV, SizeV, StrV, Value, VariantV}
+import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, Arm, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldInit, FieldS, FnD, FnDecl, ForE, ForS, GroupD, GroupDecl, HostDecl, IfE, IfS, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NoneE, OnS, Param, Pattern, Pos, ResourceDecl, ResourceS, RoleD, RoleDecl, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, TextP, TupleE, TupleP, UnaryE, ValD, ValDecl, ValS, Variant, VariantP, WildP, WithE}
+
+// The evaluator: a checked program, the inventory in it and one host's facts, into that host's
+// desired-state graph. Evaluation is pure: its only inputs are the program, the files `local` reads
+// and the facts. An error stops evaluation for the host, at the span of the expression at fault.
+
+// What evaluating for one host gave: the graph, and every error (evaluation's and the graph's).
+data Evaluated(graph: Graph, diagnostics: Vector[Diagnostic])
+
+// The facts of one host, as a fixture or a cached `fettle facts` gives them.
+data Facts(os: string, distro: string, version: string, arch: string, init: string, cpus: long, memory: long, hostname: string, user: string, root: bool)
+
+// Reads a fact fixture: a JSON object with `os`, `distro`, `version`, `arch`, `init`, `cpus`,
+// `memory` (bytes), `hostname`, `user` and `root`.
+readFacts(text: string) -> Result[Facts, string] = parseJson(text) match
+  Err(e) -> Err(s"$e")
+  Ok(j) ->
+    val str = (k: string) -> j.get(k).flatMap(v -> v.asString).getOrElse("")
+    val num = (k: string) -> j.get(k).flatMap(v -> v.asLong).getOrElse(0)
+    for k in ["os", "distro", "arch", "init"]
+      if str(k).isEmpty then return Err(s"the facts have no `$k`")
+    Ok(Facts(str("os"), str("distro"), str("version"), str("arch"), str("init"), num("cpus"), num("memory"), str("hostname"), str("user"), j.get("root").flatMap(v -> v.asBool).getOrElse(false)))
+
+// Evaluates `files` for the host `hostName` of the inventory, with `facts`; `readLocal` reads a file
+// next to the program for `local(…)`.
+evaluate(files: List[SourceFile], hostName: string, facts: Facts, readLocal: (string) -> Option[string] = _ -> None) -> Evaluated
+  val e = Evaluator(files, readLocal)
+  e.run(hostName, facts)
+
+private val maxLong: long = 9223372036854775807
+
+private val minLong: long = -maxLong - 1
+
+// Evaluation stops past this many steps, so a pathological program ends with an error, not slowly.
+val stepBudget: int = 1000000
+
+class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[string])
+  private val diagnostics = Buffer[Diagnostic]()
+  private val builder = GraphBuilder()
+  private val roles = Table[string, RoleDecl]()
+  private val fns = Table[string, FnDecl]()
+  private val datas = Table[string, DataDecl]()
+  private val variants = Table[string, (string, Variant)]()
+  private val vals = Table[string, ValDecl]()
+  private val valCache = Table[string, Value]()
+  private val groups = Buffer[GroupDecl]()
+  private var stopped = false
+  private var steps = 0
+  private var hostValue: Value = NoneV
+  // The resources a field's expression read through references, to order after them.
+  private val touched = Buffer[ResourceId]()
+  // The resources the role being called has declared, for `after` and `val g = role(…)`.
+  private var made = Buffer[ResourceId]()
+
+  run(hostName: string, facts: Facts) -> Evaluated
+    for d in builtinData
+      register(d)
+    for f in files
+      for d in f.decls
+        d match
+          DataD(x) -> register(x)
+          FnD(x) -> fns(x.name) = x
+          RoleD(x) -> roles(x.name) = x
+          ValD(x) -> x.pattern match
+            BindP(n, _) -> vals(n) = x
+            _ -> ()
+          GroupD(x) -> groups += x
+          _ -> ()
+    val memberships = groups.filter(g -> g.hosts.exists(h -> h.name == hostName))
+    if memberships.isEmpty
+      diagnostics += Diagnostic("E0310", s"no group of the inventory holds a host `$hostName`", files.headOption.map(f -> spanOfFile(f)).getOrElse(Span("", builtinPos, builtinPos)), "unknown host")
+      return Evaluated(builder.finish(), diagnostics.toVector)
+    for f in files
+      for d in f.decls
+        if stopped then break
+        d match
+          ApplyD(a) ->
+            // `all`, a group holding the host, or the host itself by name.
+            val group: Option[GroupDecl] =
+              if a.target == "all" || a.target == hostName then memberships.headOption
+              else memberships.find(g -> g.name == a.target)
+            for g in group.toList
+              val h = hostOf(g, hostName, facts, a.target == "all")
+              hostValue = h
+              val env: List[(string, Value)] = if a.alias.isEmpty then [] else [(a.alias, h)]
+              for c in a.calls
+                callStatement(c, env, "")
+          _ -> ()
+    val g = builder.finish()
+    diagnostics ++= builder.diagnostics
+    Evaluated(g, diagnostics.toVector)
+
+  private val builtinPos = Pos(0, 1, 1)
+
+  private spanOfFile(f: SourceFile) -> Span = Span(f.path, builtinPos, builtinPos)
+
+  private register(d: DataDecl)
+    datas(d.name) = d
+    for v in d.variants
+      variants(v.name) = (d.name, v)
+
+  private error(code: string, message: string, span: Span, label: string = "")
+    if stopped then return
+    diagnostics += Diagnostic(code, message, span, label)
+    stopped = true
+
+  // --- The host --------------------------------------------------------------------------------
+
+  // The host value of `name` as `g` sees it: its facts, and `g`'s vars with the host's own over them.
+  private hostOf(g: GroupDecl, name: string, facts: Facts, all: bool) -> Value
+    val h = g.hosts.find(x -> x.name == name).get
+    val given = Table[string, Value]()
+    for s in g.fields ++ h.fields
+      s match
+        FieldS(n, v, _) -> given(n) = expr(v, [])
+        _ -> ()
+    val vars: Value = if all || g.varsType.isEmpty then RecordV("", []) else datas.get(g.varsType) match
+      Some(d) -> RecordV(d.name, d.params.map(p -> (p.name, given.get(p.name).orElse(p.default.map(x -> expr(x, []))).getOrElse(NoneV))))
+      None -> RecordV("", [])
+    val version: Value = facts.distro match
+      "Debian" | "Fedora" | "Rhel" -> IntV(facts.version.toLongOption().getOrElse(0))
+      _ -> StrV(facts.version)
+    val distro = facts.distro match
+      "Arch" -> VariantV("Distro", "Arch", [])
+      "Other" -> VariantV("Distro", "Other", [("id", StrV(facts.version))])
+      d -> VariantV("Distro", d, [("version", version)])
+    RecordV("Host", [
+      ("name", StrV(name)), ("address", expr(h.address, [])), ("vars", vars),
+      ("os", VariantV("Os", facts.os, [])), ("distro", distro), ("arch", VariantV("Cpu", facts.arch, [])),
+      ("init", VariantV("Init", facts.init, [])), ("cpus", IntV(facts.cpus)), ("memory", SizeV(facts.memory)),
+      ("hostname", StrV(facts.hostname)), ("user", StrV(facts.user)), ("root", BoolV(facts.root))
+    ])
+
+  // --- Statements ------------------------------------------------------------------------------
+
+  // A role call in statement position; answers the resources it declared.
+  private callStatement(call: Expr, env: List[(string, Value)], user: string) -> List[ResourceId] = call match
+    CallE(NameE(n, _), args, s) -> roles.get(n) match
+      Some(r) ->
+        val outer = made
+        made = Buffer[ResourceId]()
+        val bound = bindArgs(r.params, args, env)
+        block(r.body, bound, user)
+        val mine = made.toList
+        outer ++= mine
+        made = outer
+        mine
+      None ->
+        error("E0311", s"there is no role `$n`", s)
+        []
+    other ->
+      error("E0311", "only a role can be applied", other.extent)
+      []
+
+  private bindArgs(params: List[Param], args: List[Arg], env: List[(string, Value)]) -> List[(string, Value)]
+    val given = Table[string, Value]()
+    var position = 0
+    for a in args
+      val v = expr(a.value, env)
+      if a.name.isEmpty
+        if position < params.length then given(params(position).name) = v
+        position += 1
+      else
+        given(a.name) = v
+    var out: List[(string, Value)] = []
+    for p in params
+      val v = given.get(p.name) match
+        Some(x) -> x
+        None -> p.default.map(d -> expr(d, out)).getOrElse(NoneV)
+      out = (p.name, v) :: out
+    out
+
+  private block(stmts: List[Stmt], outer: List[(string, Value)], user: string)
+    var env = outer
+    for s in stmts
+      if stopped then return
+      env = stmt(s, env, user)
+
+  // Runs a statement, answering the scope after it.
+  private stmt(s: Stmt, env: List[(string, Value)], user: string) -> List[(string, Value)] = s match
+    ResourceS(r, name, _) ->
+      val id = resource(r, env, user)
+      if name.isEmpty then env else (name, RefV(id)) :: env
+    ValS(p, value, sp) ->
+      val v = expr(value, env)
+      matchPattern(p, v) match
+        Some(bound) -> bound ++ env
+        None ->
+          error("E0312", s"this value does not match the pattern: ${v.shown}", sp)
+          env
+    CallS(call, after, name, sp) ->
+      val ids = callStatement(call, env, user)
+      for a in after
+        for target in refsOf(expr(a, env))
+          builder.find(target) match
+            Some(from) -> for id in ids
+              builder.find(id) match
+                Some(to) -> builder.order(from, to, After, sp)
+                None -> ()
+            None -> ()
+      if name.isEmpty then env else (name, GroupV(ids)) :: env
+    IfS(c, t, e, _) ->
+      if truth(expr(c, env)) then block(t, env, user) else block(e, env, user)
+      env
+    ForS(p, over, body, sp) ->
+      for item in items(expr(over, env), sp)
+        if stopped then break
+        matchPattern(p, item) match
+          Some(bound) -> block(body, bound ++ env, user)
+          None -> ()
+      env
+    MatchS(scrutinee, arms, sp) ->
+      val v = expr(scrutinee, env)
+      var done = false
+      for a in arms
+        if done then break
+        matchPattern(a.pattern, v) match
+          Some(bound) ->
+            block(a.body, bound ++ env, user)
+            done = true
+          None -> ()
+      if !done then error("E0312", s"no arm of this `match` matches ${v.shown}", sp)
+      env
+    AsS(u, body, _) ->
+      val who = text(expr(u, env))
+      block(body, env, who)
+      env
+    _ -> env
+
+  // Declares a resource: its title and fields evaluated, its references, triggers and `after`s made
+  // edges. Answers its identity.
+  private resource(r: ResourceDecl, env: List[(string, Value)], user: string) -> ResourceId
+    val spec = kindNamed(r.kind).get
+    touched.clear()
+    val titleValue = expr(r.title, env)
+    val titleRefs = touched.toList
+    val title = if spec.title == PathT then normalPath(text(titleValue), r.title.extent) else text(titleValue)
+    val id = ResourceId(r.kind, title)
+    val given = Table[string, (Value, List[ResourceId])]()
+    val ons = Buffer[(List[ResourceId], string, Span)]()
+    val afters = Buffer[(List[ResourceId], Span)]()
+    for s in r.body
+      s match
+        FieldS(n, v, sp) ->
+          touched.clear()
+          val inner = if n == "validate" then ("staged", PathV("${staged}")) :: env else env
+          var value = expr(v, inner)
+          spec.field(n) match
+            Some(f) -> if f.kind == PathT then value = PathV(normalPath(text(value), v.extent))
+            None -> ()
+          given(n) = (value, touched.toList)
+        OnS(sources, action, sp) -> ons += (sources.flatMap(x -> refsOf(expr(x, env))), action, sp)
+        AfterS(refs, sp) -> afters += (refs.flatMap(x -> refsOf(expr(x, env))), sp)
+        _ -> ()
+    val fields = spec.fields.flatMap(f -> given.get(f.name).map((v, _) -> (f.name, v)).toList)
+    val index = builder.add(Node(id, fields, r.span, user))
+    made += id
+    for t in titleRefs
+      builder.find(t).foreach(from -> builder.order(from, index, Reference("title"), r.span))
+    for f in spec.fields
+      val refs: List[ResourceId] = given.get(f.name).map((_, rs) -> rs).getOrElse([])
+      for t in refs
+        builder.find(t).foreach(from -> builder.order(from, index, Reference(f.name), r.span))
+    for (sources, action, sp) in ons
+      builder.trigger(sources.flatMap(x -> builder.find(x).toList), index, action, sp)
+    for (refs, sp) in afters
+      for t in refs
+        builder.find(t).foreach(from -> builder.order(from, index, After, sp))
+    id
+
+  // The resources a reference or a group names.
+  private refsOf(v: Value) -> List[ResourceId] = v match
+    RefV(id) -> [id]
+    GroupV(ids) -> ids
+    _ -> []
+
+  // `p` made absolute and normal: `//` and `/./` folded, `..` taken back, no trailing `/`.
+  private normalPath(p: string, at: Span) -> string
+    if !p.startsWith("/")
+      error("E0313", s"`$p` is not an absolute path", at, "relative path")
+      return p
+    val parts = Buffer[string]()
+    for seg in p.split("/")
+      if seg == ".." && !parts.isEmpty then parts.remove(parts.length - 1)
+      else if !(seg.isEmpty || seg == "." || seg == "..") then parts += seg
+    s"/${parts.mkString("/")}"
+
+  // --- Expressions -----------------------------------------------------------------------------
+
+  private tick(at: Span)
+    steps += 1
+    if steps == stepBudget
+      error("E0314", s"evaluation took more than $stepBudget steps", at, "budget spent")
+
+  expr(e: Expr, env: List[(string, Value)]) -> Value
+    if stopped then return NoneV
+    tick(e.extent)
+    e match
+      IntE(v, _) -> IntV(v)
+      ModeE(v, _) -> ModeV(v)
+      DurationE(ms, _, _) -> DurationV(ms)
+      SizeE(b, _, _) -> SizeV(b)
+      BoolE(b, _) -> BoolV(b)
+      NoneE(_) -> NoneV
+      StrE(parts, _, _) -> StrV(interpolate(parts, env))
+      ShE(parts, _) -> CommandV(interpolate(parts, env), [], None, true)
+      NameE(n, s) -> name(n, s, env)
+      FieldE(t, f, s) -> fieldOf(expr(t, env), f, s)
+      CallE(callee, args, s) -> call(callee, args, s, env)
+      ListE(items, _) -> ListV(items.map(i -> expr(i, env)))
+      MapE(entries, _) -> MapV(entries.map((k, v) -> (expr(k, env), expr(v, env))))
+      TupleE(items, _) -> RecordV("", items.map(i -> ("", expr(i, env))))
+      UnaryE("!", x, _) -> BoolV(!truth(expr(x, env)))
+      UnaryE(_, x, s) -> expr(x, env) match
+        IntV(v) -> if v == minLong then overflow(s) else IntV(-v)
+        _ -> NoneV
+      BinaryE(op, l, r, s) -> binary(op, l, r, s, env)
+      IfE(c, t, f, _) -> if truth(expr(c, env)) then expr(t, env) else expr(f, env)
+      MatchE(scrutinee, arms, s) ->
+        val v = expr(scrutinee, env)
+        for a in arms
+          matchPattern(a.pattern, v) match
+            Some(bound) -> return expr(a.body, bound ++ env)
+            None -> ()
+        error("E0312", s"no arm of this `match` matches ${v.shown}", s)
+        NoneV
+      ForE(p, over, filter, body, s) ->
+        val out = Buffer[Value]()
+        for item in items(expr(over, env), s)
+          if stopped then break
+          matchPattern(p, item) match
+            Some(bound) ->
+              val inner = bound ++ env
+              val keep = filter.map(c -> truth(expr(c, inner))).getOrElse(true)
+              if keep then out += expr(body, inner)
+            None -> ()
+        ListV(out.toList)
+      WithE(t, fields, _) -> expr(t, env) match
+        RecordV(n, fs) -> RecordV(n, fs.map((k, v) -> (k, updated(k, v, fields, env))))
+        other -> other
+      LambdaE(_, _, _) -> NoneV
+      FailE(m, s) ->
+        error("E0315", text(expr(m, env)), s, "`fail`")
+        NoneV
+
+  // A record field's value after `with`: the new one where `fields` sets it.
+  private updated(k: string, v: Value, fields: List[FieldInit], env: List[(string, Value)]) -> Value = fields.find(f -> f.name == k) match
+    Some(f) -> expr(f.value, env)
+    None -> v
+
+  private overflow(s: Span) -> Value
+    error("E0316", "this arithmetic overflows a 64-bit int", s, "overflow")
+    NoneV
+
+  private name(n: string, s: Span, env: List[(string, Value)]) -> Value
+    env.find((k, _) -> k == n) match
+      Some((_, v)) -> return v
+      None -> ()
+    if n == "host" then return hostValue
+    if n == "none" then return NoneV
+    if n == "true" then return BoolV(true)
+    if n == "false" then return BoolV(false)
+    variants.get(n) match
+      Some((owner, v)) -> return VariantV(owner, n, [])
+      None -> ()
+    valCache.get(n) match
+      Some(v) -> return v
+      None -> ()
+    vals.get(n) match
+      Some(d) ->
+        val v = expr(d.value, [])
+        valCache(n) = v
+        v
+      None ->
+        error("E0311", s"there is no value `$n`", s)
+        NoneV
+
+  private fieldOf(target: Value, f: string, s: Span) -> Value = target match
+    RecordV(_, fs) -> fs.find((k, _) -> k == f).map((_, v) -> v).getOrElse(NoneV)
+    VariantV(_, _, fs) -> fs.find((k, _) -> k == f).map((_, v) -> v).getOrElse(NoneV)
+    RefV(id) ->
+      touched += id
+      val spec = kindNamed(id.kind).get
+      val titleName = if spec.title == PathT then "path" else "name"
+      if f == titleName then (if spec.title == PathT then PathV(id.title) else StrV(id.title))
+      else builder.find(id).flatMap(i -> builder.nodeAt(i).field(f)).getOrElse(NoneV)
+    _ -> NoneV
+
+  // A value written into text: a string as it is, a path, a number, a mode in octal.
+  private text(v: Value) -> string = v match
+    StrV(t) -> t
+    PathV(p) -> p
+    IntV(n) -> s"$n"
+    BoolV(b) -> s"$b"
+    NoneV -> ""
+    other -> other.shown
+
+  private interpolate(parts: List[StrPart], env: List[(string, Value)]) -> string
+    val out = StringWriter()
+    for p in parts
+      p match
+        TextP(t) -> out.write(t)
+        ExprP(x) -> out.write(text(expr(x, env)))
+    out.text
+
+  private truth(v: Value) -> bool = v match
+    BoolV(b) -> b
+    _ -> false
+
+  // The items `for` ranges over: a list's or a set's, a map's entries as pairs.
+  private items(v: Value, s: Span) -> List[Value] = v match
+    ListV(xs) -> xs
+    SetV(xs) -> xs
+    MapV(es) -> es.map((k, x) -> RecordV("", [("", k), ("", x)]))
+    _ -> []
+
+  private binary(op: string, l: Expr, r: Expr, s: Span, env: List[(string, Value)]) -> Value
+    if op == "&&" then return if truth(expr(l, env)) then BoolV(truth(expr(r, env))) else BoolV(false)
+    if op == "||" then return if truth(expr(l, env)) then BoolV(true) else BoolV(truth(expr(r, env)))
+    val a = expr(l, env)
+    val b = expr(r, env)
+    (op, a, b) match
+      ("==", _, _) -> BoolV(a == b)
+      ("!=", _, _) -> BoolV(a != b)
+      ("+", StrV(x), StrV(y)) -> StrV(x + y)
+      ("+", ListV(x), ListV(y)) -> ListV(x ++ y)
+      ("+", DurationV(x), DurationV(y)) -> add(x, y, s).map(v -> DurationV(v)).getOrElse(NoneV)
+      ("+", SizeV(x), SizeV(y)) -> add(x, y, s).map(v -> SizeV(v)).getOrElse(NoneV)
+      ("+", IntV(x), IntV(y)) -> add(x, y, s).map(v -> IntV(v)).getOrElse(NoneV)
+      ("-", IntV(x), IntV(y)) ->
+        if y == minLong then return overflow(s)
+        add(x, -y, s).map(v -> IntV(v)).getOrElse(NoneV)
+      ("*", IntV(x), IntV(y)) ->
+        if x == minLong || y == minLong
+          if x != 0 && x != 1 && y != 0 && y != 1 then return overflow(s)
+        else if x != 0 && (y > maxLong / abs(x) || y < -maxLong / abs(x)) then return overflow(s)
+        IntV(x * y)
+      ("/", IntV(_), IntV(0)) | ("%", IntV(_), IntV(0)) ->
+        error("E0317", "division by zero", s, "divides by zero")
+        NoneV
+      ("/", IntV(x), IntV(y)) -> IntV(x / y)
+      ("%", IntV(x), IntV(y)) -> IntV(x % y)
+      ("..", IntV(x), IntV(y)) -> range(x, y, s)
+      ("..<", IntV(x), IntV(y)) -> range(x, y - 1, s)
+      _ -> BoolV(compare(op, a, b))
+
+  private abs(x: long) -> long = if x < 0 then -x else x
+
+  private add(x: long, y: long, s: Span) -> Option[long]
+    if (y > 0 && x > maxLong - y) || (y < 0 && x < minLong - y)
+      overflow(s)
+      return None
+    Some(x + y)
+
+  private range(from: long, to: long, s: Span) -> Value
+    if to - from >= long(stepBudget)
+      error("E0314", s"this range has more than $stepBudget ints", s, "too long")
+      return NoneV
+    val out = Buffer[Value]()
+    var i = from
+    while i <= to
+      out += IntV(i)
+      i += 1
+    ListV(out.toList)
+
+  private compare(op: string, a: Value, b: Value) -> bool
+    val c: long = (a, b) match
+      (IntV(x), IntV(y)) -> x - y
+      (DurationV(x), DurationV(y)) -> x - y
+      (SizeV(x), SizeV(y)) -> x - y
+      (StrV(x), StrV(y)) -> long(x.compare(y))
+      _ -> 0
+    op match
+      "<" -> c < 0
+      "<=" -> c <= 0
+      ">" -> c > 0
+      _ -> c >= 0
+
+  private call(callee: Expr, args: List[Arg], s: Span, env: List[(string, Value)]) -> Value = callee match
+    NameE("cmd", _) ->
+      val vs = args.map(a -> expr(a.value, env))
+      vs match
+        [] -> NoneV
+        p :: rest -> CommandV(text(p), rest, None, false)
+    NameE("lines", _) -> args match
+      [a] -> expr(a.value, env) match
+        ListV(xs) -> StrV(xs.map(x -> s"${text(x)}\n").mkString(""))
+        _ -> StrV("")
+      _ -> StrV("")
+    NameE("local", _) -> args match
+      [a] ->
+        val file = text(expr(a.value, env))
+        readLocal(file) match
+          Some(t) -> StrV(t)
+          None ->
+            error("E0318", s"`local` cannot read `$file`", a.value.extent, "unreadable")
+            NoneV
+      _ -> NoneV
+    NameE("render", rs) ->
+      error("E0319", "templates are not evaluated yet: `render` needs the template parser", rs, "render")
+      NoneV
+    FieldE(NameE("secret", _), fn, _) ->
+      val what = args.map(a -> text(expr(a.value, env))).mkString(" ")
+      SecretV(if fn == "literal" || fn == "concat" then fn else s"$fn $what")
+    FieldE(target, method, ms) -> methodCall(expr(target, env), method, args, ms, env)
+    NameE(n, ns) ->
+      fns.get(n) match
+        Some(f) ->
+          return expr(f.body, bindArgs(f.params, args, env))
+        None -> ()
+      if roles.contains(n)
+        return GroupV(callStatement(CallE(callee, args, s), env, ""))
+      variants.get(n) match
+        Some((owner, v)) -> return VariantV(owner, n, bindArgs(v.params, args, env).reverse)
+        None -> ()
+      datas.get(n) match
+        Some(d) -> RecordV(n, bindArgs(d.params, args, env).reverse)
+        None ->
+          error("E0311", s"there is no function `$n`", ns)
+          NoneV
+    _ -> NoneV
+
+  private methodCall(target: Value, method: string, args: List[Arg], s: Span, env: List[(string, Value)]) -> Value = (target, method) match
+    (CommandV(p, a, _, sh), "stdin") -> CommandV(p, a, args.headOption.map(x -> expr(x.value, env)), sh)
+    (StrV(t), "trim") -> StrV(t.trim)
+    (StrV(t), "toLower") -> StrV(t.toLower)
+    (StrV(t), "toUpper") -> StrV(t.toUpper)
+    (StrV(t), "length") -> IntV(long(t.count(_ -> true)))
+    (ListV(xs), "length") -> IntV(long(xs.length))
+    (SetV(xs), "length") -> IntV(long(xs.length))
+    (MapV(es), "length") -> IntV(long(es.length))
+    (ListV(xs), "contains") -> BoolV(args.headOption.exists(a -> xs.contains(expr(a.value, env))))
+    (SetV(xs), "contains") -> BoolV(args.headOption.exists(a -> xs.contains(expr(a.value, env))))
+    (MapV(es), "keys") -> ListV(es.map((k, _) -> k))
+    (MapV(es), "values") -> ListV(es.map((_, v) -> v))
+    (ListV(xs), "map") -> ListV(xs.map(x -> apply1(args, x, env)))
+    (ListV(xs), "filter") -> ListV(xs.filter(x -> truth(apply1(args, x, env))))
+    (ListV(xs), "mkString") -> StrV(xs.map(x -> text(x)).mkString(args.headOption.map(a -> text(expr(a.value, env))).getOrElse("")))
+    _ -> NoneV
+
+  private apply1(args: List[Arg], x: Value, env: List[(string, Value)]) -> Value = args match
+    [Arg(_, LambdaE([p], body, _), _)] -> expr(body, (p, x) :: env)
+    _ -> NoneV
+
+  // The names `p` binds when it matches `v`, or `None` where it does not match.
+  private matchPattern(p: Pattern, v: Value) -> Option[List[(string, Value)]] = p match
+    WildP(_) -> Some([])
+    BindP(n, _) -> variants.get(n) match
+      Some(_) -> v match
+        VariantV(_, name, _) -> if name == n then Some([]) else None
+        _ -> Some([(n, v)])
+      None -> Some([(n, v)])
+    VariantP(n, fields, _) -> v match
+      VariantV(_, name, fs) ->
+        if name != n || fs.length != fields.length then return None
+        var out: List[(string, Value)] = []
+        for (fp, (_, fv)) in fields.zip(fs)
+          matchPattern(fp, fv) match
+            Some(b) -> out = b ++ out
+            None -> return None
+        Some(out)
+      _ -> None
+    TupleP(ps, _) -> v match
+      RecordV("", fs) ->
+        if fs.length != ps.length then return None
+        var out: List[(string, Value)] = []
+        for (tp, (_, fv)) in ps.zip(fs)
+          matchPattern(tp, fv) match
+            Some(b) -> out = b ++ out
+            None -> return None
+        Some(out)
+      _ -> None
+    LitP(e, _) -> if expr(e, []) == v then Some([]) else None
+    AltP(alts, _) ->
+      for a in alts
+        if matchPattern(a, v).isDefined then return Some([])
+      None

@@ -97,6 +97,9 @@ class GraphBuilder
   // The index of the resource `id`, if it was declared.
   find(id: ResourceId) -> Option[int] = index.get(id)
 
+  // The resource declared at index `i`.
+  nodeAt(i: int) -> Node = nodes(i)
+
   // Orders `to` after `from`.
   order(from: int, to: int, why: Why, span: Span)
     if from != to && !edges.exists(e -> e.from == from && e.to == to && e.why == why)

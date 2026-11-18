@@ -1,0 +1,1 @@
+{"os": "Linux", "distro": "Debian", "version": "12", "arch": "Amd64", "init": "Systemd", "cpus": 2, "memory": 2147483648, "hostname": "web1", "user": "deploy", "root": false}

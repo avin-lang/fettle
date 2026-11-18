@@ -1,0 +1,50 @@
+module tests
+
+import dev.avinlang.fettle.syntax.{BinaryE, BindP, Decl, ExprP, FieldE, ForS, IfE, Import, ListE, ModeE, OnS, SourceFile, StrE, TextP, UnaryE}
+import dev.avinlang.fettle.fmt.{format, showExpr}
+
+@test("example 2.2's role prints as the design writes it")
+people()
+  val p = FieldE(nm("p"), "name", sp(1))
+  val decls: List[Decl] = [
+    record("Person", [param("name", ty("string")), param("keys", tyOf("List", [ty("string")])), paramD("admin", ty("bool"), nm("false"))]),
+    role("people", [param("members", tyOf("List", [ty("Person")])), param("departed", tyOf("List", [ty("string")]))], [
+      res("group", str("admins"), []),
+      ForS(BindP("p", sp(1)), nm("members"), [res("user", p, [
+        fieldS("shell", str("/bin/bash")),
+        fieldS("groups", IfE(FieldE(nm("p"), "admin", sp(1)), ListE([str("admins")], sp(1)), ListE([], sp(1)), sp(1))),
+        fieldS("authorizedKeys", FieldE(nm("p"), "keys", sp(1)))
+      ])], sp(1)),
+      ForS(BindP("name", sp(1)), nm("departed"), [res("user", nm("name"), [fieldS("present", nm("false"))])], sp(1)),
+      res("file", str("/etc/sudoers.d/admins"), [
+        fieldS("content", str("%admins ALL=(ALL) NOPASSWD: ALL\n")),
+        fieldS("mode", ModeE(288, sp(1))),
+        fieldS("validate", call("cmd", [str("visudo"), str("-cf"), nm("staged")]))
+      ])
+    ])
+  ]
+  assertEq(format(source(decls, "roles")), "module roles\n\ndata Person(name: string, keys: List[string], admin: bool = false)\n\nrole people(members: List[Person], departed: List[string])\n  group \"admins\"\n  for p in members\n    user p.name\n      shell = \"/bin/bash\"\n      groups = if p.admin then [\"admins\"] else []\n      authorizedKeys = p.keys\n  for name in departed\n    user name\n      present = false\n  file \"/etc/sudoers.d/admins\"\n    content = \"%admins ALL=(ALL) NOPASSWD: ALL\\n\"\n    mode = 0o440\n    validate = cmd(\"visudo\", \"-cf\", staged)\n")
+
+@test("imports print with their names, and declarations are separated by one blank line")
+formattedImports()
+  val f = source([valD("a", num(1)), valD("b", num(2))], "", [Import("roles", [("Site", sp(1)), ("webServer", sp(1))], sp(1))])
+  assertEq(format(f), "import roles.{Site, webServer}\n\nval a = 1\n\nval b = 2\n")
+
+@test("operators are parenthesised only where precedence needs it")
+precedence()
+  val a = nm("a")
+  val b = nm("b")
+  val c = nm("c")
+  assertEq(showExpr(BinaryE("*", BinaryE("+", a, b, sp(1)), c, sp(1))), "(a + b) * c")
+  assertEq(showExpr(BinaryE("+", a, BinaryE("*", b, c, sp(1)), sp(1))), "a + b * c")
+  assertEq(showExpr(BinaryE("-", a, BinaryE("-", b, c, sp(1)), sp(1))), "a - (b - c)")
+  assertEq(showExpr(BinaryE("-", BinaryE("-", a, b, sp(1)), c, sp(1))), "a - b - c")
+  assertEq(showExpr(BinaryE("&&", BinaryE("||", a, b, sp(1)), c, sp(1))), "(a || b) && c")
+  assertEq(showExpr(UnaryE("!", BinaryE("==", a, b, sp(1)), sp(1))), "!(a == b)")
+
+@test("strings print with their escapes, and an interpolation as written")
+formattedStrings()
+  assertEq(showExpr(StrE([TextP("a\"b\\c\td\n$x ${")], false, sp(1))), "\"a\\\"b\\\\c\\td\\n$x \\${\"")
+  assertEq(showExpr(StrE([ExprP(FieldE(nm("tls"), "path", sp(1))), TextP("/"), ExprP(nm("d"))], false, sp(1))), "\"${tls.path}/${d}\"")
+  assertEq(showExpr(StrE([TextP("$")], false, sp(1))), "\"$\"")
+  assertEq(showExpr(ModeE(0, sp(1))), "0o0")
