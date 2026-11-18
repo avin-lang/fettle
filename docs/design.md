@@ -1,8 +1,7 @@
-# Tend: an agentless provisioning tool with its own language
+# Tend: agentless configuration management
 
-Design proposal, 2026-11-18. **Nothing here is built yet.** "Tend" is the name this document proposes
-(section 9) for both the tool and its language; files end in `.tend`. Every name is easy to change
-until the parser exists.
+Design, 2026-11-18. "Tend" is the name of both the tool and its language (section 9); files end in
+`.tend`. The decisions taken on this design are in section 10.
 
 Tend reads a program that describes the state a set of machines should be in, checks it, connects
 to every machine over SSH, works out what differs, shows that as a plan, and changes only what
@@ -436,7 +435,7 @@ Because evaluation is pure, `tend check` can evaluate every host against cached 
   itself, because functions are not first-class values beyond lambdas passed directly to the built-in
   collection functions.
 
-Why total: provisioning computes small things (names, lists, file contents). Starlark (Bazel)
+Why total: configuration computes small things (names, lists, file contents). Starlark (Bazel)
 dropped recursion and `while` for the same reason and is pleasant to use; Dhall and CUE show that
 total configuration languages scale to large configurations; Nickel and Pkl chose general recursion
 and in exchange cannot promise that `check` or the language server finishes. Totality buys:
@@ -539,7 +538,7 @@ a change that triggers an action, the engine records the pending action on the h
 the action has run. The next run starts by running anything still pending, which the plan shows.
 
 **Removal** is explicit: `present = false`. There is no state file, so a resource deleted from the
-program is no longer managed, not removed (section 10, question 4).
+program is no longer managed, not removed (section 10, decision 4).
 
 ### 4.7 Providers
 
@@ -783,7 +782,7 @@ The name serves the tool, the language and the file extension, and is typed hund
 
 | Name | For it | Against it |
 |---|---|---|
-| **tend** (recommended) | a verb for exactly the job ("tend the web hosts"); `tend plan`, `tend apply` read as sentences; `.tend` is unclaimed as far as I know; four letters | a common English word, so search needs "tend config" |
+| **tend** (chosen) | a verb for exactly the job ("tend the web hosts"); `tend plan`, `tend apply` read as sentences; `.tend` is unclaimed as far as I know; four letters | a common English word, so search needs "tend config" |
 | rig | short; "rig the servers" | many projects named rig |
 | bosun | the ship's officer who keeps the gear in order; distinctive | harder to type and spell; an existing alerting tool was named Bosun |
 | steward | clear meaning | long, and a common product name |
@@ -817,39 +816,34 @@ functions, `if`, `for`, `match`, typed vars); `become` and `def` as hidden globa
 
 ---
 
-## 10. Open questions for the user
+## 10. Decisions (2026-11-18)
 
-1. **The name.** *Recommendation:* **tend**, files `.tend`, and rename the repository once chosen.
-2. **Syntax family.** Indentation-based like Avin, or braces like HCL? *Recommendation:* indentation,
-   two spaces, Avin-like, so one person's languages read alike and specs stay terse.
-3. **Total language** (no recursion, no `while`). *Recommendation:* total, as 3.4 argues; revisit only
-   with a real program that needs more.
-4. **Removing what was deleted from the program.** Explicit `present = false` only, or a record on
-   each host of what Tend manages, so a resource dropped from the program is removed?
-   *Recommendation:* explicit only in v1; an opt-in managed set (`prune = true` per kind) in phase 3,
-   since silent removal is the most dangerous thing a provisioning tool can do.
-5. **Identical duplicate declarations.** Merge, or always an error as Puppet does?
-   *Recommendation:* merge identical, error on any difference with both positions.
-6. **The pending-trigger record on the target** (`/var/lib/tend/pending`). It is the only thing Tend
-   ever leaves on a host. *Recommendation:* yes; it closes the lost-restart hole and is one small file.
-7. **Cross-host data** (a web host's config naming the database host's address). *Recommendation:*
-   inventory values of any host are visible to every host in v1; facts of other hosts in phase 3.
-8. **File transfer over the command's standard input rather than SFTP.** *Recommendation:* standard
-   input: works with `become`, works where the SFTP subsystem is disabled, one code path.
-9. **Integration test targets.** Containers (docker or podman with systemd images), a local unprivileged
-   `sshd`, or VMs? *Recommendation:* containers first, local `sshd` for the kinds that need no root,
-   VMs later if systemd in containers proves unreliable.
-10. **Static linking** of libssh2 and its crypto library into Avin executables, which the
-    self-contained goal requires. *Recommendation:* add it to Avin's C bindings as Avin's own item
-    before phase 1 ships; until then development builds link dynamically.
-11. **Operator platforms for the first release.** *Recommendation:* macOS arm64 and Linux x86_64,
-    subject to the Linux unknown in 8.2.
-12. **Package versions.** Exact or `latest` only, or ranges? *Recommendation:* exact or `latest` in
-    v1; ranges invite plans that change with no program change.
-13. **`apply` asking for confirmation at a terminal.** *Recommendation:* yes, after printing the plan;
-    `--yes` for scripts and CI.
-14. **`become` default.** Root for every resource unless `as` says otherwise, or the login user by
-    default? *Recommendation:* root through `Sudo` when the inventory sets `become`, since nearly
-    every resource needs it; a host with no `become` runs as the login user.
-15. **Dynamic inventory** (cloud APIs). *Recommendation:* static in v1; phase 3 reads a local command's
-    JSON against a declared type, so it stays checked.
+1. **The name** is **tend**, files end in `.tend`, and the repository is named `tend`.
+2. **The syntax is indentation-based**, two spaces a level, in Avin's family, so one person's
+   languages read alike and programs stay terse.
+3. **The language is total**: no recursion, no `while` (section 3.4); this is revisited only for a
+   real program that needs more.
+4. **Removal is explicit** (`present = false`) in v1. An opt-in managed set (`prune = true` per kind)
+   comes in phase 3, since silent removal is the most dangerous thing a configuration tool can do.
+5. **Identical duplicate declarations merge**; any difference is an error showing both positions.
+6. **The pending-trigger record** (`/var/lib/tend/pending`) is kept on the target. It closes the
+   lost-restart hole and is the only thing Tend leaves on a host.
+7. **Cross-host data:** inventory values of every host are visible to every host in v1; facts of
+   other hosts come in phase 3.
+8. **Files travel over the command's standard input**, never SFTP: it works with `become`, works
+   where the SFTP subsystem is disabled, and is one code path.
+9. **Integration targets are containers first** (docker or podman with systemd images), a local
+   unprivileged `sshd` for the kinds that need no root, and VMs later only if systemd in containers
+   proves unreliable.
+10. **Static linking** of libssh2 and its crypto library becomes Avin's own item in its C bindings,
+    done before phase 1 ships; until then development builds link dynamically.
+11. **Operator platforms for the first release** are macOS arm64 and Linux x86_64, subject to the
+    Linux unknown in 8.2.
+12. **Package versions** are exact or `latest` in v1, never ranges, which would change plans with no
+    program change.
+13. **`apply` asks for confirmation at a terminal** after printing the plan; `--yes` skips it for
+    scripts and CI.
+14. **`become` defaults to root through `Sudo` when the inventory sets `become`**, since nearly every
+    resource needs it; a host with no `become` runs as the login user.
+15. **The inventory is static in v1**; phase 3 reads a local command's JSON against a declared type,
+    so it stays checked.
