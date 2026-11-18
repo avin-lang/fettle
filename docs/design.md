@@ -1,9 +1,9 @@
-# Tend: agentless configuration management
+# Fettle: agentless configuration management
 
-Design, 2026-11-18. "Tend" is the name of both the tool and its language (section 9); files end in
-`.tend`. The decisions taken on this design are in section 10.
+Design, 2026-11-18. "Fettle" is the name of both the tool and its language (section 9); files end in
+`.fettle`. The decisions taken on this design are in section 10.
 
-Tend reads a program that describes the state a set of machines should be in, checks it, connects
+Fettle reads a program that describes the state a set of machines should be in, checks it, connects
 to every machine over SSH, works out what differs, shows that as a plan, and changes only what
 differs. It is one native executable, written in Avin. The operator's machine needs nothing else;
 each target needs only `sshd` and a POSIX shell.
@@ -34,8 +34,8 @@ each target needs only `sshd` and a POSIX shell.
 
 - Windows targets, network devices, anything without a POSIX shell.
 - Provisioning cloud infrastructure (creating VMs, DNS records, load balancers). That is Terraform's
-  job; Tend configures machines that already exist.
-- A state file. The hosts are the state; Tend reads them every time (section 4.6 on removal).
+  job; Fettle configures machines that already exist.
+- A state file. The hosts are the state; Fettle reads them every time (section 4.6 on removal).
 - A pull mode, a central server, or continuous enforcement (mgmt's reactive model).
 - Turing-complete computation in the language (section 3.4).
 - A secrets vault. Secrets come from the environment, a file or a local command.
@@ -46,13 +46,13 @@ each target needs only `sshd` and a POSIX shell.
 
 ## 2. Examples
 
-A project is a directory. `inventory.tend` names the hosts; other `.tend` files hold roles, types
+A project is a directory. `inventory.fettle` names the hosts; other `.fettle` files hold roles, types
 and templates, organised in modules by directory as Avin's are. Indentation is two spaces.
 
 ### 2.1 A web server: nginx, a TLS certificate, a reload on change
 
-```tend
-// roles/web.tend
+```fettle
+// roles/web.fettle
 module roles
 
 data Site(domain: string, root: path = "/srv/www", port: int = 443)
@@ -83,7 +83,7 @@ role webServer(site: Site, certificate: string, key: secret)
     on conf, crt, k -> reload
 ```
 
-```tend
+```fettle
 // roles/site.conf.tmpl
 @params(site: Site, crt: path, key: path)
 server {
@@ -105,12 +105,12 @@ What the reader should see:
   standard input, never in an argument list.
 - `on conf, crt, k -> reload` reloads nginx once, after all three, only if any of them changed.
 - The template declares its parameters, so using `site.prot` in it, or passing a `string` for
-  `site`, is an error at `tend check` with the template's line.
+  `site`, is an error at `fettle check` with the template's line.
 
 ### 2.2 Users and their SSH keys across a group
 
-```tend
-// roles/people.tend
+```fettle
+// roles/people.fettle
 module roles
 
 data Person(name: string, keys: List[string], admin: bool = false)
@@ -134,8 +134,8 @@ role people(members: List[Person], departed: List[string])
     validate = cmd("visudo", "-cf", staged)
 ```
 
-```tend
-// team.tend
+```fettle
+// team.fettle
 val team = [
   Person("ana", ["ssh-ed25519 AAAAC3Nz…Qk ana@laptop"], admin = true),
   Person("bo", ["ssh-ed25519 AAAAC3Nz…7f bo@desk", "ssh-ed25519 AAAAC3Nz…a1 bo@phone"]),
@@ -149,8 +149,8 @@ place; it is a value of type `path` that exists only inside `validate`.
 
 ### 2.3 A per-distribution difference
 
-```tend
-// roles/time.tend
+```fettle
+// roles/time.fettle
 module roles
 
 role timeSync(servers: List[string])
@@ -179,8 +179,8 @@ position, and that host is reported as failed before anything is applied to it.
 
 ### 2.4 A reusable module
 
-```tend
-// modules/postgres/postgres.tend
+```fettle
+// modules/postgres/postgres.fettle
 module postgres
 
 data Database(name: string, owner: string)
@@ -190,8 +190,8 @@ data Config(version: int = 16, listen: List[string] = ["127.0.0.1"], databases: 
 role server(config: Config)
   package "postgresql-${config.version}"
 
-  val conf = file "/etc/postgresql/${config.version}/main/conf.d/tend.conf"
-    content = render("tend.conf.tmpl", config = config)
+  val conf = file "/etc/postgresql/${config.version}/main/conf.d/fettle.conf"
+    content = render("fettle.conf.tmpl", config = config)
 
   val svc = service "postgresql"
     running = true
@@ -225,7 +225,7 @@ private kind pgDatabase(name: string, owner: string)
 
 and its use:
 
-```tend
+```fettle
 import postgres.{Config, Database, server}
 
 apply db -> server(Config(databases = [Database("app", "app")]))
@@ -240,8 +240,8 @@ rather than claiming success.
 
 ### 2.5 An inventory with per-host variables
 
-```tend
-// inventory.tend
+```fettle
+// inventory.fettle
 import roles.{Site, people, timeSync, webServer}
 
 data WebVars(domain: string, workers: int = 4, canary: bool = false)
@@ -284,8 +284,8 @@ apply web as h ->
 
 ### 2.6 A custom resource kind
 
-```tend
-// kinds/sysctl.tend
+```fettle
+// kinds/sysctl.fettle
 module kinds
 
 kind sysctl(key: string, value: string)
@@ -298,7 +298,7 @@ role tuned(settings: Map[string, string])
   for (k, v) in settings
     sysctl k
       value = v
-  file "/etc/sysctl.d/90-tend.conf"
+  file "/etc/sysctl.d/90-fettle.conf"
     content = lines(for (k, v) in settings yield "${k} = ${v}")
 ```
 
@@ -311,7 +311,7 @@ non-idempotent by accident. A group of existing resources is a `role`, not a `ki
 ### 2.7 What the commands print
 
 ```
-$ tend plan web
+$ fettle plan web
 web1 (debian 12, amd64)
   + package nginx                                   install 1.22.1-9
   + directory /etc/nginx/tls                        mode 0750, owner root:root
@@ -330,7 +330,7 @@ Plan: 2 hosts; 5 to create, 1 to change, 0 to remove, 2 actions.
 ```
 
 ```
-$ tend apply web
+$ fettle apply web
 web1  [6/6]  changed 6
 web2  [2/2]  changed 2
 web1, web2: done in 41 s. 8 changed, 0 failed, 0 unreachable.
@@ -338,7 +338,7 @@ web1, web2: done in 41 s. 8 changed, 0 failed, 0 unreachable.
 
 ```
 error[E0207]: the field `mode` of `file` is a `mode`, but this is a `string`
-  --> roles/web.tend:17:12
+  --> roles/web.fettle:17:12
    |
 17 |     mode = "0600"
    |            ^^^^^^ a string
@@ -382,7 +382,7 @@ call in statement position adds its resources; in `val` position it binds the gr
 - **Scalars:** `string`, `int` (64-bit, overflow is an error), `bool`, `path` (absolute, normalised),
   `mode` (`0o640`, range checked), `duration` (`30s`, `10m`), `size` (`512MiB`).
 - **Literal types are checked where the value is known.** `path "etc/x"` and `mode 0o1777777` are
-  errors at `tend check`; a computed path that is not absolute is an evaluation error at the
+  errors at `fettle check`; a computed path that is not absolute is an evaluation error at the
   expression's span, for that host. No regex validation of strings anywhere.
 - **`data`**: nominal records with defaults (`data Site(domain: string, port: int = 443)`) and
   algebraic types (variants indented under the name, as Avin writes them). Construction by position
@@ -420,8 +420,8 @@ For each host, in this order:
    source spans), and resource kinds no provider on this host can serve.
 5. Only now does the **engine** read state (probes), diff, plan and apply.
 
-Because evaluation is pure, `tend check` can evaluate every host against cached facts
-(`.tend/facts/`) or fixtures with no connection, and the language server can do the same as you type.
+Because evaluation is pure, `fettle check` can evaluate every host against cached facts
+(`.fettle/facts/`) or fixtures with no connection, and the language server can do the same as you type.
 
 ### 3.4 How far computation goes: total
 
@@ -439,7 +439,7 @@ Why total: configuration computes small things (names, lists, file contents). St
 dropped recursion and `while` for the same reason and is pleasant to use; Dhall and CUE show that
 total configuration languages scale to large configurations; Nickel and Pkl chose general recursion
 and in exchange cannot promise that `check` or the language server finishes. Totality buys:
-`tend check` over 500 hosts always finishes; the language server can evaluate on every keystroke; no
+`fettle check` over 500 hosts always finishes; the language server can evaluate on every keystroke; no
 evaluation is ever a hang during a deploy. It costs: tree walks of arbitrary depth, which a
 configuration does not need. Anything genuinely algorithmic happens on the host, through a command or
 a custom kind. A size budget (evaluation steps, output bytes) stops a pathological program with a
@@ -493,7 +493,7 @@ preview, the per-resource probe is the truth.
 
 `render(template, args…)` makes a `file`'s `content`. Templates are text files whose first line
 declares typed parameters (`@params(site: Site)`); the body uses `${expr}` and `@for`/`@if` lines.
-The same checker checks them, so a typo in a template is found at `tend check` with the template's
+The same checker checks them, so a typo in a template is found at `fettle check` with the template's
 line, which is the whole difference from Jinja.
 
 A `command` with no guard and no trigger is a checker error; `always = true` makes it legal and the
@@ -532,9 +532,9 @@ are an error that shows both positions and the differing fields.
 `on a, b -> action` adds a trigger edge. The action runs at most once per run, after every source it
 names and before anything that depends on the triggered resource; it runs only if a source changed.
 Ansible's handlers have a known hole: a run that changes the config and then fails before the handler
-leaves the service on the old config, and the next run sees no change. Tend closes it: before applying
+leaves the service on the old config, and the next run sees no change. Fettle closes it: before applying
 a change that triggers an action, the engine records the pending action on the host
-(`/var/lib/tend/pending`, or `~/.local/state/tend/pending` for a non-root login), and clears it when
+(`/var/lib/fettle/pending`, or `~/.local/state/fettle/pending` for a non-root login), and clears it when
 the action has run. The next run starts by running anything still pending, which the plan shows.
 
 **Removal** is explicit: `present = false`. There is no state file, so a resource deleted from the
@@ -563,7 +563,7 @@ only if older than `refresh` (1 h by default).
 One script, one round trip, read-only, POSIX `sh` plus `uname`, `id` and `/etc/os-release`; it
 checks which tools exist with `command -v`. The result is typed:
 
-```tend
+```fettle
 data Host[V](name: string, address: string, vars: V, os: Os, distro: Distro, arch: Arch,
              init: Init, cpus: int, memory: size, hostname: string, user: string, root: bool)
 data Distro
@@ -577,15 +577,15 @@ data Distro
   Other(id: string)
 ```
 
-`tend facts <targets>` prints and caches them in `.tend/facts/` (git-ignored), which `tend check`
+`fettle facts <targets>` prints and caches them in `.fettle/facts/` (git-ignored), which `fettle check`
 and the language server use. Custom facts (a typed probe) come later.
 
 ### 5.2 Plan
 
 Text as in section 2.7: per host, one line per resource that is not `ok` (`+` create, `~` change,
 `-` remove, `>` action, `!` command that always runs), unified diffs under changed text, secrets as
-`(secret)`, then a summary line. `--json` writes the same plan for machines. `tend plan -o plan.tend-plan`
-saves it; `tend apply plan.tend-plan` applies exactly that, refusing any host whose probes no longer
+`(secret)`, then a summary line. `--json` writes the same plan for machines. `fettle plan -o plan.fettle-plan`
+saves it; `fettle apply plan.fettle-plan` applies exactly that, refusing any host whose probes no longer
 match what the plan saw (Terraform's saved plan). Exit status: 0 no changes, 2 changes, 1 error.
 
 ### 5.3 Apply and reporting
@@ -628,7 +628,7 @@ root-owned path through the same channel (4.3), so no SFTP permission question a
 - Through avin-lang/ssh (libssh2): agent first (`SSH_AUTH_SOCK`), then `key` files (passphrase a
   secret), then `password` (a secret, never a command-line option).
 - **Host keys** are strict by default against `~/.ssh/known_hosts`. `hostKey = "SHA256:…"` pins one
-  in the inventory. `tend trust <targets>` connects, prints each fingerprint and adds it on
+  in the inventory. `fettle trust <targets>` connects, prints each fingerprint and adds it on
   confirmation; `--accept-new` does that during a run, for throwaway machines.
 - One session per host per run, with keepalives; every command is an exec on it.
 
@@ -639,16 +639,16 @@ root-owned path through the same channel (4.3), so no SFTP permission question a
 ### 6.1 The CLI
 
 ```
-tend check [path]              parse, check, evaluate every host against cached facts
-tend fmt [--check] [path…]     format in place
-tend lsp                       language server on standard input and output
-tend facts <targets>           gather, print and cache facts
-tend plan <targets> [-o file] [--json]
-tend apply <targets> | <plan file> [--yes] [--parallel n] [--stop-on-failure] [--max-failures n]
-tend test [filter] [--integration]
-tend trust <targets>
-tend graph <host>              the ordered graph as DOT
-tend explain <code>            the long form of a diagnostic
+fettle check [path]              parse, check, evaluate every host against cached facts
+fettle fmt [--check] [path…]     format in place
+fettle lsp                       language server on standard input and output
+fettle facts <targets>           gather, print and cache facts
+fettle plan <targets> [-o file] [--json]
+fettle apply <targets> | <plan file> [--yes] [--parallel n] [--stop-on-failure] [--max-failures n]
+fettle test [filter] [--integration]
+fettle trust <targets>
+fettle graph <host>              the ordered graph as DOT
+fettle explain <code>            the long form of a diagnostic
 ```
 
 Targets: groups and hosts by name, `web,db`, `web:!web2`.
@@ -675,10 +675,10 @@ resource kinds and host names. Later: rename, references, semantic tokens, code 
 
 ### 6.5 Tests
 
-Three levels, all through `tend test`:
+Three levels, all through `fettle test`:
 
-```tend
-// tests/web.test.tend
+```fettle
+// tests/web.test.fettle
 import roles.{Site, webServer}
 
 test "the key is private and nginx reloads when it changes"
@@ -695,7 +695,7 @@ target alpine = container("alpine:3.20")
 ```
 
 1. **Pure tests**: evaluate roles against fact fixtures and assert on the graph. No hosts, milliseconds.
-2. **Snapshots**: `tend test --snapshot` writes each role's from-scratch plan per fixture to
+2. **Snapshots**: `fettle test --snapshot` writes each role's from-scratch plan per fixture to
    `tests/snapshots/` and compares later runs with them.
 3. **Integration**: `--integration` starts each `target` (a container with `sshd` through docker or
    podman, if present on the operator machine, or a local unprivileged `sshd` as avin-lang/ssh's tests
@@ -707,7 +707,7 @@ target alpine = container("alpine:3.20")
 
 ## 7. How it is built in Avin
 
-One package, `dev.avinlang.tend` (renamed with the tool), one executable.
+One package, `dev.avinlang.fettle` (renamed with the tool), one executable.
 
 | Module | Holds | Rough size |
 |---|---|---|
@@ -780,17 +780,18 @@ resources; a dynamic inventory read from a command's typed JSON.
 
 The name serves the tool, the language and the file extension, and is typed hundreds of times a day.
 
+**fettle, chosen by the user 2026-11-18**: to fettle is to put a thing in good order, and "in fine
+fettle" is the state the hosts are kept in; `fettle plan`, `fettle apply` read as commands; files end
+in `.fettle`; the repository is avin-lang/fettle. The names weighed before it:
+
 | Name | For it | Against it |
 |---|---|---|
-| **tend** (chosen) | a verb for exactly the job ("tend the web hosts"); `tend plan`, `tend apply` read as sentences; `.tend` is unclaimed as far as I know; four letters | a common English word, so search needs "tend config" |
+| tend | a verb for the job ("tend the web hosts"); four letters | a common English word, hard to search for |
 | rig | short; "rig the servers" | many projects named rig |
 | bosun | the ship's officer who keeps the gear in order; distinctive | harder to type and spell; an existing alerting tool was named Bosun |
 | steward | clear meaning | long, and a common product name |
 | muster | gathers hosts | says "gather", not "configure" |
 | ward | to keep watch | reads as security tooling |
-
-The availability of whichever name is picked (GitHub org repos, Homebrew formula names) is to be
-checked before the repository is renamed from `provision`.
 
 ## Prior art: what is taken from each
 
@@ -801,7 +802,7 @@ checked before the repository is renamed from `provision`.
 | **Chef** | resources with actions (`reload`, `restart`); `only_if`/`not_if` guards | a general-purpose host language, so specs are programs with side effects |
 | **pyinfra** | two phases, compute operations then execute; a plain POSIX shell target | operations as Python with no static checking |
 | **Nix / NixOS** | pure evaluation into a configuration, activation separate; deterministic inputs | the store, generations and the learning curve |
-| **Terraform / HCL** | `plan`/`apply`, saved plans, the summary line and exit codes, the dependency graph from references, providers | a state file, which Tend replaces with probing hosts that are themselves the state |
+| **Terraform / HCL** | `plan`/`apply`, saved plans, the summary line and exit codes, the dependency graph from references, providers | a state file, which Fettle replaces with probing hosts that are themselves the state |
 | **CUE, Dhall, Pkl, Nickel** | a typed configuration language with a formatter and language server from the start; Dhall's and CUE's totality, against Nickel's and Pkl's generality (3.4) | CUE's unification lattice and Dhall's lambda-calculus surface, both harder to read than records and functions |
 | **Starlark** | no recursion, no `while`, deterministic, an interpreter embedded in one binary | Python's syntax and dynamic typing |
 | **mgmt** | the idea that resources are a graph with typed edges | reactive, continuously running enforcement (a non-goal) |
@@ -818,7 +819,8 @@ functions, `if`, `for`, `match`, typed vars); `become` and `def` as hidden globa
 
 ## 10. Decisions (2026-11-18)
 
-1. **The name** is **tend**, files end in `.tend`, and the repository is named `tend`.
+1. **The name** is **fettle**, chosen by the user; files end in `.fettle`, and the repository is
+   avin-lang/fettle.
 2. **The syntax is indentation-based**, two spaces a level, in Avin's family, so one person's
    languages read alike and programs stay terse.
 3. **The language is total**: no recursion, no `while` (section 3.4); this is revisited only for a
@@ -826,8 +828,8 @@ functions, `if`, `for`, `match`, typed vars); `become` and `def` as hidden globa
 4. **Removal is explicit** (`present = false`) in v1. An opt-in managed set (`prune = true` per kind)
    comes in phase 3, since silent removal is the most dangerous thing a configuration tool can do.
 5. **Identical duplicate declarations merge**; any difference is an error showing both positions.
-6. **The pending-trigger record** (`/var/lib/tend/pending`) is kept on the target. It closes the
-   lost-restart hole and is the only thing Tend leaves on a host.
+6. **The pending-trigger record** (`/var/lib/fettle/pending`) is kept on the target. It closes the
+   lost-restart hole and is the only thing Fettle leaves on a host.
 7. **Cross-host data:** inventory values of every host are visible to every host in v1; facts of
    other hosts come in phase 3.
 8. **Files travel over the command's standard input**, never SFTP: it works with `become`, works
