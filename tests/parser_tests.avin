@@ -1,0 +1,219 @@
+module tests
+
+import dev.avinlang.fettle.syntax.{CallS, RoleD, parseSource, parseTemplate}
+
+// The parser: every form of the language read into the tree the formatter writes back, spans that
+// point at the source, and every syntax error reported with parsing carried on.
+
+// Parses `text` and answers it formatted, failing on any syntax error.
+roundTrip(text: string) -> string
+  assertEq(syntaxOf(text), "")
+  reformat(text)
+
+@test("every declaration reads and writes back as written")
+declarations()
+  val text = src([
+    "module roles",
+    "",
+    "import other.{A, b}",
+    "",
+    "data Site(domain: string, root: path = \"/srv/www\", port: int = 443)",
+    "",
+    "data Shape",
+    "  Circle(r: int)",
+    "  Square",
+    "",
+    "double(n: int) -> int = n * 2",
+    "",
+    "private role web(site: Site, names: List[string], ports: Map[string, int], o: int?)",
+    "  package \"nginx\"",
+    "",
+    "val limit = 10",
+    "",
+    "connect all",
+    "  user = \"deploy\"",
+    "",
+    "group web: WebVars",
+    "  workers = 8",
+    "  host web1 at \"10.0.0.11\"",
+    "    domain = \"a\"",
+    "  rollout = Batches(size = 1, maxFailures = 0)",
+    "",
+    "apply web as h -> web(h.vars.site)"
+  ])
+  assertEq(roundTrip(text), text)
+
+@test("every statement reads and writes back as written")
+statements()
+  val text = src([
+    "role r(xs: List[string], d: Distro)",
+    "  val conf = file \"/etc/a\"",
+    "    content = \"x\"",
+    "    mode = 0o640",
+    "  val (a, b) = (1, 2)",
+    "  if a < b",
+    "    package \"x\"",
+    "  else if a == b",
+    "    package \"y\"",
+    "  else",
+    "    package \"z\"",
+    "  for x in xs",
+    "    user x",
+    "  match d",
+    "    Debian(_) | Ubuntu(_) ->",
+    "      package \"apt\"",
+    "    _ ->",
+    "      package \"other\"",
+    "  as \"postgres\"",
+    "    package \"pg\"",
+    "  other(xs) after conf",
+    "  val g = other(xs)",
+    "  service \"s\"",
+    "    on conf -> restart",
+    "    after conf, g"
+  ])
+  assertEq(roundTrip(text), text)
+
+@test("every expression reads and writes back as written")
+expressions()
+  val text = src([
+    "val a = -1 + 2 * 3 - 4 / 2 % 3",
+    "",
+    "val b = !(a == 1) && a != 2 || a <= 3 && a >= 0",
+    "",
+    "val c = if a > 1 then \"big\" else \"small\"",
+    "",
+    "val d = for x in [1, 2, 3] if x > 1 yield x * 2",
+    "",
+    "val e = { \"k\": 1, \"j\": 2 }",
+    "",
+    "val f = (1, \"two\", true)",
+    "",
+    "val g = site with { port = 8443, root = \"/srv\" }",
+    "",
+    "val h = xs.map(x -> x + 1).filter((a, b) -> a > b)",
+    "",
+    "val i = f(match a { 1 -> \"one\"; _ -> \"many\" })",
+    "",
+    "val i2 = match a",
+    "  1 -> \"one\"",
+    "  _ -> \"many\"",
+    "",
+    "val j = cmd(\"psql\", \"-tA\").stdin(\"SELECT 1\")",
+    "",
+    "val k = sh\"ls ${dir} | wc -l\"",
+    "",
+    "val l = [none, false, 30s, 512MiB, 0o755, 1 ..< 4, 1 .. 3]",
+    "",
+    "val m = fail \"no ${a}\""
+  ])
+  assertEq(roundTrip(text), text)
+
+@test("operators group by precedence, and parentheses only where they are needed")
+precedenceParsed()
+  assertEq(roundTrip("val a = (1 + 2) * 3\n"), "val a = (1 + 2) * 3\n")
+  assertEq(roundTrip("val a = 1 + (2 * 3)\n"), "val a = 1 + 2 * 3\n")
+  assertEq(roundTrip("val a = (1 - 2) - 3\n"), "val a = 1 - 2 - 3\n")
+  assertEq(roundTrip("val a = 1 - (2 - 3)\n"), "val a = 1 - (2 - 3)\n")
+  assertEq(roundTrip("val a = (x || y) && z\n"), "val a = (x || y) && z\n")
+  assertEq(roundTrip("val a = -(1 + 2)\n"), "val a = -(1 + 2)\n")
+  assertEq(roundTrip("val a = ((x))\n"), "val a = x\n")
+  assertEq(roundTrip("val a = 1..<4\n"), "val a = 1 ..< 4\n")
+  assertEq(roundTrip("val a = xs.filter((x) -> x > 2)\n"), "val a = xs.filter(x -> x > 2)\n")
+  assertEq(roundTrip("val a = match b { 1 -> 2; _ -> 3 }\n"), "val a = match b\n  1 -> 2\n  _ -> 3\n")
+
+@test("a trailing comma is allowed before a closing bracket, and a one-item tuple keeps it")
+trailingCommas()
+  assertEq(roundTrip("val a = [1, 2,]\n"), "val a = [1, 2]\n")
+  assertEq(roundTrip("val a = f(1, b = 2,)\n"), "val a = f(1, b = 2)\n")
+  assertEq(roundTrip("val a = { \"k\": 1, }\n"), "val a = { \"k\": 1 }\n")
+  assertEq(roundTrip("data D(a: int, b: int,)\n"), "data D(a: int, b: int)\n")
+  assertEq(roundTrip("import a.{B, c,}\n"), "import a.{B, c}\n")
+  assertEq(roundTrip("val a = []\n"), "val a = []\n")
+  assertEq(roundTrip("val a = {}\n"), "val a = {}\n")
+  assertEq(roundTrip("val a = f()\n"), "val a = f()\n")
+
+@test("a match in value position takes its arms from the lines under it")
+matchValue()
+  val text = src([
+    "role r()",
+    "  val (u, c) = match host.distro",
+    "    Debian(_) | Ubuntu(_) -> (\"chrony\", \"/a\")",
+    "    other -> fail \"no ${other}\"",
+    "  package u"
+  ])
+  assertEq(roundTrip(text), text)
+
+@test("a resource's kind may be `group`, the inventory's word, and a title may be any expression")
+groupKind()
+  val text = src([
+    "role r(p: Person)",
+    "  group \"admins\"",
+    "  user p.name",
+    "  directory \"/srv/${p.name}\" + \"/x\""
+  ])
+  assertEq(roundTrip(text), text)
+
+@test("spans point at the source: a declaration, a statement, an expression")
+treeSpans()
+  val f =parseSource("t.fettle", src(["", "role r()", "  package \"git\"", "  val n = 1 + 22"])).file
+  f.decls match
+    [RoleD(r)] ->
+      assertEq(s"${r.span.start.line}:${r.span.start.column}-${r.span.end.line}:${r.span.end.column}", "2:1-4:17")
+      r.body match
+        [a, b] ->
+          assertEq(s"${a.extent.start.line}:${a.extent.start.column}", "3:3")
+          assertEq(s"${b.extent.start.line}:${b.extent.start.column}-${b.extent.end.column}", "4:3-17")
+        _ -> assert(false)
+    _ -> assert(false)
+
+@test("`val g = r(…)` where `r` is a role binds the role's group")
+roleCallBound()
+  val p = projectOf([("main.fettle", src(["role a()", "  package \"x\"", "", "role b()", "  val g = a()", "  service \"s\"", "    after g"]))])
+  p.files.head.decls match
+    [_, RoleD(r)] ->
+      r.body.head match
+        CallS(_, _, name, _) -> assertEq(name, "g")
+        _ -> assert(false)
+    _ -> assert(false)
+  assertEq(diagsOf(["role a()", "  package \"x\"", "", "role b()", "  val g = a()", "  service \"s\"", "    after g"]), "")
+
+@test("a syntax error is reported at the token, and parsing goes on at the next line")
+syntaxErrors()
+  assertEq(syntaxOf(src(["role r()", "  package = = 1", "  file \"/a\"", "    mode = 0o600 0o700", "  service \"s\""])),
+    "t.fettle:2:13 E0150 expected `if`, `match`, `for`, `fail`, `-`, `!`, a value, a name, `(`, `[` or `{`, found `=`\nt.fettle:4:18 E0150 expected `.`, `(`, `with`, an operator or the end of the line, found `0o700`")
+  val f = parseSource("t.fettle", src(["role r()", "  package = = 1", "  file \"/a\"", "", "role s()", "  package \"y\""])).file
+  assertEq(f.decls.length, 2)
+
+@test("a declaration that does not parse is skipped with its block, and the next is read")
+declarationRecovery()
+  val text = src(["role r() oops", "  package \"x\"", "", "data D(a: int)", "", "role s(a: )", "  package \"y\"", "", "val v = 1"])
+  val f = parseSource("t.fettle", text)
+  assertEq(f.file.decls.length, 2)
+  assertEq(f.diagnostics.map(d -> shown(d)).mkString("\n"), "t.fettle:1:10 E0150 expected the end of the line, found `oops`\nt.fettle:6:11 E0150 expected a name, found `)`")
+  // A bracket left open swallows the line ends after it: one error, and nothing after it is read.
+  val open = parseSource("t.fettle", src(["role r(", "  package \"x\""]))
+  assertEq(open.diagnostics.head.code, "E0104")
+
+@test("a mistake in an interpolation is reported inside the string")
+holeError()
+  assertEq(syntaxOf("val a = \"x ${1 +} y\"\n"), "t.fettle:1:17 E0150 expected `-`, `!`, a value, a name, `(`, `[` or `{`, found `}`")
+  assertEq(syntaxOf("val a = \"x ${b c} y\"\n"), "t.fettle:1:16 E0150 expected `.`, `(`, `with`, an operator or `}`, found `c`")
+  assertEq(roundTrip("val a = \"${\"${b}\"}\"\n"), "val a = \"${\"${b}\"}\"\n")
+
+@test("an `apply` takes one call on its line or several on the lines under it")
+applyForms()
+  assertEq(roundTrip("apply all -> a(1)\n"), "apply all -> a(1)\n")
+  assertEq(roundTrip(src(["apply all ->", "  a(1)", "  b(2)"])), src(["apply all ->", "  a(1)", "  b(2)"]))
+  assertEq(syntaxOf("apply all ->\n"), "t.fettle:2:1 E0150 expected an indented block, found the end of the file")
+
+@test("a template's first line declares its parameters")
+templates()
+  val t = parseTemplate("roles/x.tmpl", "roles", "@params(site: Site, port: int = 80)\nlisten ${port};\nliteral $${not} and $ alone\n")
+  assertEq(t.diagnostics.length, 0)
+  assertEq(t.template.params.map(p -> p.name).mkString(" "), "site port")
+  assertEq(t.template.moduleName, "roles")
+  val bad = parseTemplate("x.tmpl", "", "server {\n}\n")
+  assertEq(bad.diagnostics.map(d -> shown(d)).mkString("\n"), "x.tmpl:1:1 E0150 expected `@`, found `server`")
+  val hole = parseTemplate("x.tmpl", "", "@params(a: int)\n${a +}\n")
+  assertEq(hole.diagnostics.map(d -> d.code).mkString(" "), "E0150")

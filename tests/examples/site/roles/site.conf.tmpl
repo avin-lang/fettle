@@ -1,0 +1,8 @@
+@params(site: Site, crt: path, key: path)
+server {
+  listen ${site.port} ssl;
+  server_name ${site.domain};
+  root ${site.root};
+  ssl_certificate ${crt};
+  ssl_certificate_key ${key};
+}

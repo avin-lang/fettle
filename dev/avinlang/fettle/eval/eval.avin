@@ -2,10 +2,10 @@ module dev.avinlang.fettle.eval
 
 import avin.collections.mutable.{Map as Table}
 import dev.avinlang.json.{Json, Long as JLong, Obj, Str as JStr, Bool as JBool, parse as parseJson}
-import dev.avinlang.fettle.check.{builtinData}
+import dev.avinlang.fettle.check.{builtinData, templatePath}
 import dev.avinlang.fettle.kinds.{KindSpec, PathT, kindNamed}
 import dev.avinlang.fettle.graph.{After, BoolV, CommandV, DurationV, Graph, GraphBuilder, GroupV, IntV, ListV, MapV, ModeV, Node, NoneV, PathV, RecordV, RefV, Reference, ResourceId, SecretV, SetV, SizeV, StrV, Value, VariantV}
-import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, Arm, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldInit, FieldS, FnD, FnDecl, ForE, ForS, GroupD, GroupDecl, HostDecl, IfE, IfS, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NoneE, OnS, Param, Pattern, Pos, ResourceDecl, ResourceS, RoleD, RoleDecl, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, TextP, TupleE, TupleP, UnaryE, ValD, ValDecl, ValS, Variant, VariantP, WildP, WithE}
+import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, Arm, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldInit, FieldS, FnD, FnDecl, ForE, ForS, GroupD, GroupDecl, HostDecl, IfE, IfS, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NoneE, OnS, Param, Pattern, Pos, ResourceDecl, ResourceS, RoleD, RoleDecl, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, Template, TextP, TupleE, TupleP, UnaryE, ValD, ValDecl, ValS, Variant, VariantP, WildP, WithE}
 
 // The evaluator: a checked program, the inventory in it and one host's facts, into that host's
 // desired-state graph. Evaluation is pure: its only inputs are the program, the files `local` reads
@@ -30,8 +30,8 @@ readFacts(text: string) -> Result[Facts, string] = parseJson(text) match
 
 // Evaluates `files` for the host `hostName` of the inventory, with `facts`; `readLocal` reads a file
 // next to the program for `local(…)`.
-evaluate(files: List[SourceFile], hostName: string, facts: Facts, readLocal: (string) -> Option[string] = _ -> None) -> Evaluated
-  val e = Evaluator(files, readLocal)
+evaluate(files: List[SourceFile], hostName: string, facts: Facts, readLocal: (string) -> Option[string] = _ -> None, templates: List[Template] = []) -> Evaluated
+  val e = Evaluator(files, readLocal, templates)
   e.run(hostName, facts)
 
 private val maxLong: long = 9223372036854775807
@@ -41,7 +41,7 @@ private val minLong: long = -maxLong - 1
 // Evaluation stops past this many steps, so a pathological program ends with an error, not slowly.
 val stepBudget: int = 1000000
 
-class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[string])
+class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[string], val templates: List[Template])
   private val diagnostics = Buffer[Diagnostic]()
   private val builder = GraphBuilder()
   private val roles = Table[string, RoleDecl]()
@@ -503,9 +503,15 @@ class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[s
             error("E0318", s"`local` cannot read `$file`", a.value.extent, "unreadable")
             NoneV
       _ -> NoneV
-    NameE("render", rs) ->
-      error("E0319", "templates are not evaluated yet: `render` needs the template parser", rs, "render")
-      NoneV
+    NameE("render", rs) -> args match
+      Arg("", StrE([TextP(file)], _, _), _) :: rest ->
+        val wanted = templatePath(rs.file, file)
+        templates.find(t -> t.path == wanted) match
+          Some(t) -> StrV(interpolate(t.parts, bindArgs(t.params, rest, env)))
+          None ->
+            error("E0319", s"there is no template `$wanted`", rs, "render")
+            NoneV
+      _ -> NoneV
     FieldE(NameE("secret", _), fn, _) ->
       val what = args.map(a -> text(expr(a.value, env))).mkString(" ")
       SecretV(if fn == "literal" || fn == "concat" then fn else s"$fn $what")

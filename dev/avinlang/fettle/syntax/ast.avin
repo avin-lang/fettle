@@ -117,8 +117,44 @@ data Decl
 // `import a.b.{X, y}`.
 data Import(moduleName: string, names: List[(string, Span)], span: Span)
 
-// A source file: its module, its imports and its declarations.
-data SourceFile(path: string, moduleName: string, imports: List[Import], decls: List[Decl])
+// A source file: its module, its imports and its declarations; its comments and the numbers of its
+// blank lines, which only the formatter reads.
+data SourceFile(path: string, moduleName: string, imports: List[Import], decls: List[Decl], comments: List[Comment] = [], blankLines: List[int] = [])
+
+// A template file (`*.tmpl`): the parameters its `@params(…)` line declares, and its text with the
+// interpolations in it. Its module is the module of its directory.
+data Template(path: string, moduleName: string, params: List[Param], parts: List[StrPart], span: Span)
+
+impl TypeExpr
+  // Where the type is written.
+  extent -> Span = self match
+    NamedT(_, _, s) -> s
+    OptionalT(_, s) -> s
+
+impl Decl
+  // Where the declaration stands.
+  extent -> Span = self match
+    DataD(x) -> x.span
+    FnD(x) -> x.span
+    RoleD(x) -> x.span
+    ValD(x) -> x.span
+    ApplyD(x) -> x.span
+    GroupD(x) -> x.span
+    ConnectD(x) -> x.span
+
+impl Stmt
+  // Where the statement stands.
+  extent -> Span = self match
+    ResourceS(_, _, x) -> x
+    ValS(_, _, x) -> x
+    CallS(_, _, _, x) -> x
+    IfS(_, _, _, x) -> x
+    ForS(_, _, _, x) -> x
+    MatchS(_, _, x) -> x
+    AsS(_, _, x) -> x
+    OnS(_, _, x) -> x
+    AfterS(_, x) -> x
+    FieldS(_, _, x) -> x
 
 impl Expr
   // Where the expression stands.

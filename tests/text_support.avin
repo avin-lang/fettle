@@ -1,0 +1,44 @@
+module tests
+
+import dev.avinlang.fettle.project.{Project, checkProject, fromTexts}
+import dev.avinlang.fettle.syntax.{Diagnostic, parseSource}
+import dev.avinlang.fettle.fmt.{format}
+import dev.avinlang.fettle.eval.{evaluate}
+import dev.avinlang.fettle.graph.{showGraph}
+
+// Programs written as text, for the tests that go through the parser.
+
+// The lines `ls` as a file's text, each ended by a line end.
+src(ls: Vector[string]) -> string = ls.map(l -> s"$l\n").mkString("")
+
+// A diagnostic as `file:line:column code message`.
+shown(d: Diagnostic) -> string = s"${d.span.file}:${d.span.start.line}:${d.span.start.column} ${d.code} ${d.message}"
+
+// The project of `texts`, rooted where no file is, so every `local(…)` file is missing.
+projectOf(texts: List[(string, string)]) -> Project = fromTexts("tests/no-such-project", texts)
+
+// Every diagnostic of checking the project of `texts`, one a line.
+projectDiags(texts: List[(string, string)]) -> string = checkProject(projectOf(texts)).map(d -> shown(d)).mkString("\n")
+
+// Every diagnostic of checking the one file `main.fettle` holding `lines`.
+diagsOf(lines: Vector[string]) -> string = projectDiags([("main.fettle", src(lines))])
+
+// Only the errors of checking `main.fettle` holding `lines`.
+errorsIn(lines: Vector[string]) -> string = checkProject(projectOf([("main.fettle", src(lines))])).filter(d -> !d.warning).map(d -> shown(d)).mkString("\n")
+
+// The lexical and syntax errors of parsing `t.fettle` holding `text`.
+syntaxOf(text: string) -> string = parseSource("t.fettle", text).diagnostics.map(d -> shown(d)).mkString("\n")
+
+// The graph `main.fettle`, holding `lines` and an inventory with the host `web1` applying the role
+// `r`, evaluates to on Debian, or its diagnostics.
+graphText(lines: Vector[string]) -> string
+  val inventory = ["", "group web", "  host web1 at \"10.0.0.1\"", "", "apply web -> r()"]
+  val p = projectOf([("main.fettle", src(lines ++ inventory))])
+  val checked = checkProject(p).filter(d -> !d.warning)
+  if !checked.isEmpty then return checked.map(d -> shown(d)).mkString("\n")
+  val e = evaluate(p.files, "web1", facts("debian12"), x -> p.read(x), p.templates)
+  if !e.diagnostics.isEmpty then return e.diagnostics.map(d -> shown(d)).mkString("\n")
+  showGraph(e.graph)
+
+// `text` parsed and formatted.
+reformat(text: string) -> string = format(parseSource("t.fettle", text).file)

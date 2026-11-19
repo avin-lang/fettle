@@ -1,0 +1,88 @@
+module tests
+
+// Every refusal of the design's section 3.5, written as source text and checked through the parser,
+// each with its exact diagnostic.
+
+@test("an unknown name is refused with the nearest spelling")
+rejectUnknownName()
+  assertEq(errorsIn(["role r(site: string)", "  package sitr"]), "main.fettle:2:11 E0201 there is no value `sitr`")
+  assertEq(diagsOf(["role r()", "  pakage \"x\""]), "main.fettle:2:3 E0201 there is no resource kind `pakage`")
+
+@test("an unknown field of a record, a resource or a host is refused with the nearest spelling")
+rejectUnknownField()
+  assertEq(errorsIn(["data Site(domain: string, port: int = 443)", "", "role r(site: Site)", "  package \"p${site.prot}\""]), "main.fettle:4:15 E0202 `Site` has no field `prot`")
+  assertEq(errorsIn(["role r()", "  file \"/a\"", "    mdoe = 0o600"]), "main.fettle:3:5 E0202 `file` has no field `mdoe`")
+
+@test("a type mismatch is refused: the design's E0207 for a field, E0203 elsewhere")
+rejectTypeMismatch()
+  assertEq(errorsIn(["role r()", "  file \"/a\"", "    mode = \"0600\""]), "main.fettle:3:12 E0207 the field `mode` of `file` is a `mode`, but this is a `string`")
+  assertEq(errorsIn(["val a = 1 + \"x\""]), "main.fettle:1:9 E0203 `+` adds ints, durations or sizes, or joins strings or lists, not `int` and `string`")
+
+@test("a match that does not cover every variant is refused, naming those missing")
+rejectNonExhaustive()
+  assertEq(errorsIn(["role r()", "  val n = match host.distro", "    Debian(_) -> \"apt\"", "    Alpine(_) -> \"apk\"", "  package n"]), "main.fettle:2:11 E0204 this `match` does not cover `Ubuntu(_)`, `Fedora(_)`, `Rhel(_)`, `Arch`, `Macos(_)`, `Other(_)`")
+
+@test("an arm after every value is covered is refused as unreachable")
+rejectUnreachable()
+  assertEq(errorsIn(["role r()", "  val n = match host.distro", "    _ -> \"x\"", "    Debian(_) -> \"apt\"", "  package n"]), "main.fettle:4:5 E0205 this arm is never reached: the arms before it cover every value")
+
+@test("a record built without a field that has no default is refused")
+rejectMissingField()
+  assertEq(errorsIn(["data Site(domain: string, port: int = 443)", "", "val s = Site(port = 1)"]), "main.fettle:3:9 E0206 `Site` is missing `domain`")
+
+@test("a host of a group that sets none of a var without a default is refused at the host")
+rejectMissingVars()
+  assertEq(errorsIn(["data V(domain: string)", "", "group web: V", "  host web1 at \"10.0.0.1\""]), "main.fettle:4:3 E0208 host `web1` of group `web` sets no `domain`")
+
+@test("a secret in a command's argument list or in a string is refused")
+rejectSecretFlows()
+  assertEq(errorsIn(["role r(k: secret)", "  command \"c\"", "    run = cmd(\"login\", k)", "    always = true"]), "main.fettle:3:24 E0209 a secret cannot be in a command's argument list")
+  assertEq(errorsIn(["role r(k: secret)", "  package \"p${k}\""]), "main.fettle:2:15 E0210 a secret cannot be interpolated into a string")
+
+@test("a secret on a command's standard input is accepted")
+acceptSecretOnStdin()
+  assertEq(errorsIn(["role r(k: secret)", "  command \"c\"", "    run = cmd(\"login\").stdin(k)", "    always = true"]), "")
+
+@test("a local file that does not exist is refused")
+rejectMissingLocal()
+  assertEq(errorsIn(["val c = local(\"certs/none.crt\")"]), "main.fettle:1:15 E0211 `local` reads `certs/none.crt`, which does not exist")
+
+@test("staged outside validate is refused")
+rejectStaged()
+  assertEq(errorsIn(["role r()", "  file \"/a\"", "    content = \"${staged}\""]), "main.fettle:3:18 E0212 `staged` exists only inside a file's `validate`")
+
+@test("on naming something that is not a resource reference is refused")
+rejectOnNonResource()
+  assertEq(errorsIn(["role r(name: string)", "  service \"s\"", "    on name -> restart"]), "main.fettle:3:8 E0213 `on` names resources, and this is a `string`")
+
+@test("an action the target kind does not have is refused")
+rejectMissingAction()
+  assertEq(errorsIn(["role r()", "  val conf = file \"/a\"", "  file \"/b\"", "    on conf -> reload"]), "main.fettle:4:5 E0214 `file` has no action `reload`")
+
+@test("calls that form a cycle are refused, naming it")
+rejectCycle()
+  assertEq(errorsIn(["role a()", "  b()", "", "role b()", "  a()"]), "main.fettle:2:3 E0215 these calls form a cycle, and fettle programs do not recurse: a -> b -> a")
+
+@test("unused values and imports are warnings")
+warnUnused()
+  assertEq(diagsOf(["role r()", "  val x = 1", "  package \"p\""]), "main.fettle:2:7 W0216 `x` is never used")
+  assertEq(projectDiags([("roles/a.fettle", "module roles\n\ndata Site(domain: string)\n"), ("main.fettle", "import roles.{Site}\n\nval x = 1\n")]), "main.fettle:1:15 W0217 `Site` is imported and never used")
+
+@test("duplicate literal titles in one role are refused unless identical")
+rejectDuplicateTitles()
+  assertEq(errorsIn(["role r()", "  file \"/a\"", "    mode = 0o600", "  file \"/a\"", "    mode = 0o644"]), "main.fettle:4:3 E0218 `file /a` is declared twice in this role with different fields")
+  assertEq(errorsIn(["role r()", "  package \"git\"", "  package \"git\""]), "")
+
+@test("a template refuses an unknown field of its parameters, at the template's line, and a wrong argument type at the call")
+rejectTemplateMistakes()
+  val role = "module roles\n\ndata Site(domain: string, port: int = 443)\n\nrole web(site: Site)\n  file \"/a\"\n    content = render(\"t.tmpl\", site = site)\n"
+  assertEq(projectDiags([("roles/web.fettle", role), ("roles/t.tmpl", "@params(site: Site)\nlisten ${site.prot};\n")]), "roles/t.tmpl:2:10 E0202 `Site` has no field `prot`")
+  val wrong = "module roles\n\nrole web(d: string)\n  file \"/a\"\n    content = render(\"t.tmpl\", site = d)\n"
+  assertEq(projectDiags([("roles/web.fettle", wrong), ("roles/t.tmpl", "@params(site: int)\n${site}\n")]), "roles/web.fettle:5:39 E0203 `t.tmpl`'s `site` is a `int`, but this is a `string`")
+  assertEq(projectDiags([("roles/web.fettle", "module roles\n\nval a = render(\"none.tmpl\")\n")]), "roles/web.fettle:3:16 E0243 there is no template `roles/none.tmpl`")
+
+@test("a file's module line must name its directory's module")
+rejectWrongModule()
+  assertEq(projectDiags([("roles/a.fettle", "module other\n\nval x = 1\n")]), "roles/a.fettle:1:1 E0151 this file is in `roles/`, so its module is `roles`, not `other`")
+  assertEq(projectDiags([("a.fettle", "module roles\n\nval x = 1\n")]), "a.fettle:1:1 E0151 this file is in the project's root, so its module is the root module, not `roles`")
+  assertEq(projectDiags([("roles/a.fettle", "val x = 1\n"), ("main.fettle", "import roles.{x}\n\nval y = x\n")]), "")

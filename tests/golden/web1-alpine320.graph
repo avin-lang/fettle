@@ -1,0 +1,52 @@
+1. group "admins"
+2. user "ana"
+     groups = ["admins"]
+     shell = /bin/bash
+     authorizedKeys = ["ssh-ed25519 AAAAC3Nz…Qk ana@laptop"]
+3. user "bo"
+     groups = []
+     shell = /bin/bash
+     authorizedKeys = ["ssh-ed25519 AAAAC3Nz…7f bo@desk", "ssh-ed25519 AAAAC3Nz…a1 bo@phone"]
+4. user "carl"
+     present = false
+5. file "/etc/sudoers.d/admins"
+     content = "%admins ALL=(ALL) NOPASSWD: ALL\n"
+     mode = 0o440
+     validate = cmd("visudo", "-cf", ${staged})
+6. package "chrony"
+7. file "/etc/chrony/chrony.conf"
+     content = "server 0.pool.ntp.org iburst\nserver 1.pool.ntp.org iburst\n"
+8. service "chronyd"
+     running = true
+     enabled = true
+9. package "nginx"
+10. directory "/etc/nginx/tls"
+     mode = 0o750
+11. file "/etc/nginx/tls/a.example.com.crt"
+     content = "-----BEGIN CERTIFICATE-----\na.example.com\n-----END CERTIFICATE-----\n"
+     mode = 0o644
+12. file "/etc/nginx/tls/a.example.com.key"
+     content = (secret)
+     mode = 0o600
+13. file "/etc/nginx/conf.d/a.example.com.conf"
+     content = "server {\n  listen 443 ssl;\n  server_name a.example.com;\n  root /srv/www;\n  ssl_certificate /etc/nginx/tls/a.example.com.crt;\n  ssl_certificate_key /etc/nginx/tls/a.example.com.key;\n}\n"
+14. directory "/srv/www"
+     owner = "www-data"
+15. service "nginx"
+     running = true
+     enabled = true
+edges:
+  file /etc/chrony/chrony.conf -> service chronyd: it triggers `restart`
+  directory /etc/nginx/tls -> file /etc/nginx/tls/a.example.com.crt: its field `title` refers to it
+  directory /etc/nginx/tls -> file /etc/nginx/tls/a.example.com.key: its field `title` refers to it
+  file /etc/nginx/tls/a.example.com.crt -> file /etc/nginx/conf.d/a.example.com.conf: its field `content` refers to it
+  file /etc/nginx/tls/a.example.com.key -> file /etc/nginx/conf.d/a.example.com.conf: its field `content` refers to it
+  file /etc/nginx/conf.d/a.example.com.conf -> service nginx: it triggers `reload`
+  file /etc/nginx/tls/a.example.com.crt -> service nginx: it triggers `reload`
+  file /etc/nginx/tls/a.example.com.key -> service nginx: it triggers `reload`
+  group admins -> user ana: the user is in that group
+  directory /etc/nginx/tls -> file /etc/nginx/tls/a.example.com.crt: it is in that directory
+  directory /etc/nginx/tls -> file /etc/nginx/tls/a.example.com.key: it is in that directory
+triggers:
+  file /etc/chrony/chrony.conf -> service chronyd restart
+  file /etc/nginx/conf.d/a.example.com.conf, file /etc/nginx/tls/a.example.com.crt, file /etc/nginx/tls/a.example.com.key -> service nginx reload

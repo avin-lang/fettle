@@ -1,0 +1,22 @@
+// roles/people.fettle
+module roles
+
+data Person(name: string, keys: List[string], admin: bool = false)
+
+role people(members: List[Person], departed: List[string])
+  group "admins"
+
+  for p in members
+    user p.name
+      shell = "/bin/bash"
+      groups = if p.admin then ["admins"] else []
+      authorizedKeys = p.keys
+
+  for name in departed
+    user name
+      present = false
+
+  file "/etc/sudoers.d/admins"
+    content = "%admins ALL=(ALL) NOPASSWD: ALL\n"
+    mode = 0o440
+    validate = cmd("visudo", "-cf", staged)

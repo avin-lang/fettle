@@ -1,0 +1,113 @@
+module dev.avinlang.fettle.project
+
+import avin.fs
+import dev.avinlang.fettle.syntax.{AsS, BindP, CallE, CallS, Decl, Diagnostic, ForS, IfS, MatchS, NameE, Parsed, Pos, ResourceDecl, ResourceS, RoleD, RoleDecl, SourceFile, Span, Stmt, StmtArm, Template, ValS, parseSource, parseTemplate}
+import dev.avinlang.fettle.check.{check}
+
+// A project: a directory of `.fettle` files and `.tmpl` templates, its subdirectories its modules.
+
+// A project as read: every file parsed, every template, the text of each by its path relative to the
+// root (to render diagnostics), and the lexical and syntax errors found.
+data Project(root: string, files: List[SourceFile], templates: List[Template], texts: List[(string, string)], diagnostics: Vector[Diagnostic])
+
+impl Project
+  // The text of the file at `path`, relative to the root.
+  textOf(path: string) -> string = texts.find((p, _) -> p == path).map((_, t) -> t).getOrElse("")
+
+  // Whether a file at `path`, relative to the root, exists.
+  has(path: string) -> bool = fs.isFile(under(root, path))
+
+  // Reads the file at `path`, relative to the root.
+  read(path: string) -> Option[string] = fs.readText(under(root, path)).ok
+
+// `rel` under `root`.
+under(root: string, rel: string) -> string = if root == "." || root.isEmpty then rel else s"$root/$rel"
+
+// The module of the directory `dir`, relative to the root: its path with `.` for `/`.
+moduleOfDir(dir: string) -> string = dir.replace("/", ".")
+
+// Every file below `root` whose name ends with `suffix`, relative to it, in name order.
+filesUnder(root: string, dir: string, suffix: string) -> List[string]
+  val out = Buffer[string]()
+  val names: Vector[string] = fs.listDir(under(root, dir)) match
+    Ok(es) -> es.sorted
+    Err(_) -> []
+  for n in names
+    if n.startsWith(".") then continue
+    val rel = if dir.isEmpty then n else s"$dir/$n"
+    if fs.isDir(under(root, rel))
+      out ++= filesUnder(root, rel, suffix)
+    else if n.endsWith(suffix)
+      out += rel
+  out.toList
+
+private dirOf(rel: string) -> string
+  val slash = rel.lastIndexOf("/")
+  if slash < 0 then "" else rel.slice(0, slash)
+
+// Reads and parses the project at `root`. A file's module is its directory's; a `module` line naming
+// another is an error.
+load(root: string) -> Result[Project, string]
+  if !fs.isDir(root) then return Err(s"`$root` is not a directory")
+  val texts = Buffer[(string, string)]()
+  for rel in filesUnder(root, "", ".fettle") ++ filesUnder(root, "", ".tmpl")
+    fs.readText(under(root, rel)) match
+      Ok(t) -> texts += (rel, t)
+      Err(e) -> return Err(s"$e")
+  Ok(fromTexts(root, texts.toList))
+
+// The project at `root` whose files, by their paths relative to it, hold `texts`: `.fettle` files
+// and `.tmpl` templates.
+fromTexts(root: string, texts: List[(string, string)]) -> Project
+  val diagnostics = Buffer[Diagnostic]()
+  val files = Buffer[SourceFile]()
+  for (rel, text) in texts
+    if !rel.endsWith(".fettle") then continue
+    val p = parseSource(rel, text)
+    diagnostics ++= p.diagnostics
+    val m = moduleOfDir(dirOf(rel))
+    val f = p.file
+    if !f.moduleName.isEmpty && f.moduleName != m
+      val first = Span(rel, Pos(0, 1, 1), Pos(0, 1, 1))
+      diagnostics += Diagnostic("E0151", s"this file is in ${if m.isEmpty then "the project's root" else s"`${dirOf(rel)}/`"}, so its module is ${if m.isEmpty then "the root module" else s"`$m`"}, not `${f.moduleName}`", first, "module line", [], if m.isEmpty then "remove the `module` line" else s"write `module $m`")
+    files += SourceFile(f.path, m, f.imports, f.decls, f.comments, f.blankLines)
+  val templates = Buffer[Template]()
+  for (rel, text) in texts
+    if !rel.endsWith(".tmpl") then continue
+    val p = parseTemplate(rel, moduleOfDir(dirOf(rel)), text)
+    diagnostics ++= p.diagnostics
+    templates += p.template
+  Project(root, resolveRoleCalls(files.toList), templates.toList, texts, diagnostics.toVector)
+
+// Checks a loaded project: its lexical and syntax errors, then the checker's diagnostics.
+checkProject(p: Project) -> Vector[Diagnostic]
+  val out = Buffer[Diagnostic]()
+  out ++= p.diagnostics
+  out ++= check(p.files, f -> p.has(f), p.templates)
+  out.toVector
+
+// `val x = r(…)` in a block, where `r` is a role of the project, binds the group of resources the call
+// declares: a role call, which the parser cannot tell from a function's.
+resolveRoleCalls(files: List[SourceFile]) -> List[SourceFile]
+  val roles = Buffer[string]()
+  for f in files
+    for d in f.decls
+      d match
+        RoleD(r) -> roles += r.name
+        _ -> ()
+  val names = roles.toVector
+  files.map(f -> SourceFile(f.path, f.moduleName, f.imports, f.decls.map(d -> d match
+    RoleD(r) -> RoleD(RoleDecl(r.name, r.params, stmts(r.body, names), r.isPrivate, r.span))
+    other -> other), f.comments, f.blankLines))
+
+private stmts(body: List[Stmt], roles: Vector[string]) -> List[Stmt] = body.map(s -> resolved(s, roles))
+
+private resolved(s: Stmt, roles: Vector[string]) -> Stmt = s match
+  ValS(BindP(n, _), CallE(NameE(r, rs), args, cs), sp) ->
+    if roles.contains(r) then CallS(CallE(NameE(r, rs), args, cs), [], n, sp) else s
+  ResourceS(d, n, sp) -> ResourceS(ResourceDecl(d.kind, d.title, stmts(d.body, roles), d.span), n, sp)
+  IfS(c, t, e, sp) -> IfS(c, stmts(t, roles), stmts(e, roles), sp)
+  ForS(p, over, body, sp) -> ForS(p, over, stmts(body, roles), sp)
+  MatchS(x, arms, sp) -> MatchS(x, arms.map(a -> StmtArm(a.pattern, stmts(a.body, roles), a.span)), sp)
+  AsS(u, body, sp) -> AsS(u, stmts(body, roles), sp)
+  other -> other

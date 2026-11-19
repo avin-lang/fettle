@@ -1,0 +1,80 @@
+module tests
+
+import avin.fs
+import dev.avinlang.fettle.project.{Project, checkProject, filesUnder, load, under}
+import dev.avinlang.fettle.syntax.{parseSource}
+import dev.avinlang.fettle.fmt.{format}
+import dev.avinlang.fettle.eval.{evaluate}
+import dev.avinlang.fettle.graph.{showGraph}
+import dev.avinlang.fettle.cli.{main as cliMain}
+
+// The design's examples 2.1, 2.2, 2.3 and 2.5, as one project in `tests/examples/site`: they check
+// clean, format to themselves, and evaluate to the golden graphs in `tests/golden` against the
+// Debian and Alpine fact fixtures.
+
+val site: string = "tests/examples/site"
+
+loadSite() -> Project = load(site).getOrElse(Project("", [], [], [], []))
+
+@test("the examples check with no error and no warning")
+examplesCheckClean()
+  val p = loadSite()
+  assertEq(p.files.map(f -> f.path).mkString(" "), "inventory.fettle roles/people.fettle roles/time.fettle roles/web.fettle team.fettle")
+  assertEq(p.templates.map(t -> t.path).mkString(" "), "roles/site.conf.tmpl")
+  assertEq(checkProject(p).map(d -> shown(d)).mkString("\n"), "")
+
+@test("formatting any example changes nothing, and formatting is idempotent")
+examplesFormatToThemselves()
+  for rel in filesUnder(site, "", ".fettle")
+    val text = fs.readText(under(site, rel)).getOrElse("")
+    val once = format(parseSource(rel, text).file)
+    assertEq(once, text)
+    assertEq(format(parseSource(rel, once).file), once)
+
+// The graph of `host` against the fixture `fixture`, or its diagnostics.
+graphOf(host: string, fixture: string) -> string
+  val p = loadSite()
+  val e = evaluate(p.files, host, facts(fixture), x -> p.read(x), p.templates)
+  if !e.diagnostics.isEmpty then return e.diagnostics.map(d -> shown(d)).mkString("\n")
+  showGraph(e.graph)
+
+golden(host: string, fixture: string) -> string = fs.readText(s"tests/golden/$host-$fixture.graph").getOrElse("(missing golden file)")
+
+@test("web1 and web2 evaluate to their golden graphs on Debian")
+webOnDebian()
+  for h in ["web1", "web2"]
+    assertEq(graphOf(h, "debian12"), golden(h, "debian12"))
+
+@test("web1 and web2 evaluate to their golden graphs on Alpine, where chrony's service is chronyd")
+webOnAlpine()
+  for h in ["web1", "web2"]
+    assertEq(graphOf(h, "alpine320"), golden(h, "alpine320"))
+  assert(golden("web1", "alpine320").contains("service \"chronyd\""))
+  assert(golden("web1", "debian12").contains("service \"chrony\""))
+
+@test("db1 is in no web group, so it gets people and timeSync only")
+database()
+  for fx in ["debian12", "alpine320"]
+    assertEq(graphOf("db1", fx), golden("db1", fx))
+  assert(!golden("db1", "debian12").contains("nginx"))
+
+@test("the CLI's commands answer their exit status: 0 done, 1 a mistake found, 2 a usage error")
+cliCommands()
+  assertEq(cliMain(["check", site]), 0)
+  assertEq(cliMain(["check", "tests/no-such-dir"]), 1)
+  assertEq(cliMain(["fmt", "--check", s"$site/team.fettle", s"$site/roles/web.fettle"]), 0)
+  assertEq(cliMain(["fmt", "--check", "tests/no-such-file.fettle"]), 1)
+  assertEq(cliMain(["graph", "--facts", "tests/fixtures/debian12.json", "--host", "db1", site]), 0)
+  assertEq(cliMain(["graph", "--facts", "tests/fixtures/debian12.json", "--host", "nohost", site]), 1)
+  assertEq(cliMain(["graph", "--facts", "tests/fixtures/none.json", "--host", "db1", site]), 1)
+  assertEq(cliMain(["graph", "--host", "web1", site]), 2)
+  assertEq(cliMain(["frob"]), 2)
+  assertEq(cliMain([]), 2)
+
+@test("the template renders each host's site, and the key file's content stays a secret")
+templateRendered()
+  val g = golden("web2", "debian12")
+  assert(g.contains("server_name b.example.com;"))
+  assert(g.contains("listen 443 ssl;"))
+  assert(g.contains("content = (secret)"))
+  assert(g.contains("b.example.com\\n-----END CERTIFICATE-----"))

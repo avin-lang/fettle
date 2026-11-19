@@ -1,0 +1,29 @@
+// roles/web.fettle
+module roles
+
+data Site(domain: string, root: path = "/srv/www", port: int = 443)
+
+role webServer(site: Site, certificate: string, key: secret)
+  package "nginx"
+
+  val tls = directory "/etc/nginx/tls"
+    mode = 0o750
+
+  val crt = file "${tls.path}/${site.domain}.crt"
+    content = certificate
+    mode = 0o644
+
+  val k = file "${tls.path}/${site.domain}.key"
+    content = key
+    mode = 0o600
+
+  val conf = file "/etc/nginx/conf.d/${site.domain}.conf"
+    content = render("site.conf.tmpl", site = site, crt = crt.path, key = k.path)
+
+  directory site.root
+    owner = "www-data"
+
+  service "nginx"
+    running = true
+    enabled = true
+    on conf, crt, k -> reload

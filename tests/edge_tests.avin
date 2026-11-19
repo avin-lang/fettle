@@ -1,0 +1,37 @@
+module tests
+
+// The edge cases of phase 1a, through the parser: indentation, interpolation, duplicates, ordering
+// ties, triggers on what is not declared, and where a secret may flow.
+
+@test("indentation mistakes are each reported at their line, and the rest still checks")
+edgeIndentation()
+  assertEq(errorsIn(["role r()", "   package \"a\"", "  package \"b\""]), "main.fettle:2:1 E0102 this line is indented 3 spaces past the line above, and a block is indented 2\nmain.fettle:3:1 E0103 this line's indentation, 2 spaces, lines up with no enclosing block")
+  assertEq(errorsIn(["role r()", "\tpackage \"a\""]), "main.fettle:2:1 E0101 indentation uses a tab")
+
+@test("interpolation: a lone dollar is text, an escaped one too, nested strings and any scalar")
+edgeInterpolation()
+  assertEq(graphText(["role r()", "  file \"/a\"", "    content = \"$5 \\${x} ${\"in${1 + 2}\"} ${0o640} ${30s}\""]), "1. file \"/a\"\n     content = \"$5 ${x} in3 0o640 30s\"\n")
+  assertEq(errorsIn(["role r(xs: List[string])", "  package \"${xs}\""]), "main.fettle:2:14 E0203 a `List[string]` cannot be interpolated into a string")
+  assertEq(syntaxOf("val a = \"${}\"\n"), "t.fettle:1:10 E0114 `${}` holds no expression")
+
+@test("identical duplicates from two roles merge; differing ones conflict, showing both")
+edgeDuplicates()
+  val same = ["role a()", "  package \"git\"", "", "role b()", "  package \"git\"", "", "role r()", "  a()", "  b()"]
+  assertEq(graphText(same), "1. package \"git\"\n")
+  val differ = ["role a()", "  file \"/x\"", "    mode = 0o600", "", "role b()", "  file \"/x\"", "    mode = 0o644", "", "role r()", "  a()", "  b()"]
+  assertEq(graphText(differ), "main.fettle:6:3 E0401 `file /x` is declared twice with different fields")
+
+@test("resources with no order between them keep declaration order")
+edgeOrderingTies()
+  assertEq(graphText(["role r()", "  package \"c\"", "  package \"a\"", "  package \"b\""]), "1. package \"c\"\n2. package \"a\"\n3. package \"b\"\n")
+  val after = ["role r()", "  val c = package \"c\"", "  package \"a\"", "    after b", "  val b = package \"b\""]
+  assertEq(errorsIn(after), "main.fettle:4:11 E0201 there is no value `b`")
+
+@test("a trigger on a resource that is not declared is an unknown name at check")
+triggerOnUndeclared()
+  assertEq(errorsIn(["role r()", "  service \"s\"", "    on conf -> restart"]), "main.fettle:3:8 E0201 there is no value `conf`")
+
+@test("a secret reaches a command only on standard input")
+secretIntoCommand()
+  assertEq(errorsIn(["role r(k: secret)", "  command \"c\"", "    run = sh\"login ${k}\"", "    always = true"]), "main.fettle:3:22 E0209 a secret cannot be in a command's argument list")
+  assertEq(errorsIn(["role r(k: secret)", "  command \"c\"", "    run = sh\"login\".stdin(secret.concat(\"pw=\", k))", "    always = true"]), "")

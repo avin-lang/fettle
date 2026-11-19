@@ -3,7 +3,7 @@ module dev.avinlang.fettle.check
 import avin.collections.mutable.{Map as Table}
 import dev.avinlang.fettle.kinds.{KindSpec, builtinKinds, kindNamed}
 import dev.avinlang.fettle.fmt.{showExpr}
-import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, FnDecl, GroupDecl, HostDecl, RoleDecl, ValDecl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldS, FnD, ForE, ForS, GroupD, IfE, IfS, Import, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NamedT, NoneE, OnS, OptionalT, Param, Pattern, ResourceDecl, ResourceS, RoleD, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, TextP, TupleE, TupleP, TypeExpr, UnaryE, ValD, ValS, Variant, VariantP, WildP, WithE}
+import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, FnDecl, GroupDecl, HostDecl, RoleDecl, ValDecl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldS, FnD, ForE, ForS, GroupD, IfE, IfS, Import, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NamedT, NoneE, OnS, OptionalT, Param, Pattern, ResourceDecl, ResourceS, RoleD, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, Template, TextP, TupleE, TupleP, TypeExpr, UnaryE, ValD, ValS, Variant, VariantP, WildP, WithE}
 
 // The checker: every file of a project checked together, every mistake reported with its span, and
 // checking carried on past each.
@@ -15,12 +15,21 @@ import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, Bind
 // ranges over a collection, that a secret reaches no string and no command's arguments, and the
 // rest of what section 3.5 of the design refuses.
 
-// Checks `files`, answering every diagnostic in the order found. `exists` says whether a file next
-// to the program exists, for `local(…)`.
-check(files: List[SourceFile], exists: (string) -> bool = _ -> true) -> Vector[Diagnostic]
-  val c = Checker(files, exists)
+// Checks `files` and `templates`, answering every diagnostic in the order found. `exists` says
+// whether a file next to the program exists, for `local(…)`.
+check(files: List[SourceFile], exists: (string) -> bool = _ -> true, templates: List[Template] = []) -> Vector[Diagnostic]
+  val c = Checker(files, exists, templates)
   c.run()
   c.diagnostics.toVector
+
+// A template as a message names it: its file name.
+templateLabel(path: string) -> string = path.slice(path.lastIndexOf("/") + 1, path.byteLength)
+
+// The template `render(name, …)` names from the file `from`: `name` is read relative to the file's
+// directory.
+templatePath(from: string, name: string) -> string
+  val slash = from.lastIndexOf("/")
+  if slash < 0 then name else s"${from.slice(0, slash)}/$name"
 
 // A name bound in a scope: a parameter, a `val`, a pattern's binding. `used` is set when it is read.
 class Local(val name: string, val ty: Ty, val span: Span, val warnUnused: bool)
@@ -39,16 +48,23 @@ class Module(val name: string)
 // What a statement may hold where it stands.
 data Where(role: string, inKind: string)
 
-class Checker(val files: List[SourceFile], val exists: (string) -> bool)
+class Checker(val files: List[SourceFile], val exists: (string) -> bool, val templates: List[Template])
   val diagnostics = Buffer[Diagnostic]()
+  // The path of the file being checked, for `render`.
+  private var currentFile = ""
   private val modules = Table[string, Module]()
   // Every variant name, with the type it belongs to.
   private val variantOf = Table[string, (string, Variant)]()
   private val allData = Table[string, DataDecl]()
   // The module the file being checked is in, and the names it imports, each to its module.
   private var current = Module("")
-  private val imported = Table[string, string]()
-  private val importUses = Table[string, (Span, bool)]()
+  private var imported = Table[string, string]()
+  private var importUses = Table[string, (Span, bool)]()
+  // Each file's module, imports and their uses, by its path, so a declaration of one file is checked
+  // where it is written when another file reaches it; a path given to two files has none.
+  private val scopes = Table[string, (Module, Table[string, string], Table[string, (Span, bool)])]()
+  private val ambiguous = Buffer[string]()
+  private val byFile = Buffer[(Table[string, string], Table[string, (Span, bool)])]()
   // Top-level vals' types once worked out, and those being worked out.
   private val valTypes = Table[string, Ty]()
   private val computing = Buffer[string]()
@@ -79,14 +95,56 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool)
         declare(m, d)
     for f in files
       current = modules(f.moduleName)
-      imported.clear()
-      importUses.clear()
+      currentFile = f.path
+      imported = Table[string, string]()
+      importUses = Table[string, (Span, bool)]()
       resolveImports(f)
+      if scopes.contains(f.path) then ambiguous += f.path
+      scopes(f.path) = (current, imported, importUses)
+      byFile += (imported, importUses)
+    for (f, i) in files.zipWithIndex
+      enter(f, i)
       for d in f.decls
         checkDecl(d)
+    // A template sees the declarations of its own module and its parameters.
+    for t in templates
+      current = modules.getOrElseUpdate(t.moduleName, Module(t.moduleName))
+      currentFile = t.path
+      imported = Table[string, string]()
+      importUses = Table[string, (Span, bool)]()
+      checkParams(t.params)
+      interpolations(t.parts, bindParams(t.params))
+    checkCycles()
+    for (f, i) in files.zipWithIndex
+      enter(f, i)
       for (n, (s, used)) in importUses
         if !used then warn("W0217", s"`$n` is imported and never used", s, "unused import", "remove it")
-    checkCycles()
+
+  // Makes the `i`th file, `f`, the one being checked.
+  private enter(f: SourceFile, i: int)
+    current = modules(f.moduleName)
+    currentFile = f.path
+    val (imports, uses) = byFile(i)
+    imported = imports
+    importUses = uses
+
+  // `f` run in the scope of the file at `path`: its module and its imports.
+  private inScopeOf[T](path: string, f: () -> T) -> T
+    if path == currentFile || ambiguous.contains(path) then return f()
+    scopes.get(path) match
+      None -> f()
+      Some((m, i, u)) ->
+        val (savedModule, savedFile, savedImports, savedUses) = (current, currentFile, imported, importUses)
+        current = m
+        currentFile = path
+        imported = i
+        importUses = u
+        val r = f()
+        current = savedModule
+        currentFile = savedFile
+        imported = savedImports
+        importUses = savedUses
+        r
 
   private registerData(d: DataDecl)
     allData(d.name) = d
@@ -198,7 +256,8 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool)
           builtinKinds.find(k -> refName(k.name) == n) match
             Some(k) -> return RefTy(k.name)
             None -> ()
-          findData(n) match
+          // A type is resolved where it is written, whichever file is being checked.
+          inScopeOf(s.file, () -> findData(n)) match
             Some(d) -> DataTy(d.name)
             None ->
               error("E0201", s"there is no type `$n`", s, "unknown type", didYouMean(n, ["string", "int", "bool", "path", "mode", "duration", "size", "secret", "List", "Map", "Set"] ++ allData.keysIterator().toVector))
@@ -266,7 +325,7 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool)
     decl match
       Some(v) ->
         computing += name
-        val t = expr(v.value, [], None)
+        val t = inScopeOf(v.span.file, () -> expr(v.value, [], None))
         computing.remove(computing.length - 1)
         valTypes(name) = t
         t
@@ -626,7 +685,8 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool)
       else
         StrTy
     ShE(parts, _) ->
-      interpolations(parts, env)
+      // Each interpolation of shell text is a word of the command's arguments.
+      interpolations(parts, env, true)
       CommandTy
     NameE(n, s) -> name(n, s, env)
     FieldE(target, field, s) -> fieldOf(target, field, s, env)
@@ -726,12 +786,14 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool)
     _ -> None
 
   // Checks a string's interpolations: each may be text-like, never a secret.
-  private interpolations(parts: List[StrPart], env: List[Local])
+  private interpolations(parts: List[StrPart], env: List[Local], inCommand: bool = false)
     for p in parts
       p match
         ExprP(x) ->
           val t = expr(x, env, None)
-          if holdsSecret(t)
+          if holdsSecret(t) && inCommand
+            error("E0209", "a secret cannot be in a command's argument list", x.extent, "a secret", "pass it on standard input: `sh\"…\".stdin(secret)`")
+          else if holdsSecret(t)
             error("E0210", "a secret cannot be interpolated into a string", x.extent, "a secret", "pass it as a field that takes a secret, or on a command's standard input with `.stdin(…)`; `secret.concat` joins text to a secret")
           else if !(t == StrTy || t == IntTy || t == PathTy || t == BoolTy || t == ModeTy || t == DurationTy || t == SizeTy || t == ErrTy || t == NothingTy || t == RefTy("") || t.isData)
             error("E0203", s"a `${t.shown}` cannot be interpolated into a string", x.extent, s"a ${t.shown}")
@@ -871,11 +933,25 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool)
         _ -> for a in args
           mismatch(expr(a.value, env, Some(StrTy)), StrTy, a.value, "`local`'s file")
       StrTy
-    NameE("render", _) ->
-      for a in args
-        val t = expr(a.value, env, None)
-        if holdsSecret(t)
-          error("E0210", "a secret cannot be rendered into a template's text", a.value.extent, "a secret")
+    NameE("render", rs) ->
+      // A template's parameters are typed; a secret given for one is refused where the template
+      // interpolates it, and a secret given for a `string` is a mismatch here.
+      val found: Option[(Template, List[Arg])] = args match
+        Arg("", StrE([TextP(file)], _, fs), _) :: rest ->
+          val wanted = templatePath(currentFile, file)
+          val t = templates.find(x -> x.path == wanted)
+          if t.isEmpty
+            error("E0243", s"there is no template `$wanted`", fs, "no such template", "a template is read relative to the file that renders it")
+          t.map(x -> (x, rest))
+        _ ->
+          error("E0243", "`render` takes a template's file name, written as a string, then its arguments", rs, "render")
+          None
+      found match
+        Some((t, rest)) -> checkArgs(templateLabel(t.path), t.params, rest, env, s)
+        None ->
+          for a in args
+            if holdsSecret(expr(a.value, env, None))
+              error("E0210", "a secret cannot be rendered into a template's text", a.value.extent, "a secret")
       StrTy
     FieldE(NameE("secret", _), fn, fs) ->
       fn match

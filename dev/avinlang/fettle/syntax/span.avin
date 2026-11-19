@@ -15,6 +15,10 @@ impl Span
   // `file:line:column` of its start.
   place -> string = s"$file:${start.line}:${start.column}"
 
+// A `//` comment, its text from the slashes to the line end. `ownLine` is whether nothing but white
+// space stands before it on its line.
+data Comment(text: string, span: Span, ownLine: bool)
+
 // A diagnostic: what is wrong, where, and what may help. `code` names the kind of mistake (`E0207`),
 // `label` is the short text under the primary span, `notes` are further facts and `help` a suggested
 // change. A warning does not stop `fettle check` from succeeding.

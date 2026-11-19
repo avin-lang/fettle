@@ -890,5 +890,51 @@ user.
 12. **A trigger's target is ordered after its sources**, as the trigger edge itself; `on` names
     references only, and a name that is not bound is an unknown name, so a trigger on an undeclared
     resource is refused at `fettle check`. Review with the user.
-13. **Diagnostic codes**: `E01xx` lexical, `E02xx` checker (`W02xx` warnings), `E03xx` evaluation,
-    `E04xx` the graph. Review with the user.
+13. **Diagnostic codes**: `E01xx` lexical and syntax (`E0150` a syntax error, `E0151` a `module`
+    line naming another directory's module), `E02xx` checker (`W02xx` warnings), `E03xx`
+    evaluation, `E04xx` the graph. Review with the user.
+14. **The parser reads tokens by predicate** (avin-lang/parsing's `token(what, p)` and `tokenMatch`),
+    not by `==` (decided 2026-11-19). A `Span` keeps its real equality: the graph's duplicate check,
+    the diagnostics and the tests compare spans, and an equality under which all spans are equal
+    would make two declarations at different places look like one. Review with the user.
+15. **A file's module is its directory's**: the directory's path relative to the project with `.`
+    for `/`, the root's being the root module. A file may omit its `module` line; one naming another
+    module is an error (`E0151`). Review with the user.
+16. **`val g = r(…)` where `r` is a role binds the role's group** (a role call); with a function it
+    binds a value. The parser cannot tell the two apart, so the project resolves it once every file
+    is parsed. Review with the user.
+17. **Templates** are `*.tmpl` files. The first line is `@params(name: Type, …)`; the rest is text in
+    which `${expr}` is an interpolation, `$${` writes `${`, and nothing else is an escape, so a
+    configuration file's backslashes stay as written. A template's module is its directory's.
+    `render("name.tmpl", arg = …)` reads the template relative to the file that renders it, checks
+    its arguments against the parameters as a call's, and checks the template's interpolations
+    against its parameters, so `site.prot` is an error at the template's line. Review with the user.
+18. **A trailing comma** is allowed before the closing bracket of a list, a map, a call's arguments,
+    a parameter list, a `with` and an import's names. Review with the user.
+19. **`;` separates the arms of a one-line `match e { p -> x; q -> y }`**, the form the formatter
+    writes for a `match` inside another expression; a `match` standing as a value is written with
+    its arms on the lines under it. Review with the user.
+20. **The formatter's layout**: two spaces a level and lines of at most 100 characters. A longer line
+    breaks at its outermost call, list or map, one item a line; list and map items each end with a
+    comma, call arguments are separated by them, and the closing bracket stands on its own line, as
+    examples 2.2 and 2.5 write them. One blank line stands between top-level declarations, except
+    that a one-line declaration directly under one of its sort (`apply` under `apply`, `val` under
+    `val`) stays with it; inside a block, one blank line stands where the source had any. Comments
+    are kept, on their own lines at the level of what follows, or at the end of the line they ended.
+    A group's settings and hosts keep their order. `else` holding only an `if` is written
+    `else if`; `(x) -> e` is written `x -> e`; ranges are spaced like the other operators
+    (`1 ..< 4`). Review with the user.
+21. **A line indented between a block's indentation and the one outside it** is an error (`E0103`)
+    and stays in the block it is misaligned in, so its statements are still checked there.
+    Review with the user.
+22. **A secret interpolated into `sh"…"`** is refused as a secret in a command's argument list
+    (`E0209`), since each interpolation of shell text is one word of the arguments. Review with the
+    user.
+23. **A resource's kind may be the word `group`** (`group "admins"` in a role), which is also the
+    inventory's declaration; at the top level `group` declares an inventory group, in a block it is
+    the kind. Review with the user.
+24. **Example 2.2's `team.fettle` imports `Person`** (`import roles.{Person}`), since `Person` is
+    declared in the module `roles`; the examples as the tests hold them (`tests/examples/site`) add
+    that line and are otherwise as written here. Review with the user.
+25. **Phase 1's parser reads no `kind` and no `test` declaration**; the kinds of 2.4 and 2.6 come
+    with custom kinds, and a `kind` line is a syntax error until then. Review with the user.

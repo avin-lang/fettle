@@ -1,0 +1,455 @@
+module dev.avinlang.fettle.syntax
+
+import dev.avinlang.parsing.{Error, Failure, ParseError, Position, Rule, Success, TokenParsers, Tokens, guard, not, opt, recover, rep, rep1, rep1sep, repsep, chainl1}
+
+// The parser: a file's tokens into its syntax tree, every syntax error reported and parsing carried
+// on at the next line that can begin a statement or a declaration. It is a grammar of
+// avin-lang/parsing over the lexer's tokens.
+
+// What parsing a file gave: its tree, with the declarations that could be read, and every lexical and
+// syntax error in it.
+data Parsed(file: SourceFile, diagnostics: Vector[Diagnostic])
+
+// Parses `text`, the contents of `file`. The tree's module is the one the file's `module` line names,
+// or empty when it has none.
+parseSource(file: string, text: string) -> Parsed
+  val lexed = lex(file, text)
+  val out = Buffer[Diagnostic]()
+  out ++= lexed.diagnostics
+  holeErrors(file, lexed.tokens.toList, out)
+  val tree = Grammar.parse(Grammar.sourceFile, lexed.tokens, endOfText(text))
+  for e in tree.errors()
+    out += syntaxError(file, e, lexed.tokens)
+  val (moduleName, imports, decls) = tree match
+    Success((m, (ims, ds)), _) -> (m, ims, ds)
+    _ -> ("", List[Import](), List[Decl]())
+  Parsed(SourceFile(file, moduleName, imports, decls, lexed.comments.toList, lexed.blankLines.toList), out.toVector)
+
+// What parsing a template gave.
+data ParsedTemplate(template: Template, diagnostics: Vector[Diagnostic])
+
+// Parses the template `text`, the contents of `file`, in the module `moduleName`.
+parseTemplate(file: string, moduleName: string, text: string) -> ParsedTemplate
+  val lexed = lexTemplate(file, text)
+  val out = Buffer[Diagnostic]()
+  out ++= lexed.diagnostics
+  val start = Span(file, Pos(0, 1, 1), Pos(0, 1, 1))
+  val params: List[Param] = Grammar.parse(Grammar.templateHeader, lexed.header, endOfText(text)) match
+    Success(ps, _) -> ps
+    Failure(msg, next) ->
+      out += syntaxError(file, ParseError(msg, next.pos(), false), lexed.header, "a template begins with `@params(name: Type, …)`")
+      []
+    Error(msg, next) ->
+      out += syntaxError(file, ParseError(msg, next.pos(), true), lexed.header, "a template begins with `@params(name: Type, …)`")
+      []
+  for p in lexed.body
+    p match
+      Hole(ts, _) -> holeErrors(file, [StringLit([p], true, start)], out)
+      _ -> ()
+  ParsedTemplate(Template(file, moduleName, params, strParts(lexed.body), start), out.toVector)
+
+// The position just past the end of `text`.
+private endOfText(text: string) -> Position
+  var line = 1
+  var column = 1
+  for c in text.charIterator()
+    if c == '\n'
+      line += 1
+      column = 1
+    else
+      column += 1
+  Position(text.byteLength, line, column)
+
+// A syntax error as a diagnostic, spanning the token it was found at.
+private syntaxError(file: string, e: ParseError, tokens: Vector[Token], help: string = "") -> Diagnostic
+  val at = Pos(e.pos.offset, e.pos.line, e.pos.column)
+  val span = tokens.find(t -> t.extent.start.offset == e.pos.offset && !(t is Dedent(_)) && !(t is Indent(_))).map(t -> t.extent).getOrElse(Span(file, at, at))
+  Diagnostic("E0150", e.msg, span, "", [], help)
+
+// Reports the syntax errors in the interpolations of every string among `tokens`, which the grammar
+// reads as expressions where it meets them.
+private holeErrors(file: string, tokens: List[Token], out: Buffer[Diagnostic])
+  for t in tokens
+    val parts: List[Piece] = t match
+      StringLit(ps, _, _) -> ps
+      ShellLit(ps, _) -> ps
+      _ -> []
+    for p in parts
+      p match
+        // An empty interpolation is the lexer's error already.
+        Hole([], _) -> ()
+        Hole(ts, s) ->
+          holeErrors(file, ts, out)
+          Grammar.parseAll(Grammar.holeExpr, ts.toVector, closeOf(s)) match
+            Success(_, _) -> ()
+            // The end of an interpolation's tokens is its closing brace.
+            Failure(msg, next) -> out += syntaxError(file, ParseError(msg.replace("end of input", "`}`"), next.pos(), false), ts.toVector)
+            Error(msg, next) -> out += syntaxError(file, ParseError(msg.replace("end of input", "`}`"), next.pos(), true), ts.toVector)
+        _ -> ()
+
+// The words that are never names.
+val keywords: Vector[string] = ["module", "import", "data", "role", "private", "val", "apply", "group", "connect", "if", "then", "else", "match", "for", "in", "yield", "with", "as", "on", "after", "fail", "true", "false", "none", "_"]
+
+private isWord(t: Token, w: string) -> bool = t match
+  Word(x, _) -> x == w
+  _ -> false
+
+private isSym(t: Token, s: string) -> bool = t match
+  Symbol(x, _) -> x == s
+  _ -> false
+
+private isName(t: Token) -> bool = t match
+  Word(x, _) -> !keywords.contains(x)
+  _ -> false
+
+private textOf(t: Token) -> string = t match
+  Word(x, _) -> x
+  Symbol(x, _) -> x
+  _ -> ""
+
+// Whether `t` can begin a resource's title: a string, a name or a number.
+private isTitleStart(t: Token) -> bool = t match
+  StringLit(_, _, _) | ShellLit(_, _) | IntLit(_, _) -> true
+  Word(x, _) -> !keywords.contains(x) || x == "true" || x == "false" || x == "none"
+  _ -> false
+
+// Where an interpolation's expression ends: at its closing `}`.
+private closeOf(s: Span) -> Position = Position(s.end.offset - 1, s.end.line, s.end.column - 1)
+
+// The pieces of a string as the tree holds them; an interpolation that does not parse stands as an
+// empty name, its error reported by `holeErrors`.
+private strParts(parts: List[Piece]) -> List[StrPart] = parts.map(p -> p match
+  Chunk(t, _) -> TextP(t)
+  Hole(ts, s) -> Grammar.parseAll(Grammar.holeExpr, ts.toVector, closeOf(s)) match
+    Success(e, _) -> ExprP(e)
+    _ -> ExprP(NameE("", s)))
+
+private applyAll(e: Expr, fs: List[(Expr) -> Expr]) -> Expr
+  var r = e
+  for f in fs
+    r = f(r)
+  r
+
+// The span of a statement with a block: from `head` to the end of the block's last statement.
+private blockSpan(head: Span, body: List[Stmt]) -> Span = body.lastOption match
+  Some(s) -> head.through(s.extent)
+  None -> head
+
+// What a group holds: its hosts, and its settings.
+private data GroupPart
+  HostPart(host: HostDecl)
+  SettingPart(stmt: Stmt)
+
+type P[T] = Rule[Tokens[Token], T]
+
+object Grammar: TokenParsers[Token]
+  override describe(t: Token) -> string = t match
+    Word(w, _) -> s"`$w`"
+    Symbol(x, _) -> s"`$x`"
+    StringLit(_, _, _) -> "a string"
+    ShellLit(_, _) -> "a shell string"
+    Newline(_) -> "the end of the line"
+    Indent(_) -> "an indented block"
+    Dedent(_) -> "the end of the block"
+    EndOfFile(_) -> "the end of the file"
+    other -> s"`${other.shown}`"
+
+  override span(t: Token) -> Position
+    val s = t.extent.start
+    Position(s.offset, s.line, s.column)
+
+  // --- Leaves ---------------------------------------------------------------------------------
+
+  kw(w: string) -> P[Token] = token(s"`$w`", t -> isWord(t, w))
+
+  sym(x: string) -> P[Token] = token(s"`$x`", t -> isSym(t, x))
+
+  lazy val newline: P[Token] = token("the end of the line", t -> t is Newline(_))
+
+  lazy val indent: P[Token] = token("an indented block", t -> t is Indent(_))
+
+  lazy val dedent: P[Token] = token("the end of the block", t -> t is Dedent(_))
+
+  lazy val eof: P[Token] = token("the end of the file", t -> t is EndOfFile(_))
+
+  lazy val nameTok: P[Token] = token("a name", t -> isName(t))
+
+  lazy val name: P[(string, Span)] = nameTok ^^ (t -> (textOf(t), t.extent))
+
+  // The end of a line, or nothing just after a block, which ends its line itself.
+  lazy val lineEnd: P[unit] = newline ^^^ () | Rule((input: Tokens[Token]) ->
+    if input.offset > 0 && (input.items(input.offset - 1) is Dedent(_)) then Some(()) else input.fail("the end of the line"))
+
+  // Skips the rest of a line and any block under it, stopping before the end of the block it is in.
+  lazy val skipLine: P[unit] = Rule((input: Tokens[Token]) ->
+    var depth = 0
+    var done = false
+    while !done && !input.atEnd()
+      input.first() match
+        EndOfFile(_) -> done = true
+        Dedent(_) ->
+          if depth == 0
+            done = true
+          else
+            depth -= 1
+            input.offset += 1
+            if depth == 0 && !(input.atEnd() || (input.first() is Indent(_))) then done = true
+        Indent(_) ->
+          depth += 1
+          input.offset += 1
+        Newline(_) ->
+          input.offset += 1
+          if depth == 0 && !(input.atEnd() || (input.first() is Indent(_))) then done = true
+        _ -> input.offset += 1
+    Some(()))
+
+  // --- Types and parameters -------------------------------------------------------------------
+
+  lazy val typeExpr: P[TypeExpr] = name ~ opt(sym("[") ~> rep1sep(typeExpr, sym(",")) ~ sym("]")) ~ opt(sym("?")) ^^ (match (((n, s), args), q) ->
+    val (list, end) = args match
+      Some((ts, close)) -> (ts, s.through(close.extent))
+      None -> (List[TypeExpr](), s)
+    val named = NamedT(n, list, end)
+    q match
+      Some(t) -> OptionalT(named, end.through(t.extent))
+      None -> named)
+
+  lazy val param: P[Param] = name ~ (sym(":") ~> typeExpr) ~ opt(sym("=") ~> expr) ^^ (match (((n, s), t), d) ->
+    val end = d match
+      Some(e) -> e.extent
+      None -> t.extent
+    Param(n, t, d, s.through(end)))
+
+  lazy val params: P[List[Param]] = sym("(") ~> commas(param) <~ opt(sym(",")) <~ sym(")")
+
+  // Values of `p` separated by commas, none included. A comma after the last is left for the rule
+  // around, which allows one before its closing bracket.
+  commas[T](@sendable p: -> P[T]) -> P[List[T]] = opt(commas1(p)) ^^ (o -> o.getOrElse(List[T]()))
+
+  // As `commas`, at least one.
+  commas1[T](@sendable p: -> P[T]) -> P[List[T]] = rep1(p, sym(",") ~> p)
+
+  // --- Expressions ----------------------------------------------------------------------------
+
+  lazy val expr: P[Expr] = ifExpr | matchExpr | forExpr | failExpr | orExpr
+
+  // An interpolation: one expression and nothing after it.
+  lazy val holeExpr: P[Expr] = expr
+
+  lazy val ifExpr: P[Expr] = kw("if") ~! (expr ~ (kw("then") ~> expr) ~ (kw("else") ~> expr)) ^^ (match (i, ((c, t), e)) -> IfE(c, t, e, i.extent.through(e.extent)))
+
+  lazy val matchExpr: P[Expr] = kw("match") ~! (orExpr ~ (inlineArms | blockArms)) ^^ (match (m, (s, (arms, end))) -> MatchE(s, arms, m.extent.through(end)))
+
+  lazy val exprArm: P[Arm] = pattern ~ (sym("->") ~> expr) ^^ (match (p, e) -> Arm(p, e, p.extent.through(e.extent)))
+
+  lazy val inlineArms: P[(List[Arm], Span)] = sym("{") ~> rep1sep(exprArm, sym(";")) ~ sym("}") ^^ (match (arms, close) -> (arms, close.extent))
+
+  lazy val blockArms: P[(List[Arm], Span)] = newline ~> indent ~> rep1(exprArm <~ lineEnd) <~ dedent ^^ (arms -> (arms, arms.last.span))
+
+  lazy val forExpr: P[Expr] = kw("for") ~! (pattern ~ (kw("in") ~> orExpr) ~ opt(kw("if") ~> orExpr) ~ (kw("yield") ~> expr)) ^^ (match (f, (((p, over), cond), body)) -> ForE(p, over, cond, body, f.extent.through(body.extent)))
+
+  lazy val failExpr: P[Expr] = kw("fail") ~! expr ^^ (match (f, m) -> FailE(m, f.extent.through(m.extent)))
+
+  // An operator among `ops`, as the function joining its operands.
+  binary(ops: Vector[string]) -> P[(Expr, Expr) -> Expr] = token("an operator", t -> ops.exists(o -> isSym(t, o))) ^^ (t ->
+    val op = textOf(t)
+    (l: Expr, r: Expr) -> BinaryE(op, l, r, l.extent.through(r.extent)))
+
+  lazy val orExpr: P[Expr] = chainl1(andExpr, binary(["||"]))
+
+  lazy val andExpr: P[Expr] = chainl1(compareExpr, binary(["&&"]))
+
+  lazy val compareExpr: P[Expr] = chainl1(rangeExpr, binary(["==", "!=", "<", "<=", ">", ">="]))
+
+  lazy val rangeExpr: P[Expr] = chainl1(addExpr, binary(["..", "..<"]))
+
+  lazy val addExpr: P[Expr] = chainl1(mulExpr, binary(["+", "-"]))
+
+  lazy val mulExpr: P[Expr] = chainl1(unaryExpr, binary(["*", "/", "%"]))
+
+  lazy val unaryExpr: P[Expr] = (sym("-") | sym("!")) ~ unaryExpr ^^ (match (o, x) -> UnaryE(textOf(o), x, o.extent.through(x.extent)))
+    | postfixExpr
+
+  lazy val postfixExpr: P[Expr] = primary ~ rep(suffix) ^^ (match (e, fs) -> applyAll(e, fs))
+
+  lazy val suffix: P[(Expr) -> Expr] = sym(".") ~> name ^^ (match (n, s) -> (e: Expr) -> FieldE(e, n, e.extent.through(s)))
+    | sym("(") ~> args ~ sym(")") ^^ (match (given, close) -> (e: Expr) -> CallE(e, given, e.extent.through(close.extent)))
+    | kw("with") ~> sym("{") ~> commas(fieldInit) ~ (opt(sym(",")) ~> sym("}")) ^^ (match (fs, close) -> (e: Expr) -> WithE(e, fs, e.extent.through(close.extent)))
+
+  lazy val fieldInit: P[FieldInit] = name ~ (sym("=") ~> expr) ^^ (match ((n, s), v) -> FieldInit(n, v, s.through(v.extent)))
+
+  lazy val args: P[List[Arg]] = commas(arg) <~ opt(sym(","))
+
+  lazy val arg: P[Arg] = lambda ^^ (l -> Arg("", l, l.extent))
+    | name ~ (sym("=") ~> expr) ^^ (match ((n, s), v) -> Arg(n, v, s.through(v.extent)))
+    | expr ^^ (e -> Arg("", e, e.extent))
+
+  lazy val lambda: P[Expr] = name ~ (sym("->") ~> expr) ^^ (match ((n, s), body) -> LambdaE([n], body, s.through(body.extent)))
+    | sym("(") ~ repsep(name, sym(",")) ~ (sym(")") ~ sym("->") ~> expr) ^^ (match ((open, ns), body) -> LambdaE(ns.map((n, _) -> n), body, open.extent.through(body.extent)))
+
+  lazy val primary: P[Expr] = literal
+    | name ^^ (match (n, s) -> NameE(n, s))
+    | sym("(") ~ commas(expr) ~ opt(sym(",")) ~ sym(")") ^^ (match (((open, items), comma), close) ->
+      if items.length == 1 && comma.isEmpty then items.head else TupleE(items, open.extent.through(close.extent)))
+    | sym("[") ~ commas(expr) ~ (opt(sym(",")) ~> sym("]")) ^^ (match ((open, items), close) -> ListE(items, open.extent.through(close.extent)))
+    | sym("{") ~ commas(entry) ~ (opt(sym(",")) ~> sym("}")) ^^ (match ((open, es), close) -> MapE(es, open.extent.through(close.extent)))
+
+  lazy val entry: P[(Expr, Expr)] = expr ~ (sym(":") ~> expr)
+
+  lazy val literal: P[Expr] = tokenMatch("a value", match
+    IntLit(v, s) -> IntE(v, s)
+    ModeLit(v, s) -> ModeE(v, s)
+    DurationLit(v, t, s) -> DurationE(v, t, s)
+    SizeLit(v, t, s) -> SizeE(v, t, s)
+    StringLit(ps, multi, s) -> StrE(strParts(ps), multi, s)
+    ShellLit(ps, s) -> ShE(strParts(ps), s)
+    Word("true", s) -> BoolE(true, s)
+    Word("false", s) -> BoolE(false, s)
+    Word("none", s) -> NoneE(s))
+
+  // --- Patterns -------------------------------------------------------------------------------
+
+  lazy val pattern: P[Pattern] = rep1sep(simplePattern, sym("|")) ^^ (ps -> ps match
+    [one] -> one
+    _ -> AltP(ps, ps.head.extent.through(ps.last.extent)))
+
+  lazy val simplePattern: P[Pattern] = kw("_") ^^ (t -> WildP(t.extent))
+    | name ~ opt(sym("(") ~> repsep(pattern, sym(",")) ~ sym(")")) ^^ (match ((n, s), fields) -> fields match
+      Some((fs, close)) -> VariantP(n, fs, s.through(close.extent))
+      None -> BindP(n, s))
+    | sym("(") ~ rep1sep(pattern, sym(",")) ~ sym(")") ^^ (match ((open, ps), close) -> TupleP(ps, open.extent.through(close.extent)))
+    | sym("-") ~ tokenMatch("a number", match IntLit(v, s) -> (v, s)) ^^ (match (m, (v, s)) -> LitP(IntE(-v, m.extent.through(s)), m.extent.through(s)))
+    | literal ^^ (e -> LitP(e, e.extent))
+
+  // --- Statements -----------------------------------------------------------------------------
+
+  // A block's statements, each one that does not parse reported and skipped.
+  lazy val block: P[List[Stmt]] = indent ~> rep(stmtLine) <~ dedent ^^ (ss -> ss.flatMap(s -> s.toList))
+
+  lazy val stmtLine: P[Option[Stmt]] = not(dedent | eof) ~> recover(stmt ^^ (s -> Some(s)), skipLine, (msg, at) -> None)
+
+  lazy val stmt: P[Stmt] = valStmt | ifStmt | forStmt | matchStmt | asStmt | onStmt | afterStmt | fieldStmt | callStmt | resourceStmt
+
+  lazy val fieldStmt: P[Stmt] = name ~ (sym("=") ~! (expr <~ lineEnd)) ^^ (match ((n, s), (_, v)) -> FieldS(n, v, s.through(v.extent)))
+
+  lazy val refs: P[List[Expr]] = rep1sep(orExpr, sym(","))
+
+  lazy val callStmt: P[Stmt] = guard(nameTok ~ sym("(")) ~> postfixExpr ~ opt(kw("after") ~> refs) <~ newline ^^ (match (c, after) ->
+    val list = after.getOrElse(List[Expr]())
+    val end = list.lastOption.map(a -> a.extent).getOrElse(c.extent)
+    CallS(c, list, "", c.extent.through(end)))
+
+  // `kind title`, then its block if it has one.
+  // A resource's kind: a name, or `group`, which is also the inventory's word.
+  lazy val kindName: P[(string, Span)] = token("a resource kind", t -> isName(t) || isWord(t, "group")) ^^ (t -> (textOf(t), t.extent))
+
+  lazy val resourceDecl: P[ResourceDecl] = guard(kindName ~ token("a title", t -> isTitleStart(t))) ~> kindName ~ orExpr ~ (newline ~> opt(block)) ^^ (match (((k, s), title), body) ->
+    val list = body.getOrElse(List[Stmt]())
+    ResourceDecl(k, title, list, blockSpan(s.through(title.extent), list)))
+
+  lazy val resourceStmt: P[Stmt] = resourceDecl ^^ (r -> ResourceS(r, "", r.span))
+
+  lazy val valStmt: P[Stmt] = kw("val") ~! (pattern ~ (sym("=") ~> (valResource | valValue))) ^^ (match (v, (p, rhs)) ->
+    val bound = p match
+      BindP(n, _) -> n
+      _ -> ""
+    rhs match
+      ResourceS(r, _, s) -> ResourceS(r, bound, v.extent.through(s))
+      CallS(c, after, _, s) -> CallS(c, after, bound, v.extent.through(s))
+      ValS(_, e, s) -> ValS(p, e, v.extent.through(s))
+      other -> other)
+
+  lazy val valResource: P[Stmt] = resourceDecl ^^ (r -> ResourceS(r, "", r.span))
+
+  lazy val valValue: P[Stmt] = expr ~ opt(kw("after") ~> refs) <~ lineEnd ^^ (match (e, after) -> after match
+    Some(list) -> CallS(e, list, "", e.extent.through(list.last.extent))
+    None -> ValS(WildP(e.extent), e, e.extent))
+
+  lazy val ifStmt: P[Stmt] = kw("if") ~! (expr ~ (newline ~> block) ~ opt(kw("else") ~! (ifStmt ^^ (s -> List(s)) | newline ~> block))) ^^ (match (i, ((c, t), e)) ->
+    val elseS: List[Stmt] = e match
+      Some((_, ss)) -> ss
+      None -> []
+    IfS(c, t, elseS, blockSpan(i.extent.through(c.extent), t ++ elseS)))
+
+  lazy val forStmt: P[Stmt] = kw("for") ~! (pattern ~ (kw("in") ~> expr) ~ (newline ~> block)) ^^ (match (f, ((p, over), body)) -> ForS(p, over, body, blockSpan(f.extent.through(over.extent), body)))
+
+  lazy val stmtArm: P[StmtArm] = pattern ~ (sym("->") ~> newline ~> block) ^^ (match (p, body) -> StmtArm(p, body, blockSpan(p.extent, body)))
+
+  lazy val matchStmt: P[Stmt] = kw("match") ~! (expr ~ (newline ~> indent ~> rep1(stmtArm) <~ dedent)) ^^ (match (m, (s, arms)) -> MatchS(s, arms, m.extent.through(arms.last.span)))
+
+  lazy val asStmt: P[Stmt] = kw("as") ~! (expr ~ (newline ~> block)) ^^ (match (a, (u, body)) -> AsS(u, body, blockSpan(a.extent.through(u.extent), body)))
+
+  lazy val onStmt: P[Stmt] = kw("on") ~! (refs ~ (sym("->") ~> name) <~ newline) ^^ (match (o, (sources, (action, s))) -> OnS(sources, action, o.extent.through(s)))
+
+  lazy val afterStmt: P[Stmt] = kw("after") ~! (refs <~ newline) ^^ (match (a, list) -> AfterS(list, a.extent.through(list.last.extent)))
+
+  // --- Declarations ---------------------------------------------------------------------------
+
+  lazy val sourceFile: P[(string, (List[Import], List[Decl]))] = opt(moduleLine) ~ rep(importLine) ~ rep(declLine) <~ eof ^^ (match ((m, ims), ds) ->
+    (m.getOrElse(""), (ims, ds.flatMap(d -> d.toList))))
+
+  lazy val dotted: P[(string, Span)] = rep1(name, sym(".") ~> name) ^^ (parts ->
+    val (_, first) = parts.head
+    val (_, last) = parts.last
+    (parts.map((n, _) -> n).mkString("."), first.through(last)))
+
+  lazy val moduleLine: P[string] = kw("module") ~! (dotted <~ newline) ^^ (match (_, (n, _)) -> n)
+
+  lazy val importLine: P[Import] = kw("import") ~! (dotted ~ opt(sym(".") ~> sym("{") ~> commas1(name) ~ (opt(sym(",")) ~> sym("}"))) <~ newline) ^^ (match (i, ((m, ms), names)) -> names match
+    Some((ns, close)) -> Import(m, ns, i.extent.through(close.extent))
+    None -> Import(m, List[(string, Span)](), i.extent.through(ms)))
+
+  lazy val declLine: P[Option[Decl]] = not(eof) ~> recover(decl ^^ (d -> Some(d)), skipLine, (msg, at) -> None)
+
+  lazy val decl: P[Decl] = dataDecl | roleDecl | valDecl | applyDecl | groupDecl | connectDecl | fnDecl
+
+  lazy val dataDecl: P[Decl] = kw("data") ~! (name ~ opt(params) ~ (newline ~> opt(indent ~> rep1(variant) <~ dedent))) ^^ (match (d, (((n, s), ps), vs)) ->
+    val variants = vs.getOrElse(List[Variant]())
+    val end = variants.lastOption.map(v -> v.span).getOrElse(ps.flatMap(p -> p.lastOption).map(p -> p.span).getOrElse(s))
+    DataD(DataDecl(n, ps.getOrElse(List[Param]()), variants, d.extent.through(end))))
+
+  lazy val variant: P[Variant] = name ~ opt(params) <~ newline ^^ (match ((n, s), ps) -> Variant(n, ps.getOrElse(List[Param]()), s))
+
+  lazy val roleDecl: P[Decl] = opt(kw("private")) ~ (kw("role") ~! (name ~ params ~ (newline ~> block))) ^^ (match (p, (r, (((n, s), ps), body))) ->
+    val start = p.map(t -> t.extent).getOrElse(r.extent)
+    RoleD(RoleDecl(n, ps, body, p.isDefined, blockSpan(start.through(s), body))))
+
+  lazy val valDecl: P[Decl] = kw("val") ~! (pattern ~ (sym("=") ~> expr) <~ lineEnd) ^^ (match (v, (p, e)) -> ValD(ValDecl(p, e, v.extent.through(e.extent))))
+
+  lazy val fnDecl: P[Decl] = name ~ params ~ (sym("->") ~! (typeExpr ~ (sym("=") ~> expr) <~ lineEnd)) ^^ (match (((n, s), ps), (_, (t, body))) -> FnD(FnDecl(n, ps, t, body, s.through(body.extent))))
+
+  lazy val applyCalls: P[List[Expr]] = newline ~> indent ~> rep1(postfixExpr <~ newline) <~ dedent
+    | postfixExpr <~ newline ^^ (c -> [c])
+
+  lazy val applyDecl: P[Decl] = kw("apply") ~! (name ~ opt(kw("as") ~> name) ~ (sym("->") ~> applyCalls)) ^^ (match (a, (((t, _), alias), calls)) ->
+    ApplyD(ApplyDecl(t, alias.map((n, _) -> n).getOrElse(""), calls, a.extent.through(calls.last.extent))))
+
+  lazy val hostDecl: P[HostDecl] = kw("host") ~! (name ~ (kw("at") ~> expr) ~ (newline ~> opt(block))) ^^ (match (h, (((n, _), address), fields)) ->
+    val list = fields.getOrElse(List[Stmt]())
+    HostDecl(n, address, list, blockSpan(h.extent.through(address.extent), list)))
+
+  lazy val groupPart: P[Option[GroupPart]] = hostDecl ^^ (h -> Some(HostPart(h)))
+    | stmtLine ^^ (s -> s.map(x -> SettingPart(x)))
+
+  lazy val groupDecl: P[Decl] = kw("group") ~! (name ~ opt(sym(":") ~> name) ~ (newline ~> opt(indent ~> rep(not(dedent | eof) ~> groupPart) <~ dedent))) ^^ (match (g, (((n, s), vars), parts)) ->
+    val fields = Buffer[Stmt]()
+    val hosts = Buffer[HostDecl]()
+    for p in parts.getOrElse(List[Option[GroupPart]]()).flatMap(x -> x.toList)
+      p match
+        HostPart(h) -> hosts += h
+        SettingPart(x) -> fields += x
+    val lastField = fields.lastOption.map(x -> x.extent)
+    val lastHost = hosts.lastOption.map(h -> h.span)
+    val end = (lastField, lastHost) match
+      (Some(a), Some(b)) -> if a.end.offset > b.end.offset then a else b
+      (Some(a), None) -> a
+      (None, Some(b)) -> b
+      (None, None) -> s
+    GroupD(GroupDecl(n, vars.map((v, _) -> v).getOrElse(""), fields.toList, hosts.toList, g.extent.through(end))))
+
+  lazy val connectDecl: P[Decl] = kw("connect") ~! (name ~ (newline ~> opt(block))) ^^ (match (c, ((t, s), fields)) ->
+    val list = fields.getOrElse(List[Stmt]())
+    ConnectD(ConnectDecl(t, list, blockSpan(c.extent.through(s), list))))
+
+  // A template's first line: `@params(name: Type, …)`.
+  lazy val templateHeader: P[List[Param]] = sym("@") ~> kw("params") ~> params <~ eof

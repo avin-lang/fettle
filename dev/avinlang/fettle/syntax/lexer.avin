@@ -10,14 +10,26 @@ module dev.avinlang.fettle.syntax
 // space. A line indented further than the one before and beginning with `.` continues it, so a call
 // chain may be broken across lines.
 
-// What lexing a file gave: its tokens, ending with `EndOfFile`, and every mistake found.
-data Lexed(tokens: Vector[Token], diagnostics: Vector[Diagnostic])
+// What lexing a file gave: its tokens, ending with `EndOfFile`, and every mistake found; its
+// comments, and the numbers of its blank lines, which the formatter keeps.
+data Lexed(tokens: Vector[Token], diagnostics: Vector[Diagnostic], comments: Vector[Comment], blankLines: Vector[int])
 
 // Lexes `text`, the contents of `file`.
 lex(file: string, text: string) -> Lexed
   val l = Lexer(file, text)
   l.run()
-  Lexed(l.tokens.toVector, l.diagnostics.toVector)
+  Lexed(l.tokens.toVector, l.diagnostics.toVector, l.comments.toVector, l.blankLines.toVector)
+
+// What lexing a template gave: the tokens of its `@params(…)` line, its text and interpolations, and
+// every mistake found.
+data LexedTemplate(header: Vector[Token], body: List[Piece], diagnostics: Vector[Diagnostic])
+
+// Lexes the template `text`, the contents of `file`. Its first line is `@params(…)`; the rest is text
+// in which `${expr}` is an interpolation and `$${` writes `${`. Nothing else is an escape.
+lexTemplate(file: string, text: string) -> LexedTemplate
+  val l = Lexer(file, text)
+  val (header, body) = l.runTemplate()
+  LexedTemplate(header, body, l.diagnostics.toVector)
 
 // The units a number may carry, with how many milliseconds or bytes one of each is.
 private durationUnit(u: string) -> long = u match
@@ -54,7 +66,7 @@ private isNameChar(c: char) -> bool = c.isLetterOrDigit || c == '_'
 // The operators of two and three characters, longest first; any other punctuation is one character.
 private val longSymbols: Vector[string] = ["..<", "->", "==", "!=", "<=", ">=", "&&", "||", ".."]
 
-private val singleSymbols: string = "()[]{},.:=+-*/%<>!|?@"
+private val singleSymbols: string = "()[]{},.:;=+-*/%<>!|?@"
 
 // The largest value a `long` holds.
 private val maxLong: long = 9223372036854775807
@@ -62,6 +74,8 @@ private val maxLong: long = 9223372036854775807
 class Lexer(val file: string, val text: string)
   val tokens = Buffer[Token]()
   val diagnostics = Buffer[Diagnostic]()
+  val comments = Buffer[Comment]()
+  val blankLines = Buffer[int]()
   private val n: int = text.byteLength
   private var at = 0
   private var line = 1
@@ -113,10 +127,11 @@ class Lexer(val file: string, val text: string)
       if atEnd then break
       val c = peek()
       if c == '\n' || c == '\r'
+        blankLines += line
         skipLineEnd()
         continue
       if c == '/' && peekAt(1) == '/'
-        skipComment()
+        skipComment(true)
         continue
       if tab
         error("E0101", "indentation uses a tab", spanFrom(start), "a tab", "indent with two spaces a level")
@@ -141,9 +156,40 @@ class Lexer(val file: string, val text: string)
     if peek() == '\r' then advance()
     if !atEnd && peek() == '\n' then advance()
 
-  private skipComment()
-    while !atEnd && peek() != '\n'
+  // Reads a comment up to its line end, keeping it for the formatter.
+  private skipComment(ownLine: bool)
+    val start = pos()
+    val from = at
+    while !atEnd && peek() != '\n' && peek() != '\r'
       advance()
+    comments += Comment(text.slice(from, at).trim, spanFrom(start), ownLine)
+
+  // Lexes a template: the tokens of its first line, then its text and interpolations.
+  runTemplate() -> (Vector[Token], List[Piece])
+    lexLine()
+    val e = pos()
+    tokens += EndOfFile(Span(file, e, e))
+    val parts = Buffer[Piece]()
+    val buf = StringWriter()
+    var chunkStart = pos()
+    while !atEnd
+      val c = peek()
+      if c == '$' && peekAt(1) == '$' && peekAt(2) == '{'
+        advance()
+        advance()
+        advance()
+        buf.write("${")
+      else if c == '$' && peekAt(1) == '{'
+        flushChunk(parts, buf, chunkStart)
+        val (hole, closed) = lexHole(true)
+        parts += hole
+        chunkStart = pos()
+        if !closed then break
+      else
+        if c != '\r' then buf.writeChar(c)
+        advance()
+    flushChunk(parts, buf, chunkStart)
+    (tokens.toVector, parts.toList)
 
   private emitNewline()
     if tokens.length == 0 then return
@@ -164,11 +210,14 @@ class Lexer(val file: string, val text: string)
       tokens += Indent(here)
     else if width < top
       while levels.length > 1 && levels.last > width
+        // A line between this block's indentation and the one outside it belongs to this block,
+        // misaligned: the block stays open, at the line's indentation, so its statements stay in it.
+        if levels(levels.length - 2) < width
+          error("E0103", s"this line's indentation, $width spaces, lines up with no enclosing block", here, s"$width spaces", s"indent it ${levels.last} spaces")
+          levels(levels.length - 1) = width
+          return
         levels.remove(levels.length - 1)
         tokens += Dedent(here)
-      if levels.last != width
-        error("E0103", s"this line's indentation, $width spaces, lines up with no enclosing block", here, s"$width spaces", s"indent it ${levels.last} spaces")
-        levels += width
 
   // Lexes the tokens of one line; brackets left open carry it on over the line ends that follow.
   private lexLine()
@@ -182,7 +231,7 @@ class Lexer(val file: string, val text: string)
           return
         skipLineEnd()
       else if c == '/' && peekAt(1) == '/'
-        skipComment()
+        skipComment(false)
       else
         lexToken(tokens, open)
     for (b, s) in open

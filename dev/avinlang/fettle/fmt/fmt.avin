@@ -1,105 +1,244 @@
 module dev.avinlang.fettle.fmt
 
-import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, Decl, DurationE, Expr, ExprP, FailE, FieldE, FieldS, FnD, ForE, ForS, GroupD, IfE, IfS, Import, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NamedT, NoneE, OnS, OptionalT, Param, Pattern, ResourceS, RoleD, ShE, SizeE, SourceFile, Stmt, StrE, StrPart, TextP, TupleE, TupleP, TypeExpr, UnaryE, ValD, ValS, VariantP, WildP, WithE, octal}
+import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, BindP, BoolE, CallE, CallS, Comment, ConnectD, DataD, Decl, DurationE, Expr, ExprP, FailE, FieldE, FieldS, FnD, ForE, ForS, GroupD, HostDecl, IfE, IfS, Import, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NamedT, NoneE, OnS, OptionalT, Param, Pattern, ResourceS, RoleD, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, TextP, TupleE, TupleP, TypeExpr, UnaryE, ValD, ValS, VariantP, WildP, WithE, octal}
 
-// The canonical text of a file: two spaces a level, one blank line between top-level declarations,
-// nothing aligned, operators spaced, a call's arguments on one line.
+// The canonical text of a file: two spaces a level, nothing aligned, operators spaced. One blank line
+// stands between top-level declarations, except between one-line declarations written on adjacent
+// lines; inside a block a blank line stands where the source had one or more. Comments are kept, each
+// on its line or at the end of the line it ended. A line longer than `width` characters is broken
+// at its outermost call, list or map: one item a line, a list's and a map's items each followed by
+// a comma, a call's separated by them.
 format(f: SourceFile) -> string
-  val out = StringWriter()
-  if !f.moduleName.isEmpty
-    out.write(s"module ${f.moduleName}\n")
-  if !f.imports.isEmpty
-    if !f.moduleName.isEmpty then out.write("\n")
+  val p = Printer(f.comments, f.blankLines)
+  p.file(f)
+  p.text
+
+private sortOf(d: Decl) -> string = d match
+  DataD(_) -> "data"
+  FnD(_) -> "fn"
+  RoleD(_) -> "role"
+  ValD(_) -> "val"
+  ApplyD(_) -> "apply"
+  GroupD(_) -> "group"
+  ConnectD(_) -> "connect"
+
+// The longest line the formatter leaves whole.
+val width: int = 100
+
+private pad(level: int) -> string = "  ".repeat(level)
+
+// The text of a file as it is written, with what it needs to place comments and blank lines.
+class Printer(val comments: List[Comment], val blankLines: List[int])
+  private val out = StringWriter()
+  private val pending = Buffer[Comment]()
+  // The last source line written.
+  private var lastLine = 0
+
+  text -> string
+    flushAll(0)
+    out.text
+
+  file(f: SourceFile)
+    pending ++= comments
+    if !f.moduleName.isEmpty
+      val at = firstCodeLine()
+      gap(at, 0, false)
+      line(0, s"module ${f.moduleName}", at)
+    var first = true
     for i in f.imports
-      out.write(showImport(i))
-      out.write("\n")
-  var first = f.moduleName.isEmpty && f.imports.isEmpty
-  for d in f.decls
-    if !first then out.write("\n")
-    first = false
-    writeDecl(out, d)
-  out.text
+      gap(i.span.start.line, 0, first && !f.moduleName.isEmpty)
+      first = false
+      line(0, showImport(i), i.span.start.line)
+    var previous: Option[(Span, string)] = None
+    var start = f.moduleName.isEmpty && f.imports.isEmpty
+    for d in f.decls
+      val s = d.extent
+      // A declaration written directly under a one-line declaration of its sort stays with it.
+      val together = previous match
+        Some((p, sort)) -> p.start.line == p.end.line && s.start.line == p.end.line + 1 && sort == sortOf(d)
+        None -> false
+      gap(s.start.line, 0, !start && !together)
+      start = false
+      writeDecl(d)
+      lastLine = max(lastLine, s.end.line)
+      previous = Some((s, sortOf(d)))
+
+  // The first line that is neither blank nor a comment: the module line's.
+  private firstCodeLine() -> int
+    var l = 1
+    while blankLines.contains(l) || comments.exists(c -> c.span.start.line == l)
+      l += 1
+    l
+
+  // Writes the comments standing before the source line `at`, at `level`, with a blank line where the
+  // source had one; `blank` asks for one before them in any case, unless nothing is written yet.
+  private gap(at: int, level: int, blank: bool)
+    var wantBlank = blank
+    while !pending.isEmpty && pending(0).span.start.line < at
+      val c = pending.remove(0)
+      if blankBetween(lastLine, c.span.start.line) then wantBlank = true
+      if wantBlank && !out.text.isEmpty then out.write("\n")
+      wantBlank = false
+      out.write(s"${pad(level)}${c.text}\n")
+      lastLine = max(lastLine, c.span.start.line)
+    if blankBetween(lastLine, at) then wantBlank = true
+    if wantBlank && !out.text.isEmpty then out.write("\n")
+    lastLine = max(lastLine, at)
+
+  private blankBetween(from: int, until: int) -> bool = blankLines.exists(b -> from < b < until)
+
+  private flushAll(level: int)
+    while !pending.isEmpty
+      val c = pending.remove(0)
+      if blankBetween(lastLine, c.span.start.line) && !out.text.isEmpty then out.write("\n")
+      out.write(s"${pad(level)}${c.text}\n")
+      lastLine = max(lastLine, c.span.start.line)
+
+  // Writes one line at `level`, with the comment that ended the source line `at`, if there is one.
+  private line(level: int, text: string, at: int)
+    out.write(pad(level))
+    out.write(text)
+    if !pending.isEmpty && !pending(0).ownLine && pending(0).span.start.line == at
+      out.write(s" ${pending.remove(0).text}")
+    out.write("\n")
+
+  private writeDecl(d: Decl)
+    val at = d.extent.start.line
+    d match
+      DataD(x) ->
+        val head = if x.params.isEmpty && !x.variants.isEmpty then x.name else s"${x.name}(${showParams(x.params)})"
+        line(0, s"data $head", at)
+        for v in x.variants
+          gap(v.span.start.line, 1, false)
+          line(1, if v.params.isEmpty then v.name else s"${v.name}(${showParams(v.params)})", v.span.start.line)
+      FnD(x) -> value(s"${x.name}(${showParams(x.params)}) -> ${showType(x.result)} = ", x.body, 0, at, "")
+      RoleD(x) ->
+        val p = if x.isPrivate then "private " else ""
+        line(0, s"${p}role ${x.name}(${showParams(x.params)})", at)
+        block(x.body, 1)
+      ValD(x) -> value(s"val ${showPattern(x.pattern)} = ", x.value, 0, at, "")
+      ApplyD(x) ->
+        val a = if x.alias.isEmpty then "" else s" as ${x.alias}"
+        val head = s"apply ${x.target}$a ->"
+        x.calls match
+          [c] if fits(0, s"$head ${showExpr(c)}") -> line(0, s"$head ${showExpr(c)}", at)
+          cs ->
+            line(0, head, at)
+            for c in cs
+              gap(c.extent.start.line, 1, false)
+              value("", c, 1, c.extent.start.line, "")
+      GroupD(x) ->
+        val t = if x.varsType.isEmpty then "" else s": ${x.varsType}"
+        line(0, s"group ${x.name}$t", at)
+        // Settings and hosts stay in the order written; settings first where the tree does not say.
+        var fs = x.fields
+        var hs = x.hosts
+        while !fs.isEmpty || !hs.isEmpty
+          val hostNext = !hs.isEmpty && (fs.isEmpty || hs.head.span.start.offset < fs.head.extent.start.offset)
+          if hostNext
+            writeHost(hs.head)
+            hs = hs.tail
+          else
+            stmt(fs.head, 1)
+            fs = fs.tail
+      ConnectD(x) ->
+        line(0, s"connect ${x.target}", at)
+        block(x.fields, 1)
+
+  private writeHost(h: HostDecl)
+    gap(h.span.start.line, 1, false)
+    line(1, s"host ${h.name} at ${showExpr(h.address)}", h.span.start.line)
+    block(h.fields, 2)
+
+  private block(stmts: List[Stmt], level: int)
+    for s in stmts
+      stmt(s, level)
+
+  private stmt(s: Stmt, level: int)
+    val at = s.extent.start.line
+    gap(at, level, false)
+    s match
+      ResourceS(r, name, _) ->
+        val bind = if name.isEmpty then "" else s"val $name = "
+        line(level, s"$bind${r.kind} ${showExpr(r.title)}", at)
+        block(r.body, level + 1)
+      ValS(p, v, _) -> value(s"val ${showPattern(p)} = ", v, level, at, "")
+      CallS(call, after, name, _) ->
+        val bind = if name.isEmpty then "" else s"val $name = "
+        val a = if after.isEmpty then "" else s" after ${after.map(e -> showExpr(e)).mkString(", ")}"
+        value(bind, call, level, at, a)
+      IfS(c, t, e, _) ->
+        line(level, s"if ${showExpr(c)}", at)
+        block(t, level + 1)
+        writeElse(e, level)
+      ForS(p, over, body, _) ->
+        line(level, s"for ${showPattern(p)} in ${showExpr(over)}", at)
+        block(body, level + 1)
+      MatchS(scrutinee, arms, _) ->
+        line(level, s"match ${showExpr(scrutinee)}", at)
+        for a in arms
+          gap(a.span.start.line, level + 1, false)
+          line(level + 1, s"${showPattern(a.pattern)} ->", a.span.start.line)
+          block(a.body, level + 2)
+      AsS(user, body, _) ->
+        line(level, s"as ${showExpr(user)}", at)
+        block(body, level + 1)
+      OnS(sources, action, _) -> line(level, s"on ${sources.map(e -> showExpr(e)).mkString(", ")} -> $action", at)
+      AfterS(refs, _) -> line(level, s"after ${refs.map(e -> showExpr(e)).mkString(", ")}", at)
+      FieldS(name, v, _) -> value(s"$name = ", v, level, at, "")
+    lastLine = max(lastLine, s.extent.end.line)
+
+  // `else` and its block; an `else` holding only an `if` is written `else if`.
+  private writeElse(e: List[Stmt], level: int)
+    e match
+      [] -> ()
+      [IfS(c, t, e2, sp)] ->
+        line(level, s"else if ${showExpr(c)}", sp.start.line)
+        block(t, level + 1)
+        writeElse(e2, level)
+      _ ->
+        line(level, "else", e.head.extent.start.line)
+        block(e, level + 1)
+
+  // `head`, the value `v` and `tail` at `level`: a `match` with its arms on the lines under it, and a
+  // line too long broken at the value's call, list or map.
+  private value(head: string, v: Expr, level: int, at: int, tail: string)
+    v match
+      MatchE(scrutinee, arms, _) if tail.isEmpty ->
+        line(level, s"${head}match ${showExpr(scrutinee)}", at)
+        for a in arms
+          gap(a.span.start.line, level + 1, false)
+          line(level + 1, s"${showPattern(a.pattern)} -> ${showExpr(a.body)}", a.span.start.line)
+      _ ->
+        val whole = s"$head${showExpr(v)}$tail"
+        if fits(level, whole)
+          line(level, whole, at)
+          return
+        v match
+          CallE(callee, args, close) if !args.isEmpty ->
+            line(level, s"$head${showExpr(callee)}(", at)
+            for (a, i) in args.zipWithIndex
+              val last = i == args.length - 1
+              val name = if a.name.isEmpty then "" else s"${a.name} = "
+              value(name, a.value, level + 1, a.span.start.line, if last then "" else ",")
+            line(level, s")$tail", close.end.line)
+          ListE(items, close) if !items.isEmpty ->
+            line(level, s"$head[", at)
+            for x in items
+              value("", x, level + 1, x.extent.start.line, ",")
+            line(level, s"]$tail", close.end.line)
+          MapE(entries, close) if !entries.isEmpty ->
+            line(level, s"$head{", at)
+            for (k, x) in entries
+              value(s"${showExpr(k)}: ", x, level + 1, k.extent.start.line, ",")
+            line(level, s"}$tail", close.end.line)
+          _ -> line(level, whole, at)
+
+private fits(level: int, text: string) -> bool = level * 2 + text.charCount <= width
 
 showImport(i: Import) -> string = i.names match
   [] -> s"import ${i.moduleName}"
   names -> s"import ${i.moduleName}.{${names.map((n, _) -> n).mkString(", ")}}"
-
-private pad(level: int) -> string = "  ".repeat(level)
-
-private writeDecl(out: StringWriter, d: Decl) = d match
-  DataD(x) ->
-    val head = if x.params.isEmpty && !x.variants.isEmpty then x.name else s"${x.name}(${showParams(x.params)})"
-    out.write(s"data $head\n")
-    for v in x.variants
-      out.write(if v.params.isEmpty then s"  ${v.name}\n" else s"  ${v.name}(${showParams(v.params)})\n")
-  FnD(x) ->
-    out.write(s"${x.name}(${showParams(x.params)}) -> ${showType(x.result)} = ${showExpr(x.body)}\n")
-  RoleD(x) ->
-    val p = if x.isPrivate then "private " else ""
-    out.write(s"${p}role ${x.name}(${showParams(x.params)})\n")
-    writeBlock(out, x.body, 1)
-  ValD(x) -> writeValue(out, s"val ${showPattern(x.pattern)} = ", x.value, 0)
-  ApplyD(x) ->
-    val a = if x.alias.isEmpty then "" else s" as ${x.alias}"
-    x.calls match
-      [c] -> out.write(s"apply ${x.target}$a -> ${showExpr(c)}\n")
-      cs ->
-        out.write(s"apply ${x.target}$a ->\n")
-        for c in cs
-          out.write(s"  ${showExpr(c)}\n")
-  GroupD(x) ->
-    val t = if x.varsType.isEmpty then "" else s": ${x.varsType}"
-    out.write(s"group ${x.name}$t\n")
-    writeBlock(out, x.fields, 1)
-    for h in x.hosts
-      out.write(s"  host ${h.name} at ${showExpr(h.address)}\n")
-      writeBlock(out, h.fields, 2)
-  ConnectD(x) ->
-    out.write(s"connect ${x.target}\n")
-    writeBlock(out, x.fields, 1)
-
-private writeBlock(out: StringWriter, stmts: List[Stmt], level: int)
-  for s in stmts
-    writeStmt(out, s, level)
-
-private writeStmt(out: StringWriter, s: Stmt, level: int) = s match
-  ResourceS(r, name, _) ->
-    val bind = if name.isEmpty then "" else s"val $name = "
-    out.write(s"${pad(level)}$bind${r.kind} ${showExpr(r.title)}\n")
-    writeBlock(out, r.body, level + 1)
-  ValS(p, v, _) -> writeValue(out, s"${pad(level)}val ${showPattern(p)} = ", v, level)
-  CallS(call, after, name, _) ->
-    val bind = if name.isEmpty then "" else s"val $name = "
-    val a = if after.isEmpty then "" else s" after ${after.map(e -> showExpr(e)).mkString(", ")}"
-    out.write(s"${pad(level)}$bind${showExpr(call)}$a\n")
-  IfS(c, t, e, _) ->
-    out.write(s"${pad(level)}if ${showExpr(c)}\n")
-    writeBlock(out, t, level + 1)
-    if !e.isEmpty
-      out.write(s"${pad(level)}else\n")
-      writeBlock(out, e, level + 1)
-  ForS(p, over, body, _) ->
-    out.write(s"${pad(level)}for ${showPattern(p)} in ${showExpr(over)}\n")
-    writeBlock(out, body, level + 1)
-  MatchS(scrutinee, arms, _) ->
-    out.write(s"${pad(level)}match ${showExpr(scrutinee)}\n")
-    for a in arms
-      out.write(s"${pad(level + 1)}${showPattern(a.pattern)} ->\n")
-      writeBlock(out, a.body, level + 2)
-  AsS(user, body, _) ->
-    out.write(s"${pad(level)}as ${showExpr(user)}\n")
-    writeBlock(out, body, level + 1)
-  OnS(sources, action, _) -> out.write(s"${pad(level)}on ${sources.map(e -> showExpr(e)).mkString(", ")} -> $action\n")
-  AfterS(refs, _) -> out.write(s"${pad(level)}after ${refs.map(e -> showExpr(e)).mkString(", ")}\n")
-  FieldS(name, v, _) -> writeValue(out, s"${pad(level)}$name = ", v, level)
-
-// `head` and a value; a `match` puts its arms on the lines under it.
-private writeValue(out: StringWriter, head: string, v: Expr, level: int) = v match
-  MatchE(scrutinee, arms, _) ->
-    out.write(s"${head}match ${showExpr(scrutinee)}\n")
-    for a in arms
-      out.write(s"${pad(level + 1)}${showPattern(a.pattern)} -> ${showExpr(a.body)}\n")
-  _ -> out.write(s"$head${showExpr(v)}\n")
 
 showParams(params: List[Param]) -> string = params.map(p -> p.default match
   Some(d) -> s"${p.name}: ${showType(p.declared)} = ${showExpr(d)}"

@@ -1,44 +1,116 @@
 module dev.avinlang.fettle.cli
 
 import avin.fs
-import dev.avinlang.fettle.syntax.{Diagnostic, lex}
+import dev.avinlang.fettle.syntax.{Diagnostic, parseSource}
 import dev.avinlang.fettle.report.{render}
+import dev.avinlang.fettle.project.{Project, checkProject, filesUnder, load}
+import dev.avinlang.fettle.fmt.{format}
+import dev.avinlang.fettle.eval.{evaluate, readFacts}
+import dev.avinlang.fettle.graph.{showGraph}
 
-val usage: string = "usage: fettle check [dir]"
+val usage: string = "usage: fettle check [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [dir]"
 
 // Runs the command `args` names, answering the exit status.
 main(args: Vector[string]) -> int
   if args.isEmpty
     eprintln(usage)
     return 2
+  val rest = args.drop(1)
   args(0) match
-    "check" -> check(if args.length > 1 then args(1) else ".")
+    "check" -> check(if rest.isEmpty then "." else rest(0))
+    "fmt" -> fmt(rest)
+    "graph" -> graph(rest)
     _ ->
       eprintln(s"fettle: unknown command `${args(0)}`\n$usage")
       2
 
-// `fettle check [dir]`: every `.fettle` file in `dir`, its lexical diagnostics rendered with
-// excerpts.
-check(dir: string) -> int
-  val names: Vector[string] = fs.listDir(dir) match
-    Ok(es) -> es
-    Err(e) ->
-      eprintln(s"fettle: $e")
-      return 1
+// Renders `ds` on standard error against the project's texts, answering the number of errors.
+private report(p: Project, ds: Iterable[Diagnostic]) -> int
   var errors = 0
-  for f in names
-    if f.endsWith(".fettle")
-      errors += checkFile(if dir == "." then f else s"$dir/$f")
-  if errors > 0 then 1 else 0
+  for d in ds
+    eprint(render(d, p.textOf(d.span.file)))
+    if !d.warning then errors += 1
+  errors
 
-// The number of errors in one file, each rendered on standard error.
-private checkFile(name: string) -> int = fs.readText(name) match
+private loaded(dir: string) -> Option[Project] = load(dir) match
+  Ok(p) -> Some(p)
   Err(e) ->
     eprintln(s"fettle: $e")
-    1
-  Ok(text) ->
-    var errors = 0
-    for d in lex(name, text).diagnostics
-      eprint(render(d, text))
-      if !d.warning then errors += 1
-    errors
+    None
+
+// `fettle check [dir]`: every file of the project in `dir` checked, its diagnostics rendered with
+// excerpts. Fails when any is an error.
+check(dir: string) -> int
+  val p = loaded(dir) match
+    Some(x) -> x
+    None -> return 1
+  if report(p, checkProject(p)) > 0 then 1 else 0
+
+// `fettle fmt [--check] [files…]`: each file written in its canonical form, or with `--check` only
+// named when it is not in it. With no files, every `.fettle` file under the current directory.
+fmt(args: Vector[string]) -> int
+  val checkOnly = args.contains("--check")
+  val given = args.filter(a -> a != "--check")
+  val names: Vector[string] = if given.isEmpty then filesUnder(".", "", ".fettle").toVector else given
+  var status = 0
+  for name in names
+    val text = fs.readText(name) match
+      Ok(t) -> t
+      Err(e) ->
+        eprintln(s"fettle: $e")
+        status = 1
+        continue
+    val parsed = parseSource(name, text)
+    val errors = parsed.diagnostics.filter(d -> !d.warning)
+    if !errors.isEmpty
+      for d in errors
+        eprint(render(d, text))
+      status = 1
+      continue
+    val formatted = format(parsed.file)
+    if formatted != text
+      if checkOnly
+        println(name)
+        status = 1
+      else
+        fs.writeText(name, formatted) match
+          Ok(_) -> ()
+          Err(e) ->
+            eprintln(s"fettle: $e")
+            status = 1
+  status
+
+// `fettle graph --facts <fixture.json> --host <name> [dir]`: the project checked, then evaluated
+// for one host against the facts in a fixture, and its graph printed.
+graph(args: Vector[string]) -> int
+  var facts = ""
+  var host = ""
+  var dir = "."
+  var i = 0
+  while i < args.length
+    args(i) match
+      "--facts" if i + 1 < args.length ->
+        facts = args(i + 1)
+        i += 2
+      "--host" if i + 1 < args.length ->
+        host = args(i + 1)
+        i += 2
+      a ->
+        dir = a
+        i += 1
+  if facts.isEmpty || host.isEmpty
+    eprintln(usage)
+    return 2
+  val p = loaded(dir) match
+    Some(x) -> x
+    None -> return 1
+  if report(p, checkProject(p)) > 0 then return 1
+  val f = fs.readText(facts).mapErr(e -> s"$e").flatMap(t -> readFacts(t)) match
+    Ok(x) -> x
+    Err(e) ->
+      eprintln(s"fettle: $facts: $e")
+      return 1
+  val e = evaluate(p.files, host, f, x -> p.read(x), p.templates)
+  if report(p, e.diagnostics) > 0 then return 1
+  print(showGraph(e.graph))
+  0

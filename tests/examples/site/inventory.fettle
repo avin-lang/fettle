@@ -1,0 +1,31 @@
+// inventory.fettle
+import roles.{Site, people, timeSync, webServer}
+
+data WebVars(domain: string, workers: int = 4, canary: bool = false)
+
+connect all
+  user = "deploy"
+  become = Sudo
+  key = "~/.ssh/deploy_ed25519"
+
+group web: WebVars
+  workers = 8
+  host web1 at "10.0.0.11"
+    domain = "a.example.com"
+  host web2 at "10.0.0.12"
+    domain = "b.example.com"
+    canary = true
+  rollout = Batches(size = 1, maxFailures = 0)
+
+group db
+  host db1 at "10.0.0.21"
+    hostKey = "SHA256:Xo4kJtq1…"
+
+apply all -> people(team, departed = ["carl"])
+apply all -> timeSync(["0.pool.ntp.org", "1.pool.ntp.org"])
+apply web as h ->
+  webServer(
+    Site(h.vars.domain),
+    certificate = local("certs/${h.vars.domain}.crt"),
+    key = secret.file("~/secrets/${h.vars.domain}.key")
+  )

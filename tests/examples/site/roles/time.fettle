@@ -1,0 +1,19 @@
+// roles/time.fettle
+module roles
+
+role timeSync(servers: List[string])
+  val (unit, config) = match host.distro
+    Debian(_) | Ubuntu(_) -> ("chrony", "/etc/chrony/chrony.conf")
+    Fedora(_) | Rhel(_) -> ("chronyd", "/etc/chrony.conf")
+    Alpine(_) -> ("chronyd", "/etc/chrony/chrony.conf")
+    other -> fail "timeSync does not support ${other}"
+
+  package "chrony"
+
+  val conf = file config
+    content = lines(for s in servers yield "server ${s} iburst")
+
+  service unit
+    running = true
+    enabled = true
+    on conf -> restart

@@ -1,0 +1,26 @@
+1. group "admins"
+2. user "ana"
+     groups = ["admins"]
+     shell = /bin/bash
+     authorizedKeys = ["ssh-ed25519 AAAAC3Nz…Qk ana@laptop"]
+3. user "bo"
+     groups = []
+     shell = /bin/bash
+     authorizedKeys = ["ssh-ed25519 AAAAC3Nz…7f bo@desk", "ssh-ed25519 AAAAC3Nz…a1 bo@phone"]
+4. user "carl"
+     present = false
+5. file "/etc/sudoers.d/admins"
+     content = "%admins ALL=(ALL) NOPASSWD: ALL\n"
+     mode = 0o440
+     validate = cmd("visudo", "-cf", ${staged})
+6. package "chrony"
+7. file "/etc/chrony/chrony.conf"
+     content = "server 0.pool.ntp.org iburst\nserver 1.pool.ntp.org iburst\n"
+8. service "chronyd"
+     running = true
+     enabled = true
+edges:
+  file /etc/chrony/chrony.conf -> service chronyd: it triggers `restart`
+  group admins -> user ana: the user is in that group
+triggers:
+  file /etc/chrony/chrony.conf -> service chronyd restart

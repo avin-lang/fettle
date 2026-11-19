@@ -48,3 +48,35 @@ formattedStrings()
   assertEq(showExpr(StrE([ExprP(FieldE(nm("tls"), "path", sp(1))), TextP("/"), ExprP(nm("d"))], false, sp(1))), "\"${tls.path}/${d}\"")
   assertEq(showExpr(StrE([TextP("$")], false, sp(1))), "\"$\"")
   assertEq(showExpr(ModeE(0, sp(1))), "0o0")
+
+@test("comments are kept, on their own lines and at the ends of lines, at the level of what follows")
+formattedComments()
+  val text = src(["// a file", "module roles", "", "// a role", "role r()", "  // first", "  package \"a\" // the editor", "", "  // second", "  package \"b\"", "// at the end"])
+  assertEq(reformat(text), text)
+  assertEq(reformat(src(["role r()", "  package \"a\"", "    // under", "  package \"b\""])), src(["role r()", "  package \"a\"", "  // under", "  package \"b\""]))
+
+@test("blank lines: one where the source had any inside a block, one between declarations")
+formattedBlankLines()
+  assertEq(reformat(src(["role r()", "  package \"a\"", "", "", "", "  package \"b\"", "  package \"c\""])), src(["role r()", "  package \"a\"", "", "  package \"b\"", "  package \"c\""]))
+  assertEq(reformat(src(["val a = 1", "role r()", "  package \"a\"", "val b = 2", "val c = 3"])), src(["val a = 1", "", "role r()", "  package \"a\"", "", "val b = 2", "val c = 3"]))
+  assertEq(reformat(src(["apply all -> a()", "apply all -> b()", "val c = 1"])), src(["apply all -> a()", "apply all -> b()", "", "val c = 1"]))
+
+@test("a line over 100 characters breaks at its call, list or map, one item a line")
+formattedLongLines()
+  val list = "val team = [Person(\"ana\", [\"ssh-ed25519 AAAA ana@laptop\"], admin = true), Person(\"bo\", [\"ssh-ed25519 BBBB bo@desk\"])]\n"
+  assertEq(reformat(list), src(["val team = [", "  Person(\"ana\", [\"ssh-ed25519 AAAA ana@laptop\"], admin = true),", "  Person(\"bo\", [\"ssh-ed25519 BBBB bo@desk\"]),", "]"]))
+  val call = "apply web as h -> webServer(Site(h.vars.domain), certificate = local(\"certs/${h.vars.domain}.crt\"), key = secret.file(\"~/secrets/${h.vars.domain}.key\"))\n"
+  assertEq(reformat(call), src(["apply web as h ->", "  webServer(", "    Site(h.vars.domain),", "    certificate = local(\"certs/${h.vars.domain}.crt\"),", "    key = secret.file(\"~/secrets/${h.vars.domain}.key\")", "  )"]))
+  val fitsBelow = "apply web as h -> webServer(Site(h.vars.domain), certificate = local(\"certs/${h.vars.domain}.crt\"), k = 1)\n"
+  assertEq(reformat(fitsBelow), src(["apply web as h ->", "  webServer(Site(h.vars.domain), certificate = local(\"certs/${h.vars.domain}.crt\"), k = 1)"]))
+  val map = "val m = { \"aaaaaaaaaaaaaaaaaaaa\": 1, \"bbbbbbbbbbbbbbbbbbbbbbbbbbbb\": 2, \"cccccccccccccccccccccccccc\": 3, \"d\": 4 }\n"
+  assertEq(reformat(map), src(["val m = {", "  \"aaaaaaaaaaaaaaaaaaaa\": 1,", "  \"bbbbbbbbbbbbbbbbbbbbbbbbbbbb\": 2,", "  \"cccccccccccccccccccccccccc\": 3,", "  \"d\": 4,", "}"]))
+  val exact = s"val x = \"${"a".repeat(89)}\"\n"
+  assertEq(reformat(exact), exact)
+  for t in [list, call, map]
+    assertEq(reformat(reformat(t)), reformat(t))
+
+@test("settings and hosts of a group stay in the order written")
+formattedGroupOrder()
+  val text = src(["group web", "  workers = 8", "  host web1 at \"10.0.0.1\"", "    domain = \"a\"", "  rollout = AllAtOnce"])
+  assertEq(reformat(text), text)
