@@ -31,6 +31,21 @@ edgeOrderingTies()
 triggerOnUndeclared()
   assertEq(errorsIn(["role r()", "  service \"s\"", "    on conf -> restart"]), "main.fettle:3:8 E0201 there is no value `conf`")
 
+// A module `roles` whose declarations name its own types, used from the root module.
+val rolesLib: string = src(["module roles", "", "data Person(name: string)", "", "data Team(lead: Person, members: List[Person])", "", "lead(t: Team) -> Person = t.lead", "", "role people(members: List[Person])", "  for p in members", "    user p.name"])
+
+@test("a declaration of one module reached from another resolves its types where it is written")
+crossModuleScopes()
+  val team = src(["import roles.{Person}", "", "val team = [Person(\"ana\")]"])
+  val main = src(["import roles.{Person, Team, lead, people}", "", "group all1", "  host h at \"10.0.0.1\"", "", "apply all -> people(team)", "apply all -> people([lead(Team(Person(\"bo\"), team))])"])
+  // `main.fettle` is checked before `team.fettle`, and reaches `team` first.
+  assertEq(projectDiags([("roles/lib.fettle", rolesLib), ("main.fettle", main), ("team.fettle", team)]), "")
+  // A file that imports a name only another file's value uses is still told it does not use it.
+  val unused = src(["import roles.{Person}", "", "val n = 1"])
+  assertEq(projectDiags([("roles/lib.fettle", rolesLib), ("a.fettle", unused)]), "a.fettle:1:15 W0217 `Person` is imported and never used")
+  // A type a file does not import is still unknown there.
+  assertEq(projectDiags([("roles/lib.fettle", rolesLib), ("a.fettle", src(["data X(p: Person)"]))]), "a.fettle:1:11 E0201 there is no type `Person`")
+
 @test("a secret reaches a command only on standard input")
 secretIntoCommand()
   assertEq(errorsIn(["role r(k: secret)", "  command \"c\"", "    run = sh\"login ${k}\"", "    always = true"]), "main.fettle:3:22 E0209 a secret cannot be in a command's argument list")
