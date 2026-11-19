@@ -29,6 +29,5 @@ avin run . -- check tests/examples/site
 avin run . -- graph --facts tests/fixtures/debian12.json --host web1 tests/examples/site
 ```
 
-fettle depends on [avin-lang/parsing](https://github.com/avin-lang/parsing) by path
-(`../parsing`), for its parsing of token streams; the dependency becomes a git and version one when
-parsing 0.6.0 is released.
+fettle depends on [avin-lang/parsing](https://github.com/avin-lang/parsing) 0.6.0 for its parsing
+of token streams.

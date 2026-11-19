@@ -2,5 +2,5 @@ package { name = "fettle", version = "0.0.1", description = "Agentless configura
 
 dependencies {
   json { git = "github.com/avin-lang/json", version = "0.0.2" }
-  parsing { path = "../parsing" }
+  parsing { git = "github.com/avin-lang/parsing", version = "0.6.0" }
 }
