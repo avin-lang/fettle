@@ -1,6 +1,6 @@
-package { name = "fettle", version = "0.0.1", description = "Agentless configuration management with its own typed, total language", avin = "0.0.34" }
+package { name = "fettle", version = "0.0.1", description = "Agentless configuration management with its own typed, total language", avin = "0.0.35" }
 
 dependencies {
-  json { git = "github.com/avin-lang/json", version = "0.0.2" }
+  json { git = "github.com/avin-lang/json", version = "0.0.3" }
   parsing { git = "github.com/avin-lang/parsing", version = "0.6.0" }
 }
