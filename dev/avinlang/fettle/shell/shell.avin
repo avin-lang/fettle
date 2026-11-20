@@ -44,6 +44,56 @@ quote(word: string) -> Result[string, string]
   if word.nonEmpty && word.forall(c -> plain(c)) then return Ok(word)
   Ok(s"'${word.replace("'", "'\\''")}'")
 
+// Where a position in shell text stands: outside any quotes, inside `'…'`, inside `"…"`, or right
+// after a backslash that escapes the next character (outside quotes, or inside `"…"`).
+data ShellContext
+  Bare
+  InSingle
+  InDouble
+  EscapedBare
+  EscapedDouble
+
+// The context at the end of `text`, which begins in `from` (an escaped context begins as its quote
+// state). A backslash escapes the next character outside quotes and inside `"…"`, never inside `'…'`.
+// Command substitutions and comments in the text are not tracked.
+contextAfter(from: ShellContext, text: string) -> ShellContext
+  var inSingle = from == InSingle
+  var inDouble = from == InDouble || from == EscapedDouble
+  var escaped = false
+  for c in text.charIterator()
+    if escaped
+      escaped = false
+    else if inSingle
+      if c == '\'' then inSingle = false
+    else if c == '\\'
+      escaped = true
+    else if inDouble
+      if c == '"' then inDouble = false
+    else if c == '\''
+      inSingle = true
+    else if c == '"'
+      inDouble = true
+  if inSingle then return InSingle
+  if inDouble then return if escaped then EscapedDouble else InDouble
+  if escaped then EscapedBare else Bare
+
+// `word` as an interpolation into shell text standing in `context`: one quoted word outside quotes
+// (as `quote` gives it), and inside `"…"` the word with a backslash put before each `"`, `\`, `$` and
+// backtick, so it lands verbatim. Where no quoting can make it land exactly (inside `'…'`, or after
+// a backslash) it is an error. A NUL is refused.
+quoteIn(word: string, context: ShellContext) -> Result[string, string]
+  context match
+    Bare -> quote(word)
+    InDouble ->
+      if holdsNul(word) then return Err(nulError(s"the word ${quoteShown(word)}"))
+      val out = StringWriter()
+      for c in word.charIterator()
+        if c == '"' || c == '\\' || c == '$' || c == '`' then out.writeChar('\\')
+        out.writeChar(c)
+      Ok(out.text)
+    InSingle -> Err("an interpolation inside single quotes cannot be quoted")
+    _ -> Err("an interpolation straight after a backslash cannot be quoted")
+
 // A word for an error message, its NULs shown as `\0`.
 private quoteShown(word: string) -> string = s"`${word.replace("\u{0}", "\\0")}`"
 

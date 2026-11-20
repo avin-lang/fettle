@@ -1027,9 +1027,14 @@ user.
     any other word, the empty one included, goes in single quotes with each `'` written `'\''`.
     `=` and `~` are not plain, so a quoted first word is never an assignment or a home directory.
     A NUL is refused: by `render` for a command, and as `E0320` for an `sh"…"` interpolation, each
-    of which is quoted as one word as 3.2 says (it had been pasted in unquoted). An interpolation
-    inside the text's own double quotes is quoted too, so `"${x}"` keeps the single quotes; write
-    `${x}` bare. Review with the user.
+    of which is quoted as one word as 3.2 says (it had been pasted in unquoted). The quoting of an
+    `sh"…"` interpolation follows the shell quoting of the literal text before it (outside quotes,
+    inside `'…'`, inside `"…"`, a backslash escaping outside single quotes): outside quotes it is one
+    word as above; inside `"…"` the value gets a backslash before each `"`, `\`, `$` and backtick and
+    lands verbatim, so `sh"echo \"hello ${name}\""` is right; inside `'…'`, or straight after a
+    backslash, no quoting can land it exactly, and the checker refuses it as `E0244`, at the
+    interpolation. Command substitutions and comments in the literal text are not tracked. Review
+    with the user.
 28. **One probe script, many commands**: each command runs in a subshell with standard input from
     `/dev/null` (shell text through `/bin/sh -c`, so a syntax error fails only that command), its
     output and error output go to files in a `mktemp -d` scratch directory, and the script prints a

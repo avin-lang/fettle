@@ -2,7 +2,7 @@ module dev.avinlang.fettle.eval
 
 import avin.collections.mutable.{Map as Table}
 import dev.avinlang.fettle.facts.{Facts}
-import dev.avinlang.fettle.shell.{quote}
+import dev.avinlang.fettle.shell.{Bare, contextAfter, quoteIn}
 import dev.avinlang.fettle.check.{Names, Unopened, Unreadable, VaultNames, builtinData, templatePath, vaultPath}
 import dev.avinlang.fettle.kinds.{KindSpec, PathT, kindNamed}
 import dev.avinlang.fettle.graph.{After, BoolV, CommandV, DurationV, Graph, GraphBuilder, GroupV, IntV, ListV, MapV, ModeV, Node, NoneV, PathV, RecordV, RefV, Reference, ResourceId, SecretV, SetV, SizeV, StrV, Value, VariantV}
@@ -398,14 +398,18 @@ class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[s
         ExprP(x) -> out.write(text(expr(x, env)))
     out.text
 
-  // The text of an `sh"…"` form: its literal text as shell, each interpolation quoted as one word. A
-  // value holding a NUL, which no shell word can carry, is an error.
+  // The text of an `sh"…"` form: its literal text as shell, each interpolation quoted for the shell
+  // quoting it stands in (one word outside quotes, escaped inside double quotes). A value holding a
+  // NUL, which no shell word can carry, is an error.
   private shellText(parts: List[StrPart], env: List[(string, Value)], s: Span) -> string
     val out = StringWriter()
+    var context = Bare
     for p in parts
       p match
-        TextP(t) -> out.write(t)
-        ExprP(x) -> quote(text(expr(x, env))) match
+        TextP(t) ->
+          out.write(t)
+          context = contextAfter(context, t)
+        ExprP(x) -> quoteIn(text(expr(x, env)), context) match
           Ok(w) -> out.write(w)
           Err(e) ->
             error("E0320", e, x.extent, "not a shell word")

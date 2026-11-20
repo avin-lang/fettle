@@ -3,6 +3,7 @@ module dev.avinlang.fettle.check
 import avin.collections.mutable.{Map as Table}
 import dev.avinlang.fettle.kinds.{KindSpec, builtinKinds, kindNamed}
 import dev.avinlang.fettle.fmt.{showExpr}
+import dev.avinlang.fettle.shell.{Bare, EscapedBare, EscapedDouble, InDouble, InSingle, contextAfter}
 import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, FnDecl, GroupDecl, HostDecl, RoleDecl, ValDecl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldS, FnD, ForE, ForS, GroupD, IfE, IfS, Import, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NamedT, NoneE, OnS, OptionalT, Param, Pattern, ResourceDecl, ResourceS, RoleD, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, Template, TextP, TupleE, TupleP, TypeExpr, UnaryE, ValD, ValS, Variant, VariantP, WildP, WithE}
 
 // The checker: every file of a project checked together, every mistake reported with its span, and
@@ -721,6 +722,7 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool, val tem
     ShE(parts, _) ->
       // Each interpolation of shell text is a word of the command's arguments.
       interpolations(parts, env, true)
+      shellQuoting(parts)
       CommandTy
     NameE(n, s) -> name(n, s, env)
     FieldE(target, field, s) -> fieldOf(target, field, s, env)
@@ -812,6 +814,20 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool, val tem
       d = s"${n % 8}$d"
       n = n / 8
     d
+
+  // Refuses an interpolation of shell text that stands where no quoting can make its value land
+  // exactly: inside single quotes, or straight after a backslash.
+  private shellQuoting(parts: List[StrPart])
+    var context = Bare
+    for p in parts
+      p match
+        TextP(t) -> context = contextAfter(context, t)
+        ExprP(x) ->
+          if context == InSingle
+            error("E0244", "an interpolation cannot stand inside single quotes in shell text, where no escaping is possible", x.extent, "inside '…'", "close the single quotes before it and open them after, or interpolate it outside any quotes or inside double quotes")
+          else if context == EscapedBare || context == EscapedDouble
+            error("E0244", "an interpolation cannot follow a backslash in shell text, where the backslash would escape its quoting", x.extent, "after `\\`", "remove the backslash, or put the interpolation inside double quotes")
+          context = if context == EscapedDouble then InDouble else if context == EscapedBare then Bare else context
 
   // The text of a string with no interpolation in it.
   private literalText(parts: List[StrPart]) -> Option[string] = parts match

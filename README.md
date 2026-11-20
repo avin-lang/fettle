@@ -27,7 +27,7 @@ fettle vault create|edit|view|encrypt|decrypt|rekey [<vault options>] <file>
 The modules under the front end:
 
 - `shell`: `Command` (a program and its argument words, or `sh"…"` shell text), exact POSIX
-  quoting, and the probe script that runs many commands in one round trip with its output parser.
+  quoting (context-aware for `sh"…"` interpolations), and the probe script that runs many commands in one round trip with its output parser.
 - `facts`: the read-only facts script (`uname`, `id`, `/etc/os-release`), its parser into `Facts`,
   and the JSON form fixtures use.
 - `transport`: the `Transport` trait (run a script with bytes on its standard input, close) and
