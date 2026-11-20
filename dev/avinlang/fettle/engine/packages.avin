@@ -351,9 +351,6 @@ aptSourcesLines(r: AptRepo, keyFile: string) -> Vector[string]
   out += s"Signed-By: $keyFile"
   out.toVector
 
-// The first twelve digits of a SHA-256, as the plan shows one.
-private shortHash(h: string) -> string = if h.byteLength > 12 then h.slice(0, 12) else h
-
 // Whether the repository `node` is declared present (the default).
 private wantsRepo(node: Node) -> bool = node.field("present") match
   Some(BoolV(b)) -> b

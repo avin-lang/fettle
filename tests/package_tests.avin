@@ -3,7 +3,7 @@ module tests
 import avin.fs
 
 import dev.avinlang.fettle.engine.{
-  Apk, Apt, Context, Create, Delta, Dnf, InSync, Modify, Op, PackageProvider, PackageState, Remove, Step, apkProbe,
+  Apk, Apt, Context, Create, Delta, Dnf, InSync, Modify, Op, PackageProvider, PackageState, Remove, Run, Step, apkProbe,
   aptProbe, dnfProbe, managerFor, packageState, readProbed, validPackageName, validVersion
 }
 
@@ -24,15 +24,16 @@ opMark(op: Op) -> string = op match
   Modify -> "~"
   Remove -> "-"
   InSync -> "="
+  Run(always) -> if always then "!" else ">"
 
 // What `n` needs on the host of `fixture` whose package probe printed `text`, as `<mark> <summary>`.
 needs(n: Node, fixture: string, text: string) -> string =
-  PackageProvider().delta(n, printed(text), contextOn(fixture, graphOf([n]))) match
+  PackageProvider().delta(n, stubbed(text), contextOn(fixture, graphOf([n]))) match
     Ok(d) -> s"${opMark(d.op)} ${d.summary}".trim
     Err(e) -> s"error: $e"
 
 // The delta of `n` on `fixture` for the probe text `text`; an error fails the test.
-deltaFor(n: Node, ctx: Context, text: string) -> Delta = PackageProvider().delta(n, printed(text), ctx) match
+deltaFor(n: Node, ctx: Context, text: string) -> Delta = PackageProvider().delta(n, stubbed(text), ctx) match
   Ok(d) -> d
   Err(e) -> fail(s"no delta: $e")
 

@@ -249,4 +249,4 @@ contextOn(fixture: string, g: Graph) -> Context
   c
 
 // One successful probe output printing `text`.
-printed(text: string) -> Vector[Output] = [Output(0, text, "")]
+stubbed(text: string) -> Vector[Output] = [Output(0, text, "")]

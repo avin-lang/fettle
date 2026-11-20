@@ -28,7 +28,7 @@ exampleInventory()
   assertEq(web1.become, Sudo)
   val db1 = reachOf(p.files, "db1").ok.get
   assertEq(db1.target.hostKey, Some("SHA256:Xo4kJtq1…"))
-  assertEq(unitOf(reachOf(p.files, "nowhere")), Err("no group of the inventory holds a host `nowhere`"))
+  assertEq(reachUnit(reachOf(p.files, "nowhere")), Err("no group of the inventory holds a host `nowhere`"))
 
 @test(
   "settings: connect all, then the group's connect, the host's connect, the group, the host, each over the one before"
@@ -60,7 +60,7 @@ becomeSettings()
     Ok(SudoPassword("s3cret"))
   )
   assertEq(
-    unitOf(
+    reachUnit(
       reached(base + "SudoPassword(secret.env(\"FETTLE_TEST_UNSET_VARIABLE\"))\n", "h")
     ).mapErr(e -> e.contains("not set")),
     Err(true)
@@ -82,13 +82,13 @@ connectionSecrets()
 
 @test("a port outside 1 to 65535 and an empty address are refused")
 badSettings()
-  assertEq(unitOf(reached("group g\n  host h at \"x\"\n    port = 0\n", "h")), Err("host `h`: there is no TCP port 0"))
+  assertEq(reachUnit(reached("group g\n  host h at \"x\"\n    port = 0\n", "h")), Err("host `h`: there is no TCP port 0"))
   assertEq(
-    unitOf(reached("group g\n  host h at \"x\"\n    port = 65536\n", "h")),
+    reachUnit(reached("group g\n  host h at \"x\"\n    port = 65536\n", "h")),
     Err("host `h`: there is no TCP port 65536")
   )
   assertEq(reached("group g\n  host h at \"x\"\n    port = 65535\n", "h").map(r -> r.target.port), Ok(Some(65535)))
-  assertEq(unitOf(reached("group g\n  host h at \"\"\n", "h")), Err("the address of host `h` is not a host name"))
+  assertEq(reachUnit(reached("group g\n  host h at \"\"\n", "h")), Err("the address of host `h` is not a host name"))
 
 @test("a host named ad hoc: [user@]host[:port], [address]:port for IPv6")
 adHocTargets()
@@ -121,6 +121,6 @@ adHocTargets()
 targetText(t: SshTarget) -> string =
   s"${t.user}@${t.host}:${t.port} keys=${t.keys} password=${t.password.isDefined} hostKey=${t.hostKey} knownHosts=${t.knownHosts} acceptNew=${t.acceptNew}"
 
-unitOf(r: Result[Reach, string]) -> Result[unit, string] = r.map(_ -> ())
+reachUnit(r: Result[Reach, string]) -> Result[unit, string] = r.map(_ -> ())
 
 shownTarget(r: Result[SshTarget, string]) -> Result[string, string] = r.map(t -> targetText(t))

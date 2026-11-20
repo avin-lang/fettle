@@ -106,7 +106,7 @@ private strings(node: Node, name: string) -> Result[Option[Vector[string]], stri
   Some(other) -> Err(s"`$name` is a list of strings, not `${other.shown}`")
 
 // Whether the boolean field `name` of `node` is set true.
-private flag(node: Node, name: string) -> bool = node.field(name) == Some(BoolV(true))
+private isTrue(node: Node, name: string) -> bool = node.field(name) == Some(BoolV(true))
 
 // Names as the plan lists them: `a, b`.
 private listed(items: Vector[string]) -> string = items.mkString(", ")
@@ -145,7 +145,7 @@ class GroupProvider(): Provider
         _ = accountToolsOf(p)?
         val words = Buffer[string]()
         gid.foreach(g -> words += s"gid $g")
-        if flag(node, "system") then words += "system"
+        if isTrue(node, "system") then words += "system"
         Ok(Delta(Create, words.mkString(", "), [], None, p))
       Some(g) -> gid match
         Some(wanted) if wanted != g.gid ->
@@ -163,7 +163,7 @@ class GroupProvider(): Provider
       Create ->
         val words = Buffer[string]()
         words += if busybox then "addgroup" else "groupadd"
-        if flag(node, "system") then words += if busybox then "-S" else "-r"
+        if isTrue(node, "system") then words += if busybox then "-S" else "-r"
         gid.foreach(g -> words ++= ["-g", s"$g"])
         words += n
         words.mkString(" ")
@@ -280,7 +280,7 @@ private wantedUser(node: Node, ctx: Context, reveal: bool) -> Result[WantedUser,
       groups,
       text(node, "shell"),
       text(node, "home"),
-      flag(node, "system"),
+      isTrue(node, "system"),
       keys,
       password,
       secret

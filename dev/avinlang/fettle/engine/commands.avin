@@ -93,7 +93,7 @@ class CommandProvider(): Provider
     val g = guardsOf(node, ctx)?
     val none = Probed([], None)
     if g.none
-      if flag(node, "always") then return Ok(Delta(Run(true), "runs every time", [], None, none))
+      if isTrue(node, "always") then return Ok(Delta(Run(true), "runs every time", [], None, none))
       return Ok(Delta(InSync, "", [], None, none))
     if outputs.length != g.probes.length then return Err("the guards gave no output")
     var at = 0

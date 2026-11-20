@@ -17,9 +17,6 @@ import dev.avinlang.fettle.fmt.{format}
 // An ASCII-armored key, as Caddy's `gpg.key` begins.
 val armoredKey: string = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmQINBGSm1x0BEAC8test\n-----END PGP PUBLIC KEY BLOCK-----\n"
 
-// The SHA-256 of `text`, in lowercase hexadecimal.
-sha(text: string) -> string = encoding.toHex(crypto.sha256(text.utf8.toVector))
-
 // Caddy's repository, its key at `key` pinned to `pin`, with `more` fields.
 caddyRepo(key: string, pin: string, more: List[(string, Value)] = []) -> Node
   val fields: List[(string, Value)] = [

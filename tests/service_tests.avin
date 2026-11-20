@@ -24,14 +24,14 @@ val upAndOn: List[(string, Value)] = [("running", BoolV(true)), ("enabled", Bool
 // What `n` needs on `fixture` when its probe printed `text`, as `<mark> <summary>`.
 svcNeeds(n: Node, fixture: string, text: string) -> string = svcNeedsIn(n, contextOn(fixture, graphOf([n])), text)
 
-svcNeedsIn(n: Node, ctx: Context, text: string) -> string = ServiceProvider().delta(n, printed(text), ctx) match
+svcNeedsIn(n: Node, ctx: Context, text: string) -> string = ServiceProvider().delta(n, stubbed(text), ctx) match
   Ok(d) -> s"${opMark(d.op)} ${d.summary}".trim
   Err(e) -> s"error: $e"
 
 // The command lines of the steps that bring `n` from the state `text` describes on `fixture`.
 svcSteps(n: Node, fixture: string, text: string) -> string
   val ctx = contextOn(fixture, graphOf([n]))
-  ServiceProvider().delta(n, printed(text), ctx) match
+  ServiceProvider().delta(n, stubbed(text), ctx) match
     Ok(d) -> ServiceProvider().steps(n, d, ctx) match
       Ok(s) -> s.map(x -> x.shown).mkString("\n")
       Err(e) -> s"error: $e"
