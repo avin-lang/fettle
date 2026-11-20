@@ -1,0 +1,107 @@
+module dev.avinlang.fettle.vault
+
+import avin.c.{ByteBlock}
+
+// libsodium, bound directly: Argon2id derives a key from a passphrase and a salt, XChaCha20-Poly1305
+// IETF seals text under that key with a nonce and associated data and opens it again, and libsodium's
+// random source makes the salts and nonces. Keys and plaintext live in `ByteBlock`s, outside the
+// collected heap, so they are wiped where they are rather than left in copies.
+
+@c("int sodium_init(void)")
+private sodiumInit() -> int
+
+@c(
+  "int crypto_pwhash(unsigned char *out, length(out) unsigned long long outlen, const char *passwd, length(passwd) unsigned long long passwdlen, const unsigned char *salt, unsigned long long opslimit, size_t memlimit, int alg)"
+)
+private pwhash(out: ByteBlock, passwd: ByteBlock, salt: ByteBlock, opslimit: long, memlimit: long, alg: int) -> int
+
+@c(
+  "int crypto_aead_xchacha20poly1305_ietf_encrypt(unsigned char *c, null unsigned long long *clen_p, const unsigned char *m, length(m) unsigned long long mlen, const unsigned char *ad, length(ad) unsigned long long adlen, null const unsigned char *nsec, const unsigned char *npub, const unsigned char *k)"
+)
+private aeadEncrypt(c: ByteBlock, m: ByteBlock, ad: Array[byte], npub: ByteBlock, k: ByteBlock) -> int
+
+@c(
+  "int crypto_aead_xchacha20poly1305_ietf_decrypt(unsigned char *m, null unsigned long long *mlen_p, null unsigned char *nsec, const unsigned char *c, length(c) unsigned long long clen, const unsigned char *ad, length(ad) unsigned long long adlen, const unsigned char *npub, const unsigned char *k)"
+)
+private aeadDecrypt(m: ByteBlock, c: Array[byte], ad: Array[byte], npub: ByteBlock, k: ByteBlock) -> int
+
+@c("void randombytes_buf(void *buf, length(buf) size_t size)")
+private randomInto(buf: ByteBlock)
+
+@c("void sodium_memzero(void *pnt, length(pnt) size_t len)")
+private memzero(pnt: ByteBlock)
+
+@c(const: "crypto_pwhash_ALG_ARGON2ID13")
+private val argon2id13: int
+
+@c(const: "crypto_pwhash_SALTBYTES")
+val saltBytes: int
+
+@c(const: "crypto_aead_xchacha20poly1305_ietf_NPUBBYTES")
+val nonceBytes: int
+
+@c(const: "crypto_aead_xchacha20poly1305_ietf_KEYBYTES")
+val keyBytes: int
+
+@c(const: "crypto_aead_xchacha20poly1305_ietf_ABYTES")
+val tagBytes: int
+
+@c(const: "crypto_pwhash_OPSLIMIT_MODERATE")
+val opsModerate: long
+
+@c(const: "crypto_pwhash_MEMLIMIT_MODERATE")
+val memModerate: long
+
+@c(const: "crypto_pwhash_OPSLIMIT_MIN")
+val opsMin: long
+
+@c(const: "crypto_pwhash_MEMLIMIT_MIN")
+val memMin: long
+
+// libsodium made ready; it answers whether it is. Calling it again does nothing.
+private ready() -> bool = sodiumInit() >= 0
+
+// A block holding a copy of `bytes`.
+blockOf(bytes: Array[byte]) -> ByteBlock
+  val b = ByteBlock(bytes.length)
+  if bytes.length > 0 then b.write(0, bytes)
+  b
+
+// `n` bytes from libsodium's random source.
+randomBlock(n: int) -> ByteBlock
+  val b = ByteBlock(n)
+  if !ready() then fail("libsodium could not be initialised")
+  if n > 0 then randomInto(b)
+  b
+
+// Overwrites every byte of `b` with zero, in a way the C compiler does not remove.
+wipe(b: ByteBlock)
+  if b.length > 0 then memzero(b)
+
+// The `keyBytes`-byte key Argon2id derives from `passphrase` and `salt` with `ops` passes over `mem`
+// bytes of memory; `None` where libsodium cannot, for want of memory.
+deriveKey(passphrase: ByteBlock, salt: ByteBlock, ops: long, mem: long) -> Option[ByteBlock]
+  if !ready() then return None
+  val key = ByteBlock(keyBytes)
+  if pwhash(key, passphrase, salt, ops, mem, argon2id13) != 0
+    wipe(key)
+    return None
+  Some(key)
+
+// `plain` sealed under `key` with `nonce`, `ad` bound to it unencrypted: the ciphertext followed by
+// the `tagBytes`-byte tag.
+aeadSeal(plain: ByteBlock, ad: Array[byte], nonce: ByteBlock, key: ByteBlock) -> Array[byte]
+  if !ready() then fail("libsodium could not be initialised")
+  val c = ByteBlock(plain.length + tagBytes)
+  if aeadEncrypt(c, plain, ad, nonce, key) != 0 then fail("libsodium could not seal the text")
+  c.copy()
+
+// The plaintext `sealed` holds, opened with `key`, `nonce` and `ad`; `None` where the tag does not
+// verify: another key, another nonce, other associated data, or a changed byte.
+aeadOpen(sealed: Array[byte], ad: Array[byte], nonce: ByteBlock, key: ByteBlock) -> Option[ByteBlock]
+  if !ready() || sealed.length < tagBytes then return None
+  val m = ByteBlock(sealed.length - tagBytes)
+  if aeadDecrypt(m, sealed, ad, nonce, key) != 0
+    wipe(m)
+    return None
+  Some(m)

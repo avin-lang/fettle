@@ -896,6 +896,37 @@ the user.
     hardens sshd (no passwords, no root login, validated with `sshd -t` and reloaded), enables the
     firewall with `ufw` through guarded `command`s, turns on unattended upgrades, and runs Caddy
     serving a site. It ships in `examples/vps` and is run end to end against the test containers.
+19. **The vault's details**, settling what 16 leaves open:
+    - **The body** is base64 of the 16-byte salt, the 24-byte nonce, then the ciphertext and its
+      16-byte tag. The associated data is the header line without its line end. A header's limits
+      must lie within 1–16 passes and 8 KiB–4 GiB, checked before any key is derived, so a changed
+      header cannot make opening take minutes or exhaust memory; new vaults use libsodium's moderate
+      limits (3 passes, 256 MiB). Reading accepts CRLF line ends.
+    - **The plaintext** allows `//` comments and blank lines, kept as written since the text is sealed
+      as it is; a line is not indented, and a string holds no `${…}` (`\$` writes a dollar). Its errors
+      are `E05xx` (`E0501` a line that is no secret, `E0502` a name given twice, `E0503` an
+      interpolation); `secret.vault`'s are `E0250`–`E0253` in the checker and `E0320`–`E0321` in
+      evaluation.
+    - **Passphrase sources:** a file's or a command's text loses one line end; the command runs under
+      `/bin/sh -c`; a source that fails or gives an empty passphrase is an error, never a fall to the
+      next source. `rekey` takes the new passphrase from `--new-vault-password-file`, otherwise
+      prompts twice; `encrypt` confirms a typed passphrase as `create` does.
+    - **`check` never prompts**: it checks a vault's names only with a file, a command or
+      `FETTLE_VAULT_PASSWORD`, and otherwise leaves them to the run that opens the vault. `graph` (and
+      later `plan`) asks, once a run, and only when the program names a vault; each vault is opened
+      once.
+    - **Commands:** `encrypt` and `decrypt` work in place; `encrypt` refuses a file that is already a
+      vault or whose secrets do not read. Every write goes to `<file>.fettle-new` and is renamed over
+      the file. The editor is run as `/bin/sh -c '<editor> "$1"'`, so `$EDITOR` may carry arguments
+      (`code --wait`), on `<name>.txt`; an editor that fails saves nothing, and text left unchanged
+      leaves the file unchanged rather than resealing it. `create` refuses an existing file; an empty
+      vault is a vault.
+    - **A secret's bytes never enter the graph:** `secret.vault` evaluates to a secret recording its
+      vault and name, and the bytes are read where a host needs them. Keys and passphrases live in
+      `ByteBlock`s outside the collected heap and are wiped with `sodium_memzero`; plaintext that
+      passes through Avin strings cannot be wiped.
+
+    Review with the user.
 
 ### Decided during phase 1a
 
