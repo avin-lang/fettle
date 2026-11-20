@@ -1,0 +1,113 @@
+module dev.avinlang.fettle.vault
+
+import dev.avinlang.fettle.syntax.{
+  Chunk, Dedent, Diagnostic, EndOfFile, Hole, Indent, Newline, Piece, Span, StringLit, Symbol, Token, Word, escaped, lex
+}
+
+// A vault's plaintext: one secret a line, `name = "text"` or `name = """…"""`, in Fettle's own string
+// syntax, read by Fettle's own lexer. Comments and blank lines are allowed and kept, since the
+// plaintext is sealed as it was written.
+
+// One secret: its name, its text, and where its line is.
+data Entry(name: string, value: string, span: Span)
+
+// What reading a plaintext gave: the secrets that could be read, in order, and every mistake.
+data Plain(entries: Vector[Entry], diagnostics: Vector[Diagnostic])
+
+impl Plain
+  // The names of the secrets, in order.
+  names -> Vector[string] = entries.map(e -> e.name)
+
+  // The text of the secret `name`.
+  get(name: string) -> Option[string] = entries.find(e -> e.name == name).map(e -> e.value)
+
+// The line that holds the secret `name` with the text `value`, ended by a line end.
+plainLine(name: string, value: string) -> string = s"$name = \"${escaped(value)}\"\n"
+
+// The text of a string's pieces, where it has no `${…}`.
+private textOf(parts: List[Piece]) -> Option[string]
+  val out = Buffer[string]()
+  for p in parts
+    p match
+      Chunk(t, _) -> out += t
+      Hole(_, _) -> return None
+  Some(out.toVector.mkString(""))
+
+private tokenAt(tokens: Vector[Token], i: int) -> Option[Token] = if i < tokens.length then Some(tokens(i)) else None
+
+private isLineEnd(t: Token) -> bool = t match
+  Newline(_) | EndOfFile(_) -> true
+  _ -> false
+
+// Reads the plaintext `text` of the vault `file`. A line that is not `name = "text"`, a string with an
+// interpolation, and a name given twice are errors at their place; reading carries on at the next
+// line.
+readPlain(file: string, text: string) -> Plain
+  val lexed = lex(file, text)
+  val diagnostics = Buffer[Diagnostic]()
+  diagnostics ++= lexed.diagnostics
+  val entries = Buffer[Entry]()
+  val tokens = lexed.tokens
+  var i = 0
+  while i < tokens.length
+    val t = tokens(i)
+    t match
+      EndOfFile(_) -> return Plain(entries.toVector, diagnostics.toVector)
+      Newline(_) | Dedent(_) ->
+        i += 1
+        continue
+      Indent(s) ->
+        diagnostics += Diagnostic(
+          "E0501",
+          "a vault's line is not indented",
+          s,
+          "indented",
+          [],
+          "write each secret at the start of its line"
+        )
+        i += 1
+        continue
+      _ -> ()
+    val line: Option[Entry] = (t, tokenAt(tokens, i + 1), tokenAt(tokens, i + 2), tokenAt(tokens, i + 3)) match
+      (Word(name, ns), Some(Symbol("=", _)), Some(StringLit(parts, _, vs)), Some(e)) if isLineEnd(e) ->
+        textOf(parts) match
+          Some(v) -> Some(Entry(name, v, Span(file, ns.start, vs.end)))
+          None ->
+            diagnostics += Diagnostic(
+              "E0503",
+              "a vault's secret is text, with no `${…}` in it",
+              vs,
+              "an interpolation",
+              [],
+              "write `\\$` for a `$` that is text"
+            )
+            None
+      _ ->
+        diagnostics += Diagnostic(
+          "E0501",
+          "a vault's line is `name = \"text\"` or `name = \"\"\"…\"\"\"`",
+          t.extent,
+          "not a secret",
+          [],
+          "write one secret a line: a name, `=`, and a string"
+        )
+        None
+    line match
+      Some(e) ->
+        entries.find(x -> x.name == e.name) match
+          Some(first) ->
+            diagnostics += Diagnostic(
+              "E0502",
+              s"the secret `${e.name}` is given twice",
+              e.span,
+              "given again",
+              [],
+              "",
+              false,
+              [(first.span, "first given here")]
+            )
+          None -> entries += e
+      None -> ()
+    while i < tokens.length && !isLineEnd(tokens(i))
+      i += 1
+  Plain(entries.toVector, diagnostics.toVector)

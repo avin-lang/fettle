@@ -134,6 +134,16 @@ multiline()
   assertEq(toks("a\n  val t = \"\"\"\n    x\n    \"\"\"\n  b\n"), "a NEWLINE INDENT val t = \"\"\"x\"\"\" NEWLINE b NEWLINE DEDENT")
   assertEq(errs("\"\"\"\nabc"), "1:1 E0111 this text is not closed")
 
+@test("an escaped quote in triple-quoted text does not close it")
+multilineEscapedQuotes()
+  assertEq(toks("\"\"\"\n  say \\\"\"\" here\n  \"\"\"\n"), "\"\"\"say \\\"\\\"\\\" here\"\"\" NEWLINE")
+  assertEq(toks("\"\"\"a\\\"\"\"\""), "\"\"\"a\\\"\"\"\" NEWLINE")
+  assertEq(toks("\"\"\"\\\"\\\"\\\"\"\"\""), "\"\"\"\\\"\\\"\\\"\"\"\" NEWLINE")
+  // An escaped backslash before the closing quotes escapes nothing else.
+  assertEq(toks("\"\"\"a\\\\\"\"\""), "\"\"\"a\\\\\"\"\" NEWLINE")
+  assertEq(toks("\"\"\"\n  a\\\\\n  \"\"\"\n"), "\"\"\"a\\\\\"\"\" NEWLINE")
+  assertEq(errs("\"\"\"a\\\"\"\""), "1:1 E0111 this text is not closed")
+
 @test("spans count lines from 1 and columns in characters")
 spans()
   val r = lex("f.fettle", "a\n  été b")

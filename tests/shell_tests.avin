@@ -1,6 +1,10 @@
 module tests
 
-import dev.avinlang.fettle.shell.{Command, Output, Program, Shell, cmd, parseProbe, probeScript, quote}
+import dev.avinlang.fettle.shell.{
+  Bare, Command, EscapedBare, EscapedDouble, InDouble, InSingle, Output, Program, Shell, ShellContext, cmd,
+  contextAfter, parseProbe, probeScript, quote, quoteIn
+}
+
 import dev.avinlang.fettle.transport.{LocalTransport}
 
 // `word` quoted, or the error text.
@@ -198,3 +202,97 @@ parsingEmpty()
   assertEq(parsedText("m begin\nm 0 0 0 0\nm 1 5 0 0\nm end\n", "m", 2), "0||\n5||")
   assertEq(Output(0, "", "").succeeded, true)
   assertEq(Output(1, "", "").succeeded, false)
+
+// The name of a quoting context.
+contextName(c: ShellContext) -> string = c match
+  Bare -> "bare"
+  InSingle -> "single"
+  InDouble -> "double"
+  EscapedBare -> "escaped bare"
+  EscapedDouble -> "escaped double"
+
+// The context after `text`, beginning outside quotes.
+contextOf(text: string) -> string = contextName(contextAfter(Bare, text))
+
+// What `/bin/sh` prints when `value` is interpolated into the command line `before` + value +
+// `after` the way `sh"…"` does it: quoted for the quoting `before` leaves it in.
+landed(before: string, value: string, after: string) -> string
+  val word = quoteIn(value, contextAfter(Bare, before)) match
+    Ok(w) -> w
+    Err(e) -> return s"error: $e"
+  LocalTransport().run(s"$before$word$after", Array.empty[byte]()) match
+    Ok(r) -> r.out
+    Err(e) -> s"error: ${e.message}"
+
+// Values that exercise every character a shell treats specially.
+val awkward: Vector[string] = [
+  "", "plain", "a b", "a\"b", "\"", "a\\b", "\\", "trailing\\", "$HOME", "$(id)", "`id`", "it's", "'",
+  "'; echo pwned; '", "line1\nline2", "\n", "é 日本 😀", "*", "~", "A=1", "\\\"", "${x}", "!"
+]
+
+@test("the context after shell text")
+shellContexts()
+  assertEq(contextOf(""), "bare")
+  assertEq(contextOf("echo hello "), "bare")
+  assertEq(contextOf("echo \"hello "), "double")
+  assertEq(contextOf("echo \"hello\" "), "bare")
+  assertEq(contextOf("echo 'hello "), "single")
+  assertEq(contextOf("echo 'hello' "), "bare")
+  assertEq(contextOf("echo \"it's "), "double")
+  assertEq(contextOf("echo 'say \"hi "), "single")
+  assertEq(contextOf("echo \\\" "), "bare")
+  assertEq(contextOf("echo \\' "), "bare")
+  assertEq(contextOf("echo \"a\\\" "), "double")
+  assertEq(contextOf("echo 'a\\' "), "bare")
+  assertEq(contextOf("echo \\"), "escaped bare")
+  assertEq(contextOf("echo \"a\\"), "escaped double")
+  assertEq(contextOf("echo 'a\\"), "single")
+  assertEq(contextOf("echo \\\\"), "bare")
+  assertEq(contextName(contextAfter(InDouble, "a\" ")), "bare")
+  assertEq(contextName(contextAfter(InSingle, "a' \"")), "double")
+  assertEq(contextName(contextAfter(EscapedDouble, "a")), "double")
+
+@test("outside quotes an interpolation is one word, as quote gives it")
+interpolatedBare()
+  for v in awkward
+    assertEq(landed("printf '%s' ", v, ""), v)
+  assertEq(quoteIn("a b", Bare).getOrElse(""), "'a b'")
+
+@test("inside double quotes an interpolation lands verbatim")
+interpolatedDouble()
+  for v in awkward
+    assertEq(landed("printf '%s' \"pre ", v, " post\""), s"pre $v post")
+    assertEq(landed("printf '%s' \"", v, "\""), v)
+
+@test("a single quote inside double quotes, and double quotes inside single, open nothing")
+interpolatedNested()
+  for v in awkward
+    assertEq(landed("printf '%s' \"it's ", v, " 'x'\""), s"it's $v 'x'")
+    assertEq(landed("printf '%s|%s' '\"' ", v, ""), s"\"|$v")
+    assertEq(landed("printf '%s|%s' \"c'd\" ", v, ""), s"c'd|$v")
+    assertEq(landed("printf '%s|%s' \"'\" ", v, ""), s"'|$v")
+
+@test("an escaped quote in the text opens no region and closes none")
+interpolatedEscapedQuotes()
+  for v in awkward
+    assertEq(landed("printf '%s|%s' \\\" ", v, ""), s"\"|$v")
+    assertEq(landed("printf '%s|%s' \\' ", v, ""), s"'|$v")
+    assertEq(landed("printf '%s' \"a\\\" ", v, "\""), s"a\" $v")
+    assertEq(landed("printf '%s|%s' \\\\ ", v, ""), s"\\|$v")
+    assertEq(landed("printf '%s|%s' 'a\\' ", v, ""), s"a\\|$v")
+
+@test("a region closed after an interpolation puts the next one back outside quotes")
+interpolatedSequence()
+  for v in awkward
+    val bare = quoteIn(v, Bare).getOrElse("")
+    assertEq(landed("printf '%s|%s|%s' \"", v, s"\" $bare \"x\""), s"$v|$v|x")
+
+@test("inside single quotes, or after a backslash, an interpolation cannot be quoted")
+interpolatedRefused()
+  assertEq(quoteIn("a", InSingle), Err("an interpolation inside single quotes cannot be quoted"))
+  assertEq(quoteIn("", EscapedBare), Err("an interpolation straight after a backslash cannot be quoted"))
+  assertEq(quoteIn("a", EscapedDouble), Err("an interpolation straight after a backslash cannot be quoted"))
+
+@test("a NUL is refused inside double quotes too")
+interpolatedNul()
+  assertEq(quoteIn("a\u{0}b", InDouble), Err("the word `a\\0b` holds a NUL character, which no shell word can carry"))

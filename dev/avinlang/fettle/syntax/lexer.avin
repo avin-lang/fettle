@@ -457,6 +457,21 @@ class Lexer(val file: string, val text: string)
       error("E0114", "`${}` holds no expression", here, "empty interpolation")
     (Hole(inner.toList, here), closed)
 
+  // Where the `"""` that closes text going on from byte `from` begins, or -1 where none does. A
+  // backslash escapes the character after it, so `\"""` is a quote and two more, not the close.
+  private closingQuotes(from: int) -> int
+    val quote = byte(int('"'))
+    var k = from
+    while k + 3 <= text.byteLength
+      val b = text.byteAt(k)
+      if b == byte(int('\\'))
+        k += 2
+      else if b == quote && text.byteAt(k + 1) == quote && text.byteAt(k + 2) == quote
+        return k
+      else
+        k += 1
+    -1
+
   // Lexes `"""…"""`. Text that begins with a line end drops it, and the closing `"""` alone on its
   // line sets a margin: that many leading spaces are taken off every line, and the line end before the
   // closing line is dropped.
@@ -464,7 +479,7 @@ class Lexer(val file: string, val text: string)
     advance()
     advance()
     advance()
-    val close = text.indexOf("\"\"\"", at)
+    val close = closingQuotes(at)
     var margin = 0
     var stripLast = false
     if close >= 0

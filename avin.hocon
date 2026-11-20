@@ -9,3 +9,16 @@ dependencies {
 c-linking {
   static = ["ssh/libssh2"]
 }
+
+c-libraries {
+  sodium {
+    pkg-config = "libsodium"
+    headers    = ["<sodium.h>"]
+    install    = "libsodium 1.0.18 or later: `brew install libsodium`; Debian's libsodium-dev"
+  }
+  libc { headers = ["<sys/stat.h>"] }
+}
+
+c-linking {
+  static = ["sodium"]
+}
