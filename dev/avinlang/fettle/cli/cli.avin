@@ -215,7 +215,12 @@ facts(args: Vector[string]) -> int = factsText(args) match
 factsText(args: Vector[string]) -> Result[string, (int, string)]
   val unknown = args.filter(a -> a != "--local" && a != "--json")
   if !unknown.isEmpty || !args.contains("--local")
-    return Err((2, if unknown.isEmpty then s"fettle: facts of a remote host are not gathered yet; use --local\n$usage" else s"fettle: unknown argument `${unknown(0)}`\n$usage"))
+    return Err(
+      (
+        2,
+        if unknown.isEmpty then s"fettle: facts of a remote host are not gathered yet; use --local\n$usage" else s"fettle: unknown argument `${unknown(0)}`\n$usage"
+      )
+    )
   val t = LocalTransport()
   val gathered = gather(t)
   _ = t.close()
