@@ -6,13 +6,14 @@ machines should be in; `fettle` checks it, connects to each machine over SSH, sh
 a plan, and changes only that.
 
 The design is [`docs/design.md`](docs/design.md). The front end exists: the lexer, the parser, the
-checker, the evaluator into the resource graph, templates and the formatter. No host is contacted
-yet.
+checker, the evaluator into the resource graph, templates and the formatter, and the facts of this
+machine through a local transport. No remote host is contacted yet.
 
 ```
 fettle check [<vault options>] [dir]
 fettle fmt [--check] [files…]
 fettle graph --facts <fixture.json> --host <name> [<vault options>] [dir]
+fettle facts --local [--json]
 fettle vault create|edit|view|encrypt|decrypt|rekey [<vault options>] <file>
 ```
 
@@ -20,6 +21,17 @@ fettle vault create|edit|view|encrypt|decrypt|rekey [<vault options>] <file>
   renders each diagnostic with its source excerpt.
 - `fmt` writes each file in its canonical form; `--check` only names the files that are not in it.
 - `graph` evaluates the program for one host against a fact fixture and prints the resource graph.
+- `facts --local` runs the facts script on this machine and prints its facts; `--json` prints them
+  in the form of a fact fixture, so its output can be passed to `graph --facts`.
+
+The modules under the front end:
+
+- `shell`: `Command` (a program and its argument words, or `sh"…"` shell text), exact POSIX
+  quoting, and the probe script that runs many commands in one round trip with its output parser.
+- `facts`: the read-only facts script (`uname`, `id`, `/etc/os-release`), its parser into `Facts`,
+  and the JSON form fixtures use.
+- `transport`: the `Transport` trait (run a script with bytes on its standard input, close) and
+  `LocalTransport`, which runs `/bin/sh` here; the SSH transport is built against the same trait.
 
 ## Secrets in a vault
 
@@ -67,6 +79,7 @@ libsodium (`brew install libsodium`; Debian's `libsodium-dev`), running does not
 avin test .
 avin run . -- check tests/examples/site
 avin run . -- graph --facts tests/fixtures/debian12.json --host web1 tests/examples/site
+avin run . -- facts --local
 ```
 
 fettle depends on [avin-lang/parsing](https://github.com/avin-lang/parsing) 0.6.0 for its parsing

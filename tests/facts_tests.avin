@@ -1,0 +1,239 @@
+module tests
+
+import avin.fs
+import dev.avinlang.fettle.facts.{Facts, factsJson, factsScript, gather, parseFacts, readFacts, showFacts}
+import dev.avinlang.fettle.transport.{LocalTransport}
+import dev.avinlang.fettle.cli.{factsText}
+
+// The recorded output of the facts script `tests/fixtures/facts/<name>.txt`, parsed, as JSON.
+recorded(name: string) -> string = fs.readText(
+  s"tests/fixtures/facts/$name.txt"
+).mapErr(e -> e.message).flatMap(t -> parseFacts(t)) match
+  Ok(f) -> factsJson(f)
+  Err(e) -> s"error: $e"
+
+// The facts of the lines `ls`, as JSON, or the error.
+factsOf(ls: Vector[string]) -> string = parseFacts(ls.map(l -> s"$l\n").mkString("")) match
+  Ok(f) -> factsJson(f)
+  Err(e) -> s"error: $e"
+
+// The lines of a Debian 12 host's facts, with `changed` lines in place of those with the same key and
+// the keys in `dropped` left out.
+debianWith(changed: Vector[string], dropped: Vector[string] = []) -> Vector[string]
+  val base = [
+    "kernel=Linux", "machine=x86_64", "hostname=web1", "user=deploy", "uid=1000", "cpus=2", "memory=2147483648",
+    "init=systemd", "os-release.ID=debian", "os-release.VERSION_ID=\"12\""
+  ]
+  val keyOf = (l: string) -> l.slice(0, l.indexOf('='))
+  base.filter(l -> !dropped.contains(keyOf(l)) && !changed.exists(c -> keyOf(c) == keyOf(l))) ++ changed
+
+@test("recorded facts of each supported system parse into typed facts")
+recordedFacts()
+  assertEq(
+    recorded("debian12"),
+    "{\"os\": \"Linux\", \"distro\": \"Debian\", \"version\": \"12\", \"arch\": \"Amd64\", \"init\": \"Systemd\", \"cpus\": 2, \"memory\": 2147483648, \"hostname\": \"web1\", \"user\": \"deploy\", \"root\": false}"
+  )
+  assertEq(
+    recorded("ubuntu2404"),
+    "{\"os\": \"Linux\", \"distro\": \"Ubuntu\", \"version\": \"24.04\", \"arch\": \"Arm64\", \"init\": \"Systemd\", \"cpus\": 4, \"memory\": 8323002368, \"hostname\": \"vps-7f3a\", \"user\": \"ubuntu\", \"root\": false}"
+  )
+  assertEq(
+    recorded("alpine320"),
+    "{\"os\": \"Linux\", \"distro\": \"Alpine\", \"version\": \"3.20\", \"arch\": \"Arm64\", \"init\": \"OpenRc\", \"cpus\": 1, \"memory\": 1073741824, \"hostname\": \"edge1\", \"user\": \"root\", \"root\": true}"
+  )
+  assertEq(
+    recorded("fedora40"),
+    "{\"os\": \"Linux\", \"distro\": \"Fedora\", \"version\": \"40\", \"arch\": \"Amd64\", \"init\": \"Systemd\", \"cpus\": 8, \"memory\": 16777216000, \"hostname\": \"build.example.com\", \"user\": \"fedora\", \"root\": false}"
+  )
+  assertEq(
+    recorded("rhel94"),
+    "{\"os\": \"Linux\", \"distro\": \"Rhel\", \"version\": \"9\", \"arch\": \"Amd64\", \"init\": \"Systemd\", \"cpus\": 16, \"memory\": 67108864000, \"hostname\": \"db1\", \"user\": \"root\", \"root\": true}"
+  )
+  assertEq(
+    recorded("rocky93"),
+    "{\"os\": \"Linux\", \"distro\": \"Rhel\", \"version\": \"9\", \"arch\": \"Arm64\", \"init\": \"Systemd\", \"cpus\": 2, \"memory\": 3951591424, \"hostname\": \"rocky\", \"user\": \"rocky\", \"root\": false}"
+  )
+  assertEq(
+    recorded("arch"),
+    "{\"os\": \"Linux\", \"distro\": \"Arch\", \"version\": \"\", \"arch\": \"Amd64\", \"init\": \"Systemd\", \"cpus\": 12, \"memory\": 33554432000, \"hostname\": \"archbox\", \"user\": \"ed\", \"root\": false}"
+  )
+  assertEq(
+    recorded("macos15"),
+    "{\"os\": \"Darwin\", \"distro\": \"Macos\", \"version\": \"15.6.1\", \"arch\": \"Arm64\", \"init\": \"Launchd\", \"cpus\": 12, \"memory\": 34359738368, \"hostname\": \"studio.local\", \"user\": \"ed\", \"root\": false}"
+  )
+  assertEq(
+    recorded("container-debian12"),
+    "{\"os\": \"Linux\", \"distro\": \"Debian\", \"version\": \"12\", \"arch\": \"Amd64\", \"init\": \"NoInit\", \"cpus\": 4, \"memory\": 4112060416, \"hostname\": \"3f9c2a1b7d4e\", \"user\": \"root\", \"root\": true}"
+  )
+
+@test("recorded facts agree with the fixtures the evaluator reads")
+recordedAgreeWithFixtures()
+  for name in ["debian12", "alpine320"]
+    val fixture = fs.readText(s"tests/fixtures/$name.json").getOrElse("")
+    assertEq(recorded(name), fixture.trim)
+
+@test("the JSON form reads back as the same facts")
+jsonRoundTrip()
+  for name in [
+    "debian12",
+    "ubuntu2404",
+    "alpine320",
+    "fedora40",
+    "rhel94",
+    "rocky93",
+    "arch",
+    "macos15",
+    "container-debian12"
+  ]
+    val f = parseFacts(fs.readText(s"tests/fixtures/facts/$name.txt").getOrElse("")).ok.get
+    assertEq(readFacts(factsJson(f)), Ok(f))
+  val odd = Facts("Linux", "Other", "nixos", "Amd64", "Systemd", 1, 0, "hôte \"日本\" \\ \n", "", false)
+  assertEq(readFacts(factsJson(odd)), Ok(odd))
+
+@test("other distributions are `Other` with their id")
+otherDistros()
+  assertEq(
+    factsOf(
+      debianWith(["os-release.ID=nixos", "os-release.VERSION_ID=\"24.05\""])
+    ).contains("\"distro\": \"Other\", \"version\": \"nixos\""),
+    true
+  )
+  assertEq(factsOf(debianWith(["os-release.ID=\"opensuse-leap\""])).contains("\"version\": \"opensuse-leap\""), true)
+  assertEq(factsOf(debianWith(["os-release.ID=Debian"])).contains("\"distro\": \"Debian\""), true)
+  assertEq(
+    factsOf(
+      debianWith(["kernel=FreeBSD", "machine=amd64"], ["os-release.ID", "os-release.VERSION_ID"])
+    ).contains("\"os\": \"FreeBsd\", \"distro\": \"Other\", \"version\": \"freebsd\""),
+    true
+  )
+
+@test("os-release values are unquoted as the format says")
+osReleaseQuoting()
+  assertEq(factsOf(debianWith(["os-release.ID=nix\"os"])).contains("\"version\": \"nix\\\"os\""), true)
+  assertEq(
+    factsOf(
+      debianWith(["os-release.ID=\"a\\\"b\\\\c\\$d\\`e\\qf\""])
+    ).contains("\"version\": \"a\\\"b\\\\c$d`e\\\\qf\""),
+    true
+  )
+  assertEq(factsOf(debianWith(["os-release.ID='single'"])).contains("\"version\": \"single\""), true)
+  assertEq(factsOf(debianWith(["os-release.VERSION_ID='12'"])).contains("\"version\": \"12\""), true)
+
+@test("a line without `=`, and a key given twice")
+lineShapes()
+  assertEq(factsOf(debianWith([]) :+ "garbage"), "error: line 11 of the facts is not `key=value`: `garbage`")
+  assertEq(factsOf(debianWith([]) :+ "=x"), "error: line 11 of the facts is not `key=value`: `=x`")
+  assertEq(factsOf(debianWith([]) :+ "cpus=3").contains("\"cpus\": 3"), true)
+  assertEq(factsOf(debianWith([]) :+ "unknown.fact=whatever").contains("\"cpus\": 2"), true)
+  assertEq(factsOf(debianWith([]) :+ "").contains("\"cpus\": 2"), true)
+  assertEq(parseFacts(debianWith([]).map(l -> s"$l\r\n").mkString("")).map(f -> f.hostname), Ok("web1"))
+  assertEq(factsOf(debianWith(["hostname=a=b"])).contains("\"hostname\": \"a=b\""), true)
+
+@test("missing and garbled facts are named")
+brokenFacts()
+  assertEq(factsOf([]), "error: the facts have no `kernel`")
+  for k in ["kernel", "machine", "hostname", "user", "uid", "cpus", "memory", "init"]
+    assertEq(factsOf(debianWith([], [k])), s"error: the facts have no `$k`")
+  assertEq(factsOf(debianWith(["memory="])), "error: the facts have no `memory`")
+  assertEq(factsOf(debianWith(["cpus=two"])), "error: the fact `cpus` is not a number: `two`")
+  assertEq(factsOf(debianWith(["memory=-1"])), "error: the fact `memory` is not a number: `-1`")
+  assertEq(factsOf(debianWith(["uid=x"])), "error: the fact `uid` is not a number: `x`")
+  assertEq(factsOf(debianWith(["init=upstart"])), "error: the fact `init` is garbled: `upstart`")
+  assertEq(factsOf(debianWith(["kernel=SunOS"])), "error: fettle does not manage the operating system `SunOS`")
+  assertEq(factsOf(debianWith(["machine=riscv64"])), "error: fettle does not manage the architecture `riscv64`")
+  assertEq(factsOf(debianWith(["machine=i686"])), "error: fettle does not manage the architecture `i686`")
+  assertEq(factsOf(debianWith([], ["os-release.ID"])), "error: the facts have no `ID` from /etc/os-release")
+  assertEq(
+    factsOf(debianWith([], ["os-release.VERSION_ID"])),
+    "error: Debian has no VERSION_ID in /etc/os-release (a testing or rolling release, which fettle does not manage)"
+  )
+  assertEq(
+    factsOf(debianWith(["os-release.VERSION_ID=twelve"])),
+    "error: the Debian version `twelve` is not a whole number"
+  )
+  assertEq(
+    factsOf(debianWith(["os-release.ID=fedora", "os-release.VERSION_ID=rawhide"])),
+    "error: the Fedora version `rawhide` is not a whole number"
+  )
+  assertEq(
+    factsOf(["kernel=Darwin", "machine=arm64", "hostname=h", "user=u", "uid=0", "cpus=1", "memory=1", "init=launchd"]),
+    "error: the facts have no `macos` version"
+  )
+
+@test("uid 0 is root, any other is not")
+rootness()
+  assertEq(factsOf(debianWith(["uid=0"])).contains("\"root\": true"), true)
+  assertEq(factsOf(debianWith(["uid=1"])).contains("\"root\": false"), true)
+  assertEq(factsOf(debianWith(["uid=65534"])).contains("\"root\": false"), true)
+
+@test("fixture JSON with a name that is no variant is refused")
+fixtureValidation()
+  val good = fs.readText("tests/fixtures/debian12.json").getOrElse("")
+  assertEq(readFacts(good.replace("\"Debian\"", "\"Debain\"")).isErr, true)
+  assertEq(readFacts(good.replace("\"Linux\"", "\"Windows\"")), Err("`Windows` is not an Os (Linux, Darwin, FreeBsd)"))
+  assertEq(readFacts(good.replace("\"Amd64\"", "\"X86\"")), Err("`X86` is not a Cpu (Amd64, Arm64)"))
+  assertEq(
+    readFacts(good.replace("\"Systemd\"", "\"systemd\"")),
+    Err("`systemd` is not an Init (Systemd, OpenRc, Launchd, NoInit)")
+  )
+  assertEq(
+    readFacts(good.replace("\"12\"", "\"bookworm\"")),
+    Err("the Debian version `bookworm` is not a whole number")
+  )
+
+@test("facts shown to a person")
+showingFacts()
+  val f = parseFacts(fs.readText("tests/fixtures/facts/debian12.txt").getOrElse("")).ok.get
+  assertEq(
+    showFacts(f),
+    "os       Linux\ndistro   Debian 12\narch     Amd64\ninit     Systemd\ncpus     2\nmemory   2147483648 bytes\nhostname web1\nuser     deploy\nroot     false\n"
+  )
+  val a = parseFacts(fs.readText("tests/fixtures/facts/arch.txt").getOrElse("")).ok.get
+  assertEq(showFacts(a).split('\n')(1), "distro   Arch")
+  assertEq(
+    showFacts(Facts("Linux", "Other", "nixos", "Amd64", "Systemd", 1, 1, "h", "u", false)).split('\n')(1),
+    "distro   Other(nixos)"
+  )
+
+@test("the facts script gathers this machine's facts")
+gatheringLocally()
+  val f = gather(LocalTransport()).ok.get
+  assertEq(f.os, "Darwin")
+  assertEq(f.arch, "Arm64")
+  assertEq(f.distro, "Macos")
+  assertEq(f.init, "Launchd")
+  assertEq(f.cpus > 0, true)
+  assertEq(f.memory > 0, true)
+  assertEq(f.hostname.nonEmpty, true)
+  assertEq(f.user.nonEmpty, true)
+
+@test("the facts script is POSIX sh that dash and bash both run")
+factsScriptShells()
+  for sh in ["/bin/sh", "/bin/bash", "/bin/dash"]
+    if !fs.exists(sh) then continue
+    val r = LocalTransport().run(s"exec $sh", factsScript.utf8).ok.get
+    assertEq(r.succeeded, true)
+    assertEq(parseFacts(r.out).map(f -> f.os), Ok("Darwin"))
+
+@test("fettle facts --local --json decodes as a fixture")
+factsCommand()
+  val text = factsText(["--local", "--json"]).getOrElse("")
+  assertEq(text.endsWith("}\n"), true)
+  val f = readFacts(text).ok.get
+  assertEq(f.os, "Darwin")
+  assertEq(f.arch, "Arm64")
+  assertEq(factsJson(f) + "\n", text)
+  assertEq(factsText(["--local"]).getOrElse("").startsWith("os       Darwin\n"), true)
+
+@test("fettle facts refuses what it cannot do yet and arguments it does not know")
+factsCommandErrors()
+  assertEq(failure([]), "2 fettle: facts of a remote host are not gathered yet; use --local")
+  assertEq(failure(["--json"]), "2 fettle: facts of a remote host are not gathered yet; use --local")
+  assertEq(failure(["--local", "--bogus"]), "2 fettle: unknown argument `--bogus`")
+  assertEq(failure(["web1"]), "2 fettle: unknown argument `web1`")
+  assertEq(failure(["--local"]), "succeeded")
+
+// How `fettle facts args` fails: its exit status and the first line of its message.
+failure(args: Vector[string]) -> string = factsText(args) match
+  Ok(_) -> "succeeded"
+  Err((code, message)) -> s"$code ${message.split('\n')(0)}"

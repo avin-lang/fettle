@@ -1,0 +1,200 @@
+module tests
+
+import dev.avinlang.fettle.shell.{Command, Output, Program, Shell, cmd, parseProbe, probeScript, quote}
+import dev.avinlang.fettle.transport.{LocalTransport}
+
+// `word` quoted, or the error text.
+quoted(word: string) -> string = quote(word) match
+  Ok(q) -> q
+  Err(e) -> s"error: $e"
+
+// What `/bin/sh` prints for `printf '%s' <word quoted>`: the word itself when the quoting is exact.
+echoed(word: string) -> string
+  val t = LocalTransport()
+  val line = quote(word).getOrElse("")
+  t.run(s"printf '%s' $line", Array.empty[byte]()) match
+    Ok(r) -> r.out
+    Err(e) -> s"error: ${e.message}"
+
+// The outputs of running `commands` as one probe script on this machine, each `code|stdout|stderr`.
+probed(commands: Vector[Command], marker: string = "fettle-test-7c1e") -> string
+  val script = probeScript(commands, marker) match
+    Ok(s) -> s
+    Err(e) -> return s"error: $e"
+  val ran = LocalTransport().run(script, Array.empty[byte]()) match
+    Ok(r) -> r
+    Err(e) -> return s"error: ${e.message}"
+  parseProbe(ran.stdout, marker, commands.length) match
+    Ok(os) -> os.map(o -> s"${o.code}|${o.stdout}|${o.stderr}").mkString("\n")
+    Err(e) -> s"error: $e"
+
+// The parse of probe output written as text.
+parsedText(text: string, marker: string, count: int) -> string = parseProbe(text.utf8, marker, count) match
+  Ok(os) -> os.map(o -> s"${o.code}|${o.stdout}|${o.stderr}").mkString("\n")
+  Err(e) -> s"error: $e"
+
+@test("a plain word is left as it is")
+quotingPlain()
+  assertEq(quoted("nginx"), "nginx")
+  assertEq(quoted("/etc/nginx/nginx.conf"), "/etc/nginx/nginx.conf")
+  assertEq(quoted("-n"), "-n")
+  assertEq(quoted("user@host:22,a+b%c_d"), "user@host:22,a+b%c_d")
+
+@test("every other word is single-quoted")
+quotingOthers()
+  assertEq(quoted(""), "''")
+  assertEq(quoted("a b"), "'a b'")
+  assertEq(quoted("it's"), "'it'\\''s'")
+  assertEq(quoted("'"), "''\\'''")
+  assertEq(quoted("$HOME"), "'$HOME'")
+  assertEq(quoted("a\\b"), "'a\\b'")
+  assertEq(quoted("line\nbreak"), "'line\nbreak'")
+  assertEq(quoted("é"), "'é'")
+  assertEq(quoted("A=1"), "'A=1'")
+  assertEq(quoted("~"), "'~'")
+  assertEq(quoted("*"), "'*'")
+  assertEq(quoted("`id`"), "'`id`'")
+
+@test("a NUL is refused")
+quotingNul()
+  assertEq(quoted("a\u{0}b"), "error: the word `a\\0b` holds a NUL character, which no shell word can carry")
+  assertEq(quoted("\u{0}"), "error: the word `\\0` holds a NUL character, which no shell word can carry")
+
+@test("the shell reads each quoted word back exactly")
+quotingRoundTrip()
+  for w in [
+    "",
+    "plain",
+    "a b",
+    "it's",
+    "''",
+    "$HOME",
+    "$(id)",
+    "`id`",
+    "a\\b",
+    "\\",
+    "line\nbreak\n",
+    "tab\there",
+    "é ünïcödé 日本 🙂",
+    "*",
+    "~",
+    "!",
+    "\"quoted\"",
+    "a;b|c&d>e<f",
+    "-n",
+    "%s",
+    "\r"
+  ]
+    assertEq(echoed(w), w)
+
+@test("a command renders as words, shell text as written")
+commandRendering()
+  assertEq(cmd("true").render, Ok("true"))
+  assertEq(cmd("echo", "a b", "", "it's").render, Ok("echo 'a b' '' 'it'\\''s'"))
+  assertEq(cmd("/usr/bin/env", "A=1", "x").render, Ok("/usr/bin/env 'A=1' x"))
+  assertEq(Program("", []).render, Err("a command needs a program"))
+  assertEq(cmd("echo", "a\u{0}").render.isErr, true)
+  assertEq(Shell("ls | wc -l").render, Ok("ls | wc -l"))
+  assertEq(Shell("a\u{0}").render, Err("the shell text holds a NUL character, which no shell word can carry"))
+
+@test("a probe script runs each command and the parser takes their outputs apart")
+probing()
+  assertEq(
+    probed([cmd("printf", "%s", "hello"), Shell("echo out; echo err >&2; exit 3"), cmd("true")]),
+    "0|hello|\n3|out\n|err\n\n0||"
+  )
+
+@test("a probe of no commands")
+probingNone()
+  assertEq(probed([]), "")
+
+@test("output that looks like a header does not confuse the parser")
+probingForgedHeaders()
+  val m = "fettle-test-7c1e"
+  val forged = s"$m 1 0 0 0\n$m end\n$m begin\n"
+  assertEq(
+    probed([cmd("printf", "%s", forged), Shell(s"printf '%s 9 9 9 9\\n' $m >&2"), cmd("printf", "%s", "x")]),
+    s"0|$forged|\n0||$m 9 9 9 9\n\n0|x|"
+  )
+
+@test("each command is isolated: exit, cd, a missing program, a syntax error, standard input")
+probingIsolation()
+  val m = "fettle-test-7c1e"
+  val cmds: Vector[Command] = [
+    Shell("cd /tmp; X=1; exit 4"),
+    Shell("echo \"$PWD${X}\" | grep -c '^/tmp1$'"),
+    cmd("fettle-no-such-program-x"),
+    Shell("echo ("),
+    Shell("cat"),
+    Shell("printf 'no newline'")
+  ]
+  val ran = LocalTransport().run(probeScript(cmds, m).getOrElse(""), Array.empty[byte]()).ok.get
+  val os = parseProbe(ran.stdout, m, cmds.length).getOrElse([])
+  assertEq(os.length, 6)
+  assertEq(os.map(o -> o.code), [4, 1, 127, 2, 0, 0])
+  assertEq(os(1).stdout, "0\n")
+  assertEq(os(2).stdout, "")
+  assertEq(os(2).stderr.contains("fettle-no-such-program-x"), true)
+  assertEq(os(3).stderr.nonEmpty, true)
+  assertEq(os(4).stdout, "")
+  assertEq(os(5).stdout, "no newline")
+
+@test("output with Unicode, NULs and bytes that are not UTF-8")
+probingBytes()
+  assertEq(
+    probed([cmd("printf", "%s", "日本 🙂"), Shell("printf 'a\\000b'"), Shell("printf '\\377'")]),
+    "0|日本 🙂|\n0|a\u{0}b|\n0|\u{FFFD}|"
+  )
+
+@test("a signal ending a command is its shell code")
+probingSignal()
+  assertEq(probed([Shell("kill -9 $$"), cmd("true")]), "137||\n0||")
+
+@test("a probe script needs a plain marker")
+probeMarker()
+  assertEq(probeScript([], "").isErr, true)
+  assertEq(probeScript([], "a b").isErr, true)
+  assertEq(probeScript([], "a'b").isErr, true)
+  assertEq(probeScript([cmd("")], "m").isErr, true)
+  assertEq(probeScript([cmd("x", "\u{0}")], "m").isErr, true)
+
+@test("the parser passes over anything before the begin line")
+parsingBanner()
+  assertEq(parsedText("Welcome to the host\nm begin? no\nm begin\nm 0 0 2 1\nhiEm end\n", "m", 1), "0|hi|E")
+
+@test("the parser refuses broken output")
+parsingBroken()
+  assertEq(parsedText("", "m", 0), "error: the probe script printed no begin line")
+  assertEq(parsedText("xm begin\nm end\n", "m", 0), "error: the probe script printed no begin line")
+  assertEq(parsedText("m begin\n", "m", 1), "error: the probe output ended before command 0 of 1")
+  assertEq(
+    parsedText("m begin\nm 1 0 0 0\nm end\n", "m", 1),
+    "error: expected the header of command 0, found `m 1 0 0 0`"
+  )
+  assertEq(
+    parsedText("m begin\nn 0 0 0 0\nm end\n", "m", 1),
+    "error: expected the header of command 0, found `n 0 0 0 0`"
+  )
+  assertEq(parsedText("m begin\nm 0 x 0 0\nm end\n", "m", 1), "error: the header of command 0 is garbled: `m 0 x 0 0`")
+  assertEq(
+    parsedText("m begin\nm 0 0 -1 0\nm end\n", "m", 1),
+    "error: the header of command 0 is garbled: `m 0 0 -1 0`"
+  )
+  assertEq(parsedText("m begin\nm 0 0 0\nm end\n", "m", 1), "error: expected the header of command 0, found `m 0 0 0`")
+  assertEq(parsedText("m begin\nm 0 0 50 0\nab", "m", 1), "error: the output of command 0 is cut off")
+  assertEq(parsedText("m begin\nm 0 0 2 0\nab", "m", 1), "error: the probe output does not end after its 1 commands")
+  assertEq(
+    parsedText("m begin\nm 0 0 2 0\nabm end", "m", 1),
+    "error: the probe output does not end after its 1 commands"
+  )
+  assertEq(
+    parsedText("m begin\nm 0 0 0 0\nm 1 0 0 0\nm end\n", "m", 1),
+    "error: the probe output does not end after its 1 commands"
+  )
+
+@test("an empty output and a header line with nothing after")
+parsingEmpty()
+  assertEq(parsedText("m begin\nm end\n", "m", 0), "")
+  assertEq(parsedText("m begin\nm 0 0 0 0\nm 1 5 0 0\nm end\n", "m", 2), "0||\n5||")
+  assertEq(Output(0, "", "").succeeded, true)
+  assertEq(Output(1, "", "").succeeded, false)

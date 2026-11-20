@@ -1,0 +1,11 @@
+kernel=Linux
+machine=aarch64
+hostname=rocky
+user=rocky
+uid=1000
+cpus=2
+memory=3951591424
+init=systemd
+os-release.ID="rocky"
+os-release.ID_LIKE="rhel centos fedora"
+os-release.VERSION_ID="9.3"

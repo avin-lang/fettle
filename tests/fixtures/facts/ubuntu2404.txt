@@ -1,0 +1,11 @@
+kernel=Linux
+machine=aarch64
+hostname=vps-7f3a
+user=ubuntu
+uid=1000
+cpus=4
+memory=8323002368
+init=systemd
+os-release.VERSION_ID="24.04"
+os-release.ID=ubuntu
+os-release.ID_LIKE=debian

@@ -1,0 +1,10 @@
+kernel=Linux
+machine=x86_64
+hostname=web1
+user=deploy
+uid=1000
+cpus=2
+memory=2147483648
+init=systemd
+os-release.VERSION_ID="12"
+os-release.ID=debian

@@ -1,0 +1,158 @@
+module dev.avinlang.fettle.shell
+
+// Commands for a POSIX shell on a host: a command as words, never as text glued together; exact
+// single-quote quoting; and a probe script that runs many commands in one round trip, with the
+// parser of what it prints.
+
+// A command to run: a program and its arguments, each passed as one word whatever it holds, or the
+// text of an `sh"…"` form, which is shell (pipes, redirections) with its interpolations already
+// quoted one word each.
+data Command
+  Program(program: string, args: Vector[string])
+  Shell(text: string)
+
+// How one command of a probe script ended: its exit code (128 plus the signal for one killed by a
+// signal, as the shell reports it), and its standard output and standard error, bytes that are not
+// UTF-8 each replaced with U+FFFD.
+data Output(code: int, stdout: string, stderr: string)
+
+impl Output
+  // Whether the command exited with code 0.
+  succeeded -> bool = code == 0
+
+// The program `program` with the arguments `args`.
+cmd(program: string, args: string*) -> Command = Program(program, args.toVector)
+
+// Whether `c` may stand in a word unquoted: ASCII letters and digits and `_ @ % + : , . / -`. `=` is
+// left out, so a quoted first word is never read as an assignment, and `~` too, which expands at the
+// start of a word.
+private plain(c: char) -> bool = 'a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9' || "_@%+:,./-".contains(
+  c.toString()
+)
+
+// Whether `text` holds a NUL, which no word, argument or shell text can carry.
+private holdsNul(text: string) -> bool = text.exists(c -> int(c) == 0)
+
+// The error for text that holds a NUL.
+private nulError(what: string) -> string = s"$what holds a NUL character, which no shell word can carry"
+
+// `word` as one shell word: as it is when every character is plain and it is not empty, otherwise in
+// single quotes, each `'` in it written `'\''`. Inside single quotes every other character, a line
+// end, `$`, `\` or any Unicode, stands for itself. A NUL is refused.
+quote(word: string) -> Result[string, string]
+  if holdsNul(word) then return Err(nulError(s"the word ${quoteShown(word)}"))
+  if word.nonEmpty && word.forall(c -> plain(c)) then return Ok(word)
+  Ok(s"'${word.replace("'", "'\\''")}'")
+
+// A word for an error message, its NULs shown as `\0`.
+private quoteShown(word: string) -> string = s"`${word.replace("\u{0}", "\\0")}`"
+
+impl Command
+  // The command as one line of shell: the program and each argument quoted as one word, or the
+  // shell text as written. An empty program, and a NUL anywhere, are refused.
+  render -> Result[string, string] = self match
+    Program(p, _) if p.isEmpty -> Err("a command needs a program")
+    Program(p, args) ->
+      val words = Buffer[string]()
+      for w in p +: args
+        words += quote(w)?
+      Ok(words.mkString(" "))
+    Shell(t) if holdsNul(t) -> Err(nulError("the shell text"))
+    Shell(t) -> Ok(t)
+
+// `c` as the probe script runs it: shell text through `/bin/sh -c`, so a syntax error in it fails
+// this command alone; a program as its words.
+private isolated(c: Command) -> Result[string, string] = c match
+  Shell(t) -> quote(t).map(q -> s"/bin/sh -c $q")
+  _ -> c.render
+
+// The shell variable holding the probe script's scratch directory.
+private val scratch: string = "fettle_d"
+
+// A POSIX `sh` script that runs `commands` one after the other, each in a subshell with standard input
+// from `/dev/null`, and prints for each a header line `<marker> <index> <code> <stdout bytes> <stderr
+// bytes>` followed by exactly that many bytes of its output and then of its error output. Each command's
+// output goes to a file first and is counted with `wc -c`, so no output, however it looks, is taken for
+// a header. The script begins with `<marker> begin` and ends with `<marker> end`; `marker` is a word
+// the output cannot guess, a fresh random one per script. Its scratch directory (from `mktemp -d`) is
+// removed on exit; failing to make one exits with 125 before `begin`.
+probeScript(commands: Vector[Command], marker: string) -> Result[string, string]
+  if marker.isEmpty || !marker.forall(c -> plain(c)) then return Err(s"the marker `$marker` is not a plain word")
+  val out = StringWriter()
+  out.write("umask 077\n")
+  out.write(
+    s"$scratch=$$(mktemp -d 2>/dev/null) || { echo 'fettle: cannot make a scratch directory' >&2; exit 125; }\n"
+  )
+  out.write(s"trap 'rm -rf \"$$$scratch\"' EXIT\n")
+  out.write("trap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\n")
+  out.write(s"printf '%s begin\\n' $marker\n")
+  for (c, i) in commands.zipWithIndex
+    val line = isolated(c)?
+    out.write(s"(\n$line\n) >\"$$$scratch/o\" 2>\"$$$scratch/e\" </dev/null\n")
+    out.write(
+      s"printf '%s %s %s %s %s\\n' $marker $i \"$$?\" $$(wc -c <\"$$$scratch/o\") $$(wc -c <\"$$$scratch/e\")\n"
+    )
+    out.write(s"cat \"$$$scratch/o\" \"$$$scratch/e\"\n")
+  out.write(s"printf '%s end\\n' $marker\n")
+  Ok(out.text)
+
+// The outputs of a probe script's `count` commands, read from its standard output `bytes`. Anything
+// before the `<marker> begin` line is ignored (a login banner, say). A missing begin, a header out of
+// place or of the wrong command, a count that runs past the output, and a missing end are each an
+// error naming what was expected.
+parseProbe(bytes: Array[byte], marker: string, count: int) -> Result[Vector[Output], string]
+  val begin = s"$marker begin\n".utf8
+  var at = lineStart(bytes, begin)
+  if at < 0 then return Err("the probe script printed no begin line")
+  at += begin.length
+  val outputs = Buffer[Output]()
+  for i in 0 ..< count
+    val eol = indexOfByte(bytes, byte(int('\n')), at)
+    if eol < 0 then return Err(s"the probe output ended before command $i of $count")
+    val header = string.fromUtf8Lossy(bytes.slice(at, eol))
+    val fields = header.split(' ')
+    if fields.length != 5 || fields(0) != marker || fields(1) != s"$i"
+      return Err(s"expected the header of command $i, found `$header`")
+    val code = fields(2).toIntOption()
+    val outLen = fields(3).toIntOption()
+    val errLen = fields(4).toIntOption()
+    if code.isEmpty || outLen.isEmpty || errLen.isEmpty || outLen.get < 0 || errLen.get < 0
+      return Err(s"the header of command $i is garbled: `$header`")
+    val outFrom = eol + 1
+    val errFrom = outFrom + outLen.get
+    val next = errFrom + errLen.get
+    if next > bytes.length then return Err(s"the output of command $i is cut off")
+    outputs += Output(
+      code.get,
+      string.fromUtf8Lossy(bytes.slice(outFrom, errFrom)),
+      string.fromUtf8Lossy(bytes.slice(errFrom, next))
+    )
+    at = next
+  val end = s"$marker end\n".utf8
+  if !occursAt(bytes, end, at) then return Err(s"the probe output does not end after its $count commands")
+  Ok(outputs.toVector)
+
+// The first offset of `byte` in `bytes` at or after `from`, or -1.
+private indexOfByte(bytes: Array[byte], b: byte, from: int) -> int
+  var i = from
+  while i < bytes.length
+    if bytes(i) == b then return i
+    i += 1
+  -1
+
+// Whether `part` occurs in `bytes` at `at`.
+private occursAt(bytes: Array[byte], part: Array[byte], at: int) -> bool
+  if at < 0 || at + part.length > bytes.length then return false
+  for j in 0 ..< part.length
+    if bytes(at + j) != part(j) then return false
+  true
+
+// The offset of the first line of `bytes` that is `line` (which ends with its `\n`), or -1.
+private lineStart(bytes: Array[byte], line: Array[byte]) -> int
+  var at = 0
+  while at <= bytes.length - line.length
+    if occursAt(bytes, line, at) then return at
+    val eol = indexOfByte(bytes, byte(int('\n')), at)
+    if eol < 0 then return -1
+    at = eol + 1
+  -1
