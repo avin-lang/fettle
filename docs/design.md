@@ -985,3 +985,10 @@ user.
     that line and are otherwise as written here. Review with the user.
 25. **Phase 1's parser reads no `kind` and no `test` declaration**; the kinds of 2.4 and 2.6 come
     with custom kinds, and a `kind` line is a syntax error until then. Review with the user.
+26. **Integration targets run in their own colima profile `fettle`** (docker runtime, addressed as
+    `docker --context colima-fettle`, never the `default` context), as three images under
+    `tests/integration/images`: `debian12` and `ubuntu2404` (systemd as PID 1, run `--privileged` on
+    cgroup v2) and `alpine3` (OpenRC), each with `sshd`, `sudo`, key-only login for `fettle`
+    (passwordless sudo) and `fettlepw` (sudo needs the password `fettlepw`). `targets.zsh` brings
+    them up on dynamic `127.0.0.1` ports and prints an ssh config; the test keypair is generated
+    into a git-ignored `.state/`. Review with the user.
