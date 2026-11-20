@@ -1,7 +1,8 @@
 module dev.avinlang.fettle.engine
 
 import avin.collections.mutable.{Map as Table}
-import dev.avinlang.fettle.graph.{Node, Value}
+import dev.avinlang.fettle.facts.{Facts}
+import dev.avinlang.fettle.graph.{Graph, Node, ResourceId, Value}
 import dev.avinlang.fettle.shell.{Command, Output}
 
 // What a provider is: for one kind, the commands that print a resource's current state (its probe),
@@ -84,6 +85,21 @@ trait Provider
     s"`${node.id.kind}` has no action `$action`"
   )
 
+  // Whether resources of this kind that stand next to each other in the order, with nothing
+  // ordering one after another, are applied together by `together` (packages installed in one
+  // transaction).
+  batches -> bool = false
+
+  // The steps that bring every resource of `items`, each with what it needs, to its declared state
+  // at once. Called only when `batches`.
+  together(items: Vector[(Node, Delta)], ctx: Context) -> Result[Vector[Step], string] = Err(
+    "this kind applies one resource at a time"
+  )
+
+  // Whether running the action `action` also does what `other` would, so a run that asks for both
+  // runs only `action` (a restart does what a reload does).
+  subsumes(action: string, other: string) -> bool = false
+
 // What the providers may read on the operator's machine, each read once a run: local files (a
 // `file`'s `source`) and secrets. `root` says whether the host's login is root.
 class Context(
@@ -93,6 +109,30 @@ class Context(
 )
   private val files = Table[string, Result[Array[byte], string]]()
   private val secrets = Table[Value, Result[string, string]]()
+  private val marks = Table[string, int]()
+
+  // The host's facts and graph, which the engine sets when it plans the host.
+  var facts: Option[Facts] = None
+  var graph: Option[Graph] = None
+
+  // The resources changed so far in this run, in the order they changed.
+  val changed = Buffer[ResourceId]()
+
+  // Records that `what` was done (the package index refreshed), after the changes made so far.
+  mark(what: string)
+    marks(what) = changed.length
+
+  // Whether `what` was done in this run.
+  marked(what: string) -> bool = marks.get(what).isDefined
+
+  // Whether a resource `which` accepts changed in this run since `what` was last done, or at all if
+  // it was not.
+  changedSince(what: string, which: (ResourceId) -> bool) -> bool
+    var i = marks.get(what).getOrElse(0)
+    while i < changed.length
+      if which(changed(i)) then return true
+      i += 1
+    false
 
   // The bytes of the local file `file`.
   bytesOf(file: string) -> Result[Array[byte], string] = files.get(file) match
@@ -110,9 +150,12 @@ class Context(
       secrets(secret) = r
       r
 
-// The providers of the built-in kinds: `file`, `directory` and `symlink`.
+// The providers of the built-in kinds.
 builtinProvider(kind: string) -> Option[Provider] = kind match
   "file" -> Some(FileProvider())
   "directory" -> Some(DirectoryProvider())
   "symlink" -> Some(SymlinkProvider())
+  "package" -> Some(PackageProvider())
+  "service" -> Some(ServiceProvider())
+  "aptRepository" -> Some(AptRepositoryProvider())
   _ -> None

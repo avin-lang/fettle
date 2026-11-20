@@ -1,0 +1,164 @@
+module dev.avinlang.fettle.engine
+
+import dev.avinlang.fettle.graph.{BoolV, Node}
+import dev.avinlang.fettle.shell.{Command, Output, Shell, quote}
+
+// The provider of `service`, on systemd or OpenRC as the host's `init` fact says. Its probe prints
+// `load=` (`loaded`, `masked` or `not-found`), `enabled=` (systemd's `is-enabled` word, or `enabled`
+// or `disabled` for OpenRC's default runlevel), `active=` (`is-active`'s word, or `active` or
+// `inactive` from `rc-service … status`) and, on systemd, `reload=yes` when the unit's file changed
+// on disk since systemd last read it. A unit file under `/etc/systemd/system` that changed in this
+// run also makes the service reload systemd's units first, once.
+
+// The init system of the host whose facts `ctx` holds: `Systemd` or `OpenRc`.
+private initOf(ctx: Context) -> Result[string, string] = ctx.facts match
+  None -> Err("the host's facts are not known")
+  Some(f) -> f.init match
+    "Systemd" -> Ok("Systemd")
+    "OpenRc" -> Ok("OpenRc")
+    "NoInit" -> Err("the host runs no init system (its `init` is `NoInit`), so it has no services to manage")
+    other -> Err(s"services under $other are not supported yet (systemd and OpenRC are)")
+
+// Whether `name` may be a service's name: not empty, not starting with `-`, and no white space or
+// control character or `/`.
+validServiceName(name: string) -> bool =
+  name.nonEmpty && !name.startsWith("-") && !name.exists(c -> int(c) <= 32 || int(c) == 127 || c == '/')
+
+// The systemd unit a service's name stands for: the name itself when it has a suffix
+// (`caddy.socket`), else `<name>.service`.
+unitOf(name: string) -> string = if name.contains(".") then name else s"$name.service"
+
+// Whether the file `file` defines the unit `u` or adds to it, under `/etc/systemd/system`.
+unitFile(file: string, u: string) -> bool =
+  file == s"/etc/systemd/system/$u" || file.startsWith(s"/etc/systemd/system/$u.d/")
+
+// Whether a file of the unit `u` changed in this run since systemd's units were last reloaded.
+private unitChanged(ctx: Context, u: string) -> bool =
+  ctx.changedSince("daemon-reload", id -> id.kind == "file" && unitFile(id.title, u))
+
+// The probe of the service `s` (a shell word) on systemd.
+systemdProbe(s: string) -> string =
+  s"export LC_ALL=C\nu=$s\n"
+    + "printf 'load=%s\\n' \"$(systemctl show -p LoadState --value \"$u\" 2>/dev/null)\"\n"
+    + "printf 'enabled=%s\\n' \"$(systemctl is-enabled \"$u\" 2>/dev/null)\"\n"
+    + "printf 'active=%s\\n' \"$(systemctl is-active \"$u\" 2>/dev/null)\"\n"
+    + "printf 'reload=%s\\n' \"$(systemctl show -p NeedDaemonReload --value \"$u\" 2>/dev/null)\""
+
+// The probe of the service `s` on OpenRC: whether its script exists, whether it is in the default
+// runlevel, and whether it is started.
+openrcProbe(s: string) -> string =
+  s"export LC_ALL=C\nu=$s\n"
+    + "if rc-service --exists \"$u\" 2>/dev/null; then echo load=loaded; else echo load=not-found; fi\n"
+    + "if rc-update show default 2>/dev/null | awk -v u=\"$u\" '$1 == u { found = 1 } END { exit !found }'; then echo enabled=enabled; else echo enabled=disabled; fi\n"
+    + "if rc-service \"$u\" status >/dev/null 2>&1; then echo active=active; else echo active=inactive; fi"
+
+// What the probe found of a service: whether its unit or script exists, whether it is masked,
+// whether it is enabled (`None` where the init system decides: a static, indirect, generated or
+// transient unit), whether it runs, and whether systemd must reload its units first.
+data ServiceState(known: bool, masked: bool, enabled: Option[bool], running: bool, reload: bool)
+
+// The state of a service in what its probe printed.
+serviceState(p: Probed) -> ServiceState
+  val load = p.value("load")
+  val known = load == "loaded" || load == "masked"
+  val word = p.value("enabled")
+  val masked = load == "masked" || word == "masked" || word == "masked-runtime"
+  val enabled = word match
+    "enabled" | "enabled-runtime" | "alias" | "linked" | "linked-runtime" -> Some(true)
+    "static" | "indirect" | "generated" | "transient" -> None
+    _ -> Some(false)
+  val active = p.value("active")
+  val running = active == "active" || active == "reloading" || active == "activating" || active == "refreshing"
+  ServiceState(known, masked, enabled, running, p.value("reload") == "yes")
+
+// The boolean field `field` of `node`, if set.
+private flag(node: Node, field: string) -> Option[bool] = node.field(field) match
+  Some(BoolV(b)) -> Some(b)
+  _ -> None
+
+// The words of the plan's line that change `field` to `to`.
+private serviceWord(field: string, to: bool) -> string = (field, to) match
+  ("running", true) -> "start"
+  ("running", false) -> "stop"
+  (_, true) -> "enable"
+  _ -> "disable"
+
+class ServiceProvider(): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string]
+    if !validServiceName(node.id.title) then return Err(s"`${node.id.title}` is not a service name")
+    val s = quote(node.id.title)?
+    initOf(ctx)? match
+      "Systemd" -> Ok([Shell(systemdProbe(s))])
+      _ -> Ok([Shell(openrcProbe(s))])
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    if outputs.length != 1 then return Err("the probe gave no output")
+    val o = outputs(0)
+    if !o.succeeded then return Err(s"the probe failed with status ${o.code}: ${o.stderr.trim}")
+    val p = readProbed(o.stdout)
+    val init = initOf(ctx)?
+    val state = serviceState(p)
+    val running = flag(node, "running")
+    val enabled = flag(node, "enabled")
+    val name = node.id.title
+    if state.masked && (running == Some(true) || enabled == Some(true))
+      return Err(s"`$name` is masked, so it cannot be started or enabled; unmask it first")
+    val changes = Buffer[FieldChange]()
+    val words = Buffer[string]()
+    if init == "Systemd" && state.known && (state.reload || unitChanged(ctx, unitOf(name)))
+      changes += FieldChange("units", "changed on disk", "reloaded")
+      words += "daemon-reload"
+    running match
+      Some(r) if r != state.running ->
+        changes += FieldChange("running", s"${state.running}", s"$r")
+        words += serviceWord("running", r)
+      _ -> ()
+    (enabled, state.enabled) match
+      (Some(e), Some(now)) if e != now ->
+        changes += FieldChange("enabled", s"$now", s"$e")
+        words += serviceWord("enabled", e)
+      _ -> ()
+    if changes.isEmpty then return Ok(Delta(InSync, "", [], None, p))
+    val note = if state.known then "" else " (not installed yet)"
+    Ok(Delta(Modify, words.mkString(", ") + note, changes.toVector, None, p))
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string]
+    val s = quote(node.id.title)?
+    val init = initOf(ctx)?
+    val to = (field: string) -> delta.changes.find(c -> c.field == field).map(c -> c.after == "true")
+    val lines = Buffer[string]()
+    if delta.changes.exists(c -> c.field == "units")
+      lines += "systemctl daemon-reload"
+      ctx.mark("daemon-reload")
+    val run = to("running")
+    val enable = to("enabled")
+    if init == "Systemd"
+      (enable, run) match
+        (Some(true), Some(true)) -> lines += s"systemctl enable --now $s"
+        (Some(false), Some(false)) -> lines += s"systemctl disable --now $s"
+        _ ->
+          enable.foreach(e -> lines += s"systemctl ${if e then "enable" else "disable"} $s")
+          run.foreach(r -> lines += s"systemctl ${if r then "start" else "stop"} $s")
+    else
+      enable.foreach(e -> lines += s"rc-update ${if e then "add" else "del"} $s default")
+      run.foreach(r -> lines += s"rc-service $s ${if r then "start" else "stop"}")
+    Ok([Step(s"set -e\n${lines.mkString("\n")}\n", Array.empty[byte](), lines.mkString("; "))])
+
+  // `start`, `stop`, `restart` or `reload`, after reloading systemd's units when a file of this unit
+  // changed in the run.
+  override action(node: Node, action: string, ctx: Context) -> Result[Vector[Step], string]
+    if !(action == "start" || action == "stop" || action == "restart" || action == "reload")
+      return Err(s"`service` has no action `$action`")
+    val s = quote(node.id.title)?
+    val lines = Buffer[string]()
+    if initOf(ctx)? == "Systemd"
+      if unitChanged(ctx, unitOf(node.id.title))
+        lines += "systemctl daemon-reload"
+        ctx.mark("daemon-reload")
+      lines += s"systemctl $action $s"
+    else lines += s"rc-service $s $action"
+    Ok([Step(s"set -e\n${lines.mkString("\n")}\n", Array.empty[byte](), lines.mkString("; "))])
+
+  // A restart does what a reload or a start would.
+  override subsumes(action: string, other: string) -> bool =
+    action == "restart" && (other == "reload" || other == "start")

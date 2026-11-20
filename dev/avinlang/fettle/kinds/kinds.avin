@@ -91,8 +91,20 @@ val commandKind: KindSpec = KindSpec("command", StringT, "Command", [
   FieldSpec("always", BoolT, false, "false")
 ], ["run"])
 
+// A vendor's apt repository (decision 17): a deb822 `.sources` file naming a signing key fetched
+// from `key` and pinned by `keySha256`.
+val aptRepositoryKind: KindSpec = KindSpec("aptRepository", StringT, "AptRepository", [
+  FieldSpec("uris", ListT(StringT)),
+  FieldSpec("suites", ListT(StringT)),
+  FieldSpec("components", ListT(StringT)),
+  FieldSpec("architectures", ListT(StringT)),
+  FieldSpec("key", StringT),
+  FieldSpec("keySha256", StringT),
+  FieldSpec("present", BoolT, false, "true")
+])
+
 // Every built-in kind of phase 1, in the order the design lists them.
-val builtinKinds: List[KindSpec] = [packageKind, serviceKind, userKind, groupKind, fileKind, directoryKind, symlinkKind, commandKind]
+val builtinKinds: List[KindSpec] = [packageKind, serviceKind, userKind, groupKind, fileKind, directoryKind, symlinkKind, commandKind, aptRepositoryKind]
 
 // The built-in kind named `name`.
 kindNamed(name: string) -> Option[KindSpec] = builtinKinds.find(k -> k.name == name)

@@ -1,0 +1,11 @@
+// inventory.fettle
+import roles.{caddy}
+
+connect all
+  user = "admin"
+  become = Sudo
+
+group web
+  host vps at "203.0.113.10"
+
+apply web -> caddy("example.com")

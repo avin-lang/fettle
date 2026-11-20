@@ -253,16 +253,21 @@ private contentOf(node: Node, ctx: Context) -> Result[Option[Content], string] =
   (None, None) -> Ok(None)
   _ -> Err("a file's `content` is a string or a secret, and its `source` a path")
 
+// What the language's `staged` evaluates to inside `validate`: a path standing for the staged file.
+private val stagedPath: string = "${staged}"
+
 // The `validate` command of `node` as a line of shell checking the staged file `"$t"`: each `%s`
-// in it stands for that file, and one must be there.
+// in it, and each `staged` (as a word, or as a word interpolated into shell text), stands for that
+// file, and one must be there.
 private validateLine(node: Node) -> Result[Option[string], string] = node.field("validate") match
   None -> Ok(None)
   Some(CommandV(_, _, Some(_), _)) -> Err("a `validate` command takes no standard input")
-  Some(CommandV(t, _, None, true)) ->
+  Some(CommandV(text, _, None, true)) ->
+    val t = text.replace(s"'$stagedPath'", "%s").replace(stagedPath, "%s")
     if !t.contains("%s") then return Err("a `validate` command names the file it checks as `%s`")
     Ok(Some(s"/bin/sh -c ${quote(t.replace("%s", "\"$1\""))?} fettle \"$$t\" </dev/null"))
   Some(CommandV(program, args, None, false)) ->
-    val words = word(StrV(program)) :: args.map(a -> word(a))
+    val words = word(StrV(program)) :: args.map(a -> word(a).replace(stagedPath, "%s"))
     if !words.exists(w -> w.contains("%s")) then return Err("a `validate` command names the file it checks as `%s`")
     val out = Buffer[string]()
     for w in words

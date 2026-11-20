@@ -36,7 +36,8 @@ The modules under the front end:
 - `transport`: the `Transport` trait (run a script with bytes on its standard input, close) and
   `LocalTransport`, which runs `/bin/sh` here; the SSH transport is built against the same trait.
 - `engine`: the plan, apply and verify loop over any `Transport`, the `Provider` trait each kind
-  implements, the `file`, `directory` and `symlink` providers, and the pending-trigger record.
+  implements, the `file`, `directory`, `symlink`, `package`, `service` and `aptRepository`
+  providers, and the pending-trigger record.
 
 ## Plan and apply
 
@@ -55,8 +56,21 @@ me (macos 15.1, arm64)
 Plan: 1 host; 1 to create, 1 to change, 0 to remove, 0 actions.
 ```
 
-Only `file`, `directory` and `symlink` have providers so far; the kinds with actions (`service`,
-`command`) come next, and until then a resource of another kind is an `x` line.
+The kinds with providers so far (a resource of another kind is an `x` line):
+
+| Kind | Title | Fields | Providers |
+|---|---|---|---|
+| `file` | path | `content` or `source`, `owner`, `group`, `mode`, `validate`, `present` | POSIX shell |
+| `directory` | path | `owner`, `group`, `mode`, `present` | POSIX shell |
+| `symlink` | path | `target`, `present` | POSIX shell |
+| `package` | name | `present`, `version` (exact or `latest`), `refresh` (index age, `1h`) | apt (Debian, Ubuntu), dnf (RHEL family, Fedora), apk (Alpine) |
+| `service` | name | `running`, `enabled`; actions `start`, `stop`, `restart`, `reload` | systemd, OpenRC |
+| `aptRepository` | name | `uris`, `suites`, `components`, `architectures`, `key` (URL), `keySha256`, `present` | apt (a deb822 `.sources` file and its key) |
+
+A host's packages are probed in one command and those next to each other install in one
+transaction; the package index is refreshed at most once a run. Packages come after every
+`aptRepository`, and a changed repository refreshes the index itself. A restart asked for in the same
+run as a reload or a start does both.
 
 `+` creates, `~` changes (a line diff for text under 256 KiB), `-` removes (`present = false`), `>`
 runs an action a trigger asked for, `x` is a resource that cannot be planned. A secret is shown as

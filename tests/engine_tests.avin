@@ -188,6 +188,29 @@ validateForms()
   )
   _ = fs.removeDirAll(dir)
 
+@test("`staged` names the staged file in `validate`: as an argument, inside a word, and in shell text")
+validateStaged()
+  val dir = scratchDir("validate-staged")
+  val f = s"$dir/site.conf"
+  val forms = [
+    CommandV("test", [StrV("-s"), PathV("${staged}")], None, false),
+    CommandV("/bin/sh", [StrV("-c"), StrV("grep -q ok \"${1#--config=}\""), StrV("sh"), StrV("--config=${staged}")], None, false),
+    CommandV("grep -q ok '${staged}'", [], None, true),
+    CommandV("grep -q ok ${staged}", [], None, true)
+  ]
+  var n = 0
+  for v in forms
+    n += 1
+    val a = applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV(s"ok $n\n")), ("validate", v)])]))
+    assertEq(outcomesOf(a), "changed")
+    assertEq(textAt(f), s"ok $n\n")
+  // A staged file that does not validate leaves the one in place.
+  val failing = CommandV("grep", [StrV("-q"), StrV("never"), PathV("${staged}")], None, false)
+  val a = applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("new\n")), ("validate", failing)])]))
+  assertEq(outcomesOf(a), "failed")
+  assertEq(textAt(f), "ok 4\n")
+  _ = fs.removeDirAll(dir)
+
 @test("`present = false` removes a file, a symlink and an empty directory, and nothing that is absent")
 removes()
   val dir = scratchDir("remove")
@@ -416,11 +439,11 @@ wrongKinds()
 @test("a kind with no provider cannot be planned, and the rest of the plan stands")
 noProvider()
   val dir = scratchDir("noprovider")
-  val g = graphOf([node("package", "nginx", 1), node("file", s"$dir/f", 2, [("content", StrV("x"))])])
+  val g = graphOf([node("cron", "nightly", 1), node("file", s"$dir/f", 2, [("content", StrV("x"))])])
   val p = planWith(engineIn(dir), g)
   assertEq(
     planText(p, dir).lines.slice(1, 3),
-    [" x package nginx cannot be planned: there is no provider for `package` yet", " + file /T/f 1 line"]
+    [" x cron nightly cannot be planned: there is no provider for `cron` yet", " + file /T/f 1 line"]
   )
   assertEq(outcomesOf(engineIn(dir).apply(p)), "failed changed")
   _ = fs.removeDirAll(dir)

@@ -23,6 +23,8 @@ data Why
   Member
   // `from` is the managed target of the symlink `to`.
   Target
+  // `from` is an apt repository, which every package comes after.
+  Repository
   // `after from` in `to`'s declaration.
   After
   // `on from -> action` in `to`'s declaration.
@@ -45,6 +47,7 @@ impl Why
     Owner(f) -> s"its `$f` names it"
     Member -> "the user is in that group"
     Target -> "the link points at it"
+    Repository -> "packages come after apt repositories"
     After -> "`after` says so"
     Trigger(a) -> s"it triggers `$a`"
 
@@ -186,11 +189,17 @@ class GraphBuilder
     diagnostics += Diagnostic("E0402", s"the resources form an ordering cycle: $names -> ${nodes(cycle(0)).id.shown}", first, "the cycle", [], "remove one of these orderings", false, links.map(e -> (e.span, s"`${nodes(e.to).id.shown}` after `${nodes(e.from).id.shown}`: ${e.why.shown}")).toList)
 
   // Puppet's autorequire: a path after its parent directory, an owner after its user and group, a
-  // user after its groups, a symlink after its managed target.
+  // user after its groups, a symlink after its managed target; and a package after every apt
+  // repository.
   private addKnownRelationships()
     var k = 0
     for node in nodes
       val kind = node.id.kind
+      if kind == "package"
+        var r = 0
+        for other in nodes
+          if other.id.kind == "aptRepository" then order(r, k, Repository, node.span)
+          r += 1
       if kind == "file" || kind == "directory" || kind == "symlink"
         parentDirectory(node.id.title) match
           Some(i) -> order(i, k, Parent, node.span)

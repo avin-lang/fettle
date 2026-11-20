@@ -1,0 +1,1 @@
+{"os": "Linux", "distro": "Rhel", "version": "9", "arch": "Arm64", "init": "Systemd", "cpus": 2, "memory": 3951591424, "hostname": "rocky", "user": "rocky", "root": false}

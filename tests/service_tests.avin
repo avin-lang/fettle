@@ -1,0 +1,355 @@
+module tests
+
+import avin.fs
+
+import dev.avinlang.fettle.engine.{
+  Context, ServiceProvider, ServiceState, openrcProbe, readProbed, serviceState, systemdProbe, unitFile, unitOf,
+  validServiceName
+}
+
+import dev.avinlang.fettle.facts.{Facts}
+import dev.avinlang.fettle.graph.{BoolV, Graph, GraphBuilder, Node, ResourceId, StrV, Value}
+import dev.avinlang.fettle.shell.{Shell}
+
+// The `service` provider on systemd and OpenRC: its probe, the states it reads, what it finds to do,
+// its steps and actions, systemd's daemon-reload after a unit file changes, and a restart taking in
+// a reload asked for in the same run.
+
+// A service resource.
+svc(name: string, line: int, fields: List[(string, Value)] = []) -> Node = node("service", name, line, fields)
+
+// Running and enabled, as a web server is declared.
+val upAndOn: List[(string, Value)] = [("running", BoolV(true)), ("enabled", BoolV(true))]
+
+// What `n` needs on `fixture` when its probe printed `text`, as `<mark> <summary>`.
+svcNeeds(n: Node, fixture: string, text: string) -> string = svcNeedsIn(n, contextOn(fixture, graphOf([n])), text)
+
+svcNeedsIn(n: Node, ctx: Context, text: string) -> string = ServiceProvider().delta(n, printed(text), ctx) match
+  Ok(d) -> s"${opMark(d.op)} ${d.summary}".trim
+  Err(e) -> s"error: $e"
+
+// The command lines of the steps that bring `n` from the state `text` describes on `fixture`.
+svcSteps(n: Node, fixture: string, text: string) -> string
+  val ctx = contextOn(fixture, graphOf([n]))
+  ServiceProvider().delta(n, printed(text), ctx) match
+    Ok(d) -> ServiceProvider().steps(n, d, ctx) match
+      Ok(s) -> s.map(x -> x.shown).mkString("\n")
+      Err(e) -> s"error: $e"
+    Err(e) -> s"error: $e"
+
+// The facts `f` with the init system `init`.
+withInit(f: Facts, init: string) -> Facts =
+  Facts(f.os, f.distro, f.version, f.arch, init, f.cpus, f.memory, f.hostname, f.user, f.root)
+
+// What systemd's probe prints for a unit in the states given.
+systemd(load: string, enabled: string, active: string, reload: string = "no") -> string =
+  s"load=$load\nenabled=$enabled\nactive=$active\nreload=$reload\n"
+
+@test("the systemd and OpenRC probes, as the host runs them")
+serviceProbes()
+  assertEq(
+    systemdProbe("caddy"),
+    "export LC_ALL=C\nu=caddy\n" + "printf 'load=%s\\n' \"$(systemctl show -p LoadState --value \"$u\" 2>/dev/null)\"\n"
+      + "printf 'enabled=%s\\n' \"$(systemctl is-enabled \"$u\" 2>/dev/null)\"\n"
+      + "printf 'active=%s\\n' \"$(systemctl is-active \"$u\" 2>/dev/null)\"\n"
+      + "printf 'reload=%s\\n' \"$(systemctl show -p NeedDaemonReload --value \"$u\" 2>/dev/null)\""
+  )
+  assertEq(
+    openrcProbe("chronyd"),
+    "export LC_ALL=C\nu=chronyd\n" + "if rc-service --exists \"$u\" 2>/dev/null; then echo load=loaded; else echo load=not-found; fi\n"
+      + "if rc-update show default 2>/dev/null | awk -v u=\"$u\" '$1 == u { found = 1 } END { exit !found }'; then echo enabled=enabled; else echo enabled=disabled; fi\n"
+      + "if rc-service \"$u\" status >/dev/null 2>&1; then echo active=active; else echo active=inactive; fi"
+  )
+  val n = svc("caddy", 1, upAndOn)
+  val g = graphOf([n])
+  assertEq(ServiceProvider().probes(n, contextOn("debian12", g)), Ok([Shell(systemdProbe("caddy"))]))
+  assertEq(ServiceProvider().probes(n, contextOn("rocky93", g)), Ok([Shell(systemdProbe("caddy"))]))
+  assertEq(ServiceProvider().probes(n, contextOn("alpine320", g)), Ok([Shell(openrcProbe("caddy"))]))
+  val odd = svc("my unit", 1)
+  assertEq(ServiceProvider().probes(odd, contextOn("debian12", graphOf([odd]))), Err("`my unit` is not a service name"))
+
+@test("a host with no init system cannot plan a service, and says why")
+noInit()
+  val n = svc("caddy", 1, upAndOn)
+  val c = contextOn("debian12", graphOf([n]))
+  c.facts = Some(withInit(facts("debian12"), "NoInit"))
+  assertEq(
+    ServiceProvider().probes(n, c),
+    Err("the host runs no init system (its `init` is `NoInit`), so it has no services to manage")
+  )
+  c.facts = Some(withInit(facts("debian12"), "Launchd"))
+  assertEq(ServiceProvider().probes(n, c), Err("services under Launchd are not supported yet (systemd and OpenRC are)"))
+
+@test("service names and the units and unit files they stand for")
+unitNames()
+  for ok in ["caddy", "getty@tty1", "systemd-journald", "caddy.socket", "a:b"]
+    assertEq(validServiceName(ok), true)
+  for bad in ["", "-x", "a b", "a/b", "a\tb"]
+    assertEq(validServiceName(bad), false)
+  assertEq(unitOf("caddy"), "caddy.service")
+  assertEq(unitOf("caddy.socket"), "caddy.socket")
+  assertEq(unitFile("/etc/systemd/system/caddy.service", "caddy.service"), true)
+  assertEq(unitFile("/etc/systemd/system/caddy.service.d/override.conf", "caddy.service"), true)
+  assertEq(unitFile("/etc/systemd/system/caddy.service.bak", "caddy.service"), false)
+  assertEq(unitFile("/etc/systemd/system/caddy-api.service", "caddy.service"), false)
+  assertEq(unitFile("/lib/systemd/system/caddy.service", "caddy.service"), false)
+
+@test("systemd's enablement and activity words read as the service's state")
+systemdStates()
+  assertEq(
+    serviceState(readProbed(systemd("loaded", "enabled", "active"))),
+    ServiceState(true, false, Some(true), true, false)
+  )
+  assertEq(
+    serviceState(readProbed(systemd("loaded", "disabled", "inactive"))),
+    ServiceState(true, false, Some(false), false, false)
+  )
+  for w in ["enabled-runtime", "alias", "linked", "linked-runtime"]
+    assertEq(serviceState(readProbed(systemd("loaded", w, "active"))).enabled, Some(true))
+  for w in ["static", "indirect", "generated", "transient"]
+    assertEq(serviceState(readProbed(systemd("loaded", w, "active"))).enabled, None)
+  for w in ["active", "reloading", "activating", "refreshing"]
+    assertEq(serviceState(readProbed(systemd("loaded", "enabled", w))).running, true)
+  for w in ["inactive", "failed", "deactivating", ""]
+    assertEq(serviceState(readProbed(systemd("loaded", "enabled", w))).running, false)
+  assertEq(serviceState(readProbed(systemd("masked", "masked", "inactive"))).masked, true)
+  assertEq(serviceState(readProbed(systemd("loaded", "masked-runtime", "inactive"))).masked, true)
+  assertEq(
+    serviceState(readProbed(systemd("not-found", "", "inactive"))),
+    ServiceState(false, false, Some(false), false, false)
+  )
+  assertEq(serviceState(readProbed(systemd("loaded", "enabled", "active", "yes"))).reload, true)
+
+@test("systemd: what a declared service needs in each combination of states")
+systemdDeltas()
+  val n = svc("caddy", 1, upAndOn)
+  assertEq(svcNeeds(n, "debian12", systemd("loaded", "enabled", "active")), "=")
+  assertEq(svcNeeds(n, "debian12", systemd("loaded", "disabled", "inactive")), "~ start, enable")
+  assertEq(svcNeeds(n, "debian12", systemd("loaded", "enabled", "failed")), "~ start")
+  assertEq(svcNeeds(n, "debian12", systemd("loaded", "disabled", "active")), "~ enable")
+  assertEq(svcNeeds(n, "debian12", systemd("not-found", "", "inactive")), "~ start, enable (not installed yet)")
+  assertEq(svcNeeds(n, "debian12", systemd("loaded", "static", "active")), "=")
+  assertEq(svcNeeds(n, "debian12", systemd("loaded", "enabled", "active", "yes")), "~ daemon-reload")
+  assertEq(
+    svcNeeds(n, "debian12", systemd("masked", "masked", "inactive")),
+    "error: `caddy` is masked, so it cannot be started or enabled; unmask it first"
+  )
+  val off = svc("caddy", 1, [("running", BoolV(false)), ("enabled", BoolV(false))])
+  assertEq(svcNeeds(off, "debian12", systemd("loaded", "enabled", "active")), "~ stop, disable")
+  assertEq(svcNeeds(off, "debian12", systemd("masked", "masked", "inactive")), "=")
+  assertEq(svcNeeds(off, "debian12", systemd("not-found", "", "inactive")), "=")
+  assertEq(svcNeeds(off, "debian12", systemd("loaded", "static", "inactive")), "=")
+  val bare = svc("caddy", 1)
+  assertEq(svcNeeds(bare, "debian12", systemd("loaded", "disabled", "inactive")), "=")
+  val runOnly = svc("caddy", 1, [("running", BoolV(true))])
+  assertEq(svcNeeds(runOnly, "debian12", systemd("loaded", "disabled", "inactive")), "~ start")
+  assertEq(
+    ServiceProvider().delta(n, [], contextOn("debian12", graphOf([n]))),
+    Err("the probe gave no output")
+  )
+
+@test("OpenRC: the default runlevel is enablement, `rc-service … status` is running")
+openrcDeltas()
+  val n = svc("chronyd", 1, upAndOn)
+  assertEq(svcNeeds(n, "alpine320", "load=loaded\nenabled=disabled\nactive=inactive\n"), "~ start, enable")
+  assertEq(svcNeeds(n, "alpine320", "load=loaded\nenabled=enabled\nactive=active\n"), "=")
+  assertEq(
+    svcNeeds(n, "alpine320", "load=not-found\nenabled=disabled\nactive=inactive\n"),
+    "~ start, enable (not installed yet)"
+  )
+  assertEq(
+    svcSteps(n, "alpine320", "load=loaded\nenabled=disabled\nactive=inactive\n"),
+    "rc-update add chronyd default; rc-service chronyd start"
+  )
+  val off = svc("chronyd", 1, [("running", BoolV(false)), ("enabled", BoolV(false))])
+  assertEq(
+    svcSteps(off, "alpine320", "load=loaded\nenabled=enabled\nactive=active\n"),
+    "rc-update del chronyd default; rc-service chronyd stop"
+  )
+
+@test("systemd's steps: enable --now and disable --now when both change, one command each otherwise")
+systemdSteps()
+  val n = svc("caddy", 1, upAndOn)
+  assertEq(svcSteps(n, "debian12", systemd("loaded", "disabled", "inactive")), "systemctl enable --now caddy")
+  assertEq(svcSteps(n, "debian12", systemd("loaded", "enabled", "inactive")), "systemctl start caddy")
+  assertEq(svcSteps(n, "debian12", systemd("loaded", "disabled", "active")), "systemctl enable caddy")
+  val off = svc("caddy", 1, [("running", BoolV(false)), ("enabled", BoolV(false))])
+  assertEq(svcSteps(off, "debian12", systemd("loaded", "enabled", "active")), "systemctl disable --now caddy")
+  val mixed = svc("caddy", 1, [("running", BoolV(false)), ("enabled", BoolV(true))])
+  assertEq(
+    svcSteps(mixed, "debian12", systemd("loaded", "disabled", "active")),
+    "systemctl enable caddy; systemctl stop caddy"
+  )
+  assertEq(
+    svcSteps(n, "debian12", systemd("loaded", "disabled", "inactive", "yes")),
+    "systemctl daemon-reload; systemctl enable --now caddy"
+  )
+
+@test("a unit file changed in this run reloads systemd's units once, before the service or its action")
+daemonReloadAfterUnitChange()
+  val n = svc("caddy", 1, upAndOn)
+  val ctx = contextOn("debian12", graphOf([n]))
+  val fine = systemd("loaded", "enabled", "active")
+  assertEq(svcNeedsIn(n, ctx, fine), "=")
+  ctx.changed += ResourceId("file", "/etc/caddy/Caddyfile")
+  assertEq(svcNeedsIn(n, ctx, fine), "=")
+  ctx.changed += ResourceId("file", "/etc/systemd/system/caddy.service.d/override.conf")
+  assertEq(svcNeedsIn(n, ctx, fine), "~ daemon-reload")
+  assertEq(
+    ServiceProvider().action(n, "restart", ctx).map(s -> s.map(x -> x.shown).mkString("\n")),
+    Ok("systemctl daemon-reload; systemctl restart caddy")
+  )
+  // The action reloaded the units, so neither the service nor a second action does it again.
+  assertEq(svcNeedsIn(n, ctx, fine), "=")
+  assertEq(
+    ServiceProvider().action(n, "reload", ctx).map(s -> s.map(x -> x.shown).mkString("\n")),
+    Ok("systemctl reload caddy")
+  )
+  // Another unit's file reloads only that unit's service.
+  ctx.changed += ResourceId("file", "/etc/systemd/system/other.service")
+  assertEq(svcNeedsIn(n, ctx, fine), "=")
+  ctx.changed += ResourceId("file", "/etc/systemd/system/caddy.service")
+  assertEq(svcNeedsIn(n, ctx, fine), "~ daemon-reload")
+  // OpenRC has no units to reload.
+  val alpine = contextOn("alpine320", graphOf([n]))
+  alpine.changed += ResourceId("file", "/etc/systemd/system/caddy.service")
+  assertEq(svcNeedsIn(n, alpine, "load=loaded\nenabled=enabled\nactive=active\n"), "=")
+
+@test("the four actions on systemd and OpenRC, and no other")
+serviceActions()
+  val n = svc("caddy", 1)
+  val d = contextOn("debian12", graphOf([n]))
+  val a = contextOn("alpine320", graphOf([n]))
+  for act in ["start", "stop", "restart", "reload"]
+    assertEq(
+      ServiceProvider().action(n, act, d).map(s -> s.map(x -> x.shown).mkString("")),
+      Ok(s"systemctl $act caddy")
+    )
+    assertEq(
+      ServiceProvider().action(n, act, a).map(s -> s.map(x -> x.shown).mkString("")),
+      Ok(s"rc-service caddy $act")
+    )
+  assertEq(ServiceProvider().action(n, "run", d), Err("`service` has no action `run`"))
+  val p = ServiceProvider()
+  assertEq(p.subsumes("restart", "reload"), true)
+  assertEq(p.subsumes("restart", "start"), true)
+  assertEq(p.subsumes("reload", "restart"), false)
+  assertEq(p.subsumes("restart", "stop"), false)
+  assertEq(p.subsumes("start", "reload"), false)
+
+// --- on a stub host ----------------------------------------------------------------------------
+
+// A systemd stub host where the unit `caddy.service` is loaded, enabled and active.
+caddyHost(name: string) -> string
+  val dir = stubHost(name)
+  put(dir, "units/caddy.service.load", "loaded")
+  put(dir, "units/caddy.service.enabled", "enabled")
+  put(dir, "units/caddy.service.active", "active")
+  dir
+
+// A graph of two files and the service `caddy`, reloaded when `conf` changes and restarted when
+// `env` changes.
+reloadAndRestart(dir: string, conf: string, env: string) -> Graph
+  val b = GraphBuilder()
+  val c = b.add(node("file", s"$dir/Caddyfile", 1, [("content", StrV(conf))]))
+  val u = b.add(node("file", s"$dir/caddy.env", 2, [("content", StrV(env))]))
+  val s = b.add(svc("caddy", 3, upAndOn))
+  b.trigger([c], s, "reload", at(3))
+  b.trigger([u], s, "restart", at(3))
+  b.finish()
+
+@test("a restart and a reload asked for in one run are one restart")
+restartTakesInReload()
+  val dir = caddyHost("svc-merge")
+  val t = StubTransport(dir)
+  val e = stubEngine(dir, t)
+  val p = stubPlan(e, reloadAndRestart(dir, "a\n", "b\n"), "debian12")
+  assertEq(p.actions.map(a -> a.action), ["restart"])
+  assertEq(p.actions(0).sources.length, 2)
+  assertEq(planText(p, dir).lines(3), " > service caddy restart (file /T/caddy.env, file /T/Caddyfile)")
+  val a = e.apply(p)
+  assertEq(outcomesOf(a), "changed changed ok")
+  assertEq(a.actions.map(r -> r.action), ["restart"])
+  assertEq(logOf(dir), "systemctl restart caddy\n")
+  assertEq(fs.exists(pendingIn(dir)), false)
+  // Only the configuration changing: a reload alone.
+  val q = stubPlan(stubEngine(dir, StubTransport(dir)), reloadAndRestart(dir, "a2\n", "b\n"), "debian12")
+  assertEq(q.actions.map(a -> a.action), ["reload"])
+  _ = stubEngine(dir, StubTransport(dir)).apply(q)
+  assertEq(logOf(dir), "systemctl restart caddy\nsystemctl reload caddy\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a pending reload left by a failed run is done by this run's restart, and cleared")
+pendingReloadUnderRestart()
+  val dir = caddyHost("svc-pending")
+  val g = reloadAndRestart(dir, "a\n", "b\n")
+  _ = fs.createDirAll(s"$dir/state")
+  _ = fs.writeText(pendingIn(dir), "[\"service\",\"caddy\",\"reload\"]\n")
+  _ = fs.writeText(s"$dir/Caddyfile", "a\n")
+  val e = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e, g, "debian12")
+  assertEq(p.actions.map(a -> s"${a.action} ${a.pending}"), ["restart true"])
+  _ = e.apply(p)
+  assertEq(logOf(dir), "systemctl restart caddy\n")
+  assertEq(fs.exists(pendingIn(dir)), false)
+  _ = fs.removeDirAll(dir)
+
+@test("a service the plan found in sync reloads systemd's units when its unit changed on disk")
+needDaemonReloadOnStub()
+  val dir = caddyHost("svc-reload")
+  put(dir, "units/caddy.service.reload", "yes")
+  val e = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e, graphOf([svc("caddy", 1, upAndOn)]), "debian12")
+  assertEq(planText(p, dir).lines(1), " ~ service caddy daemon-reload")
+  assertEq(outcomesOf(e.apply(p)), "changed")
+  assertEq(logOf(dir), "systemctl daemon-reload\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a service whose package installs in the same run is started and enabled after it")
+serviceAfterPackage()
+  val dir = stubHost("svc-new")
+  put(dir, "repo/caddy", "2.9.1")
+  val g = graphOf([node("package", "caddy", 1), svc("caddy", 2, upAndOn)])
+  val e = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e, g, "debian12")
+  assertEq(planText(p, dir).lines(2), " ~ service caddy start, enable (not installed yet)")
+  // The package's install puts the unit in place, as caddy's does.
+  _ = fs.writeText(
+    s"$dir/bin/apt-get",
+    aptGetStub + "printf 'loaded\\n' >\"$STUB/units/caddy.service.load\"; printf 'disabled\\n' >\"$STUB/units/caddy.service.enabled\"\n"
+  )
+  _ = shOut(s"chmod +x ${sq(dir)}/bin/apt-get")
+  assertEq(outcomesOf(e.apply(p)), "changed changed")
+  assertEq(logOf(dir).lines.slice(2, 3), ["systemctl enable --now caddy"])
+  _ = fs.removeDirAll(dir)
+
+@test("OpenRC on an Alpine stub host: added to the default runlevel and started")
+openrcOnStub()
+  val dir = stubHost("svc-openrc")
+  put(dir, "initd/chronyd", "")
+  val e = stubEngine(dir, StubTransport(dir))
+  val g = graphOf([svc("chronyd", 1, upAndOn)])
+  val p = stubPlan(e, g, "alpine320")
+  assertEq(planText(p, dir).lines(1), " ~ service chronyd start, enable")
+  assertEq(outcomesOf(e.apply(p)), "changed")
+  assertEq(logOf(dir), "rc-update add chronyd default\nrc-service chronyd start\n")
+  assertEq(stubPlan(stubEngine(dir, StubTransport(dir)), g, "alpine320").hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("a service on a host with no init system is an `x` line, and the rest of the plan stands")
+noInitOnStub()
+  val dir = stubHost("svc-noinit")
+  val e = stubEngine(dir, StubTransport(dir))
+  val g = graphOf([svc("caddy", 1, upAndOn), node("file", s"$dir/f", 2, [("content", StrV("x"))])])
+  val f = withInit(facts("debian12"), "NoInit")
+  val p = e.plan("web1", f, g) match
+    Ok(x) -> x
+    Err(m) -> fail(m)
+  assertEq(
+    planText(p, dir).lines.slice(1, 3),
+    [
+      " x service caddy cannot be planned: the host runs no init system (its `init` is `NoInit`), so it has no services to manage",
+      " + file /T/f 1 line"
+    ]
+  )
+  _ = fs.removeDirAll(dir)

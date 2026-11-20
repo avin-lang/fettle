@@ -1,0 +1,467 @@
+module tests
+
+import avin.fs
+
+import dev.avinlang.fettle.engine.{
+  Apk, Apt, Context, Create, Delta, Dnf, InSync, Modify, Op, PackageProvider, PackageState, Remove, Step, apkProbe,
+  aptProbe, dnfProbe, managerFor, packageState, readProbed, validPackageName, validVersion
+}
+
+import dev.avinlang.fettle.graph.{After, BoolV, DurationV, GraphBuilder, Node, StrV, Value}
+import dev.avinlang.fettle.report.{showApplied}
+import dev.avinlang.fettle.shell.{Output, Shell}
+
+// The `package` provider: its probe (one command for every package of a host), what it finds
+// against what is declared on Debian 12, Ubuntu 24.04, Rocky 9 and Alpine 3.20, its steps (one
+// transaction, the index refreshed at most once), and the engine driving it on a stub host.
+
+// A package resource.
+pkg(name: string, line: int, fields: List[(string, Value)] = []) -> Node = node("package", name, line, fields)
+
+// The mark of an operation, as the plan writes it, `=` for in sync.
+opMark(op: Op) -> string = op match
+  Create -> "+"
+  Modify -> "~"
+  Remove -> "-"
+  InSync -> "="
+
+// What `n` needs on the host of `fixture` whose package probe printed `text`, as `<mark> <summary>`.
+needs(n: Node, fixture: string, text: string) -> string =
+  PackageProvider().delta(n, printed(text), contextOn(fixture, graphOf([n]))) match
+    Ok(d) -> s"${opMark(d.op)} ${d.summary}".trim
+    Err(e) -> s"error: $e"
+
+// The delta of `n` on `fixture` for the probe text `text`; an error fails the test.
+deltaFor(n: Node, ctx: Context, text: string) -> Delta = PackageProvider().delta(n, printed(text), ctx) match
+  Ok(d) -> d
+  Err(e) -> fail(s"no delta: $e")
+
+// The command lines of `steps`, one a line.
+shownOf(steps: Vector[Step]) -> string = steps.map(s -> s.shown).mkString("\n")
+
+// The steps of `nodes` together on `fixture`, each with what `text` says it needs.
+stepsFor(nodes: Vector[Node], fixture: string, text: string) -> string
+  val ctx = contextOn(fixture, graphOf(nodes))
+  val items = nodes.map(n -> (n, deltaFor(n, ctx, text)))
+  PackageProvider().together(items, ctx) match
+    Ok(s) -> shownOf(s)
+    Err(e) -> s"error: $e"
+
+val aptGolden: string = "export LC_ALL=C\n"
+  + "command -v dpkg-query >/dev/null 2>&1 || { echo 'dpkg-query is not on this host' >&2; exit 1; }\n"
+  + "f=/var/lib/apt/periodic/update-success-stamp\n"
+  + "[ -e \"$f\" ] || f=/var/lib/apt/lists\n"
+  + "if [ -e \"$f\" ]; then m=$(stat -c %Y \"$f\" 2>/dev/null || stat -f %m \"$f\"); echo \"index-age=$(( $(date +%s) - m ))\"; fi\n"
+  + "dpkg-query -W -f 'installed:${Package}=${db:Status-Status} ${Version}\\n' caddy curl 2>/dev/null\n"
+  + "apt-cache policy caddy curl 2>/dev/null | awk '/^[^ ]/ { p = $1; sub(/:$/, \"\", p) } /^  Candidate:/ { print \"candidate:\" p \"=\" $2 }'\n"
+  + "exit 0"
+
+@test("every apt package of a host shares one probe command, its names in the graph's order")
+aptProbeShared()
+  val g = graphOf([pkg("caddy", 1), node("file", "/etc/caddy/Caddyfile", 2), pkg("curl", 3)])
+  val ctx = contextOn("debian12", g)
+  val p = PackageProvider()
+  assertEq(p.probes(g.nodes(0), ctx), Ok([Shell(aptGolden)]))
+  assertEq(p.probes(g.nodes(2), ctx), p.probes(g.nodes(0), ctx))
+  assertEq(aptProbe("caddy curl", ""), aptGolden)
+  assertEq(PackageProvider().probes(g.nodes(0), contextOn("ubuntu2404", g)), Ok([Shell(aptGolden)]))
+
+@test("dnf and apk probes read rpm and dnf's repoquery, and apk's database and `apk version`")
+otherProbes()
+  val g = graphOf([pkg("nginx", 1), pkg("git", 2)])
+  assertEq(
+    dnfProbe("nginx git"),
+    "export LC_ALL=C\n" + "command -v rpm >/dev/null 2>&1 || { echo 'rpm is not on this host' >&2; exit 1; }\n"
+      + "rpm -q --qf 'installed:%{NAME}=installed %{VERSION}-%{RELEASE}\\n' nginx git 2>/dev/null\n"
+      + "dnf -q repoquery --latest-limit 1 --qf 'candidate:%{name}=%{version}-%{release}\\n' nginx git 2>/dev/null\n"
+      + "exit 0"
+  )
+  assertEq(PackageProvider().probes(g.nodes(1), contextOn("rocky93", g)), Ok([Shell(dnfProbe("nginx git"))]))
+  assertEq(PackageProvider().probes(g.nodes(0), contextOn("alpine320", g)), Ok([Shell(apkProbe("nginx git", ""))]))
+  assert(apkProbe("nginx git", "").contains("awk -v want=' nginx git ' "))
+  assert(apkProbe("nginx git", "").contains("apk version -l '<' nginx git 2>/dev/null"))
+  assert(apkProbe("nginx git", "").contains("db=/lib/apk/db/installed\n"))
+
+@test("the manager follows the distribution, and one with none is an error")
+managers()
+  assertEq(managerFor("Debian"), Ok(Apt))
+  assertEq(managerFor("Ubuntu"), Ok(Apt))
+  assertEq(managerFor("Rhel"), Ok(Dnf))
+  assertEq(managerFor("Fedora"), Ok(Dnf))
+  assertEq(managerFor("Alpine"), Ok(Apk))
+  assertEq(managerFor("Arch"), Err("packages on Arch are not supported yet (apt, dnf and apk are)"))
+  assertEq(managerFor("Macos").isErr, true)
+  val g = graphOf([pkg("git", 1)])
+  assertEq(
+    PackageProvider().probes(g.nodes(0), contextOn("nope", g)).isErr,
+    true
+  )
+
+@test("package names and versions are checked before they reach a command")
+namesAndVersions()
+  for ok in ["caddy", "g++", "libc6", "python3.11", "x_y", "a-b", "Z"]
+    assertEq(validPackageName(ok), true)
+  for bad in ["", "-y", ".x", "+x", "_x", "a b", "a;b", "a/b", "caddy\n", "näme", "a:amd64"]
+    assertEq(validPackageName(bad), false)
+  for ok in ["2.8.4", "1:2.39.5-0+deb12u1", "1.24.0-2ubuntu7", "2.8.4-r3", "1.0~rc1", "1.20.1-14.el9_2.1"]
+    assertEq(validVersion(ok), true)
+  for bad in ["", "-1", "1 2", ">=1", "1*", "1;rm"]
+    assertEq(validVersion(bad), false)
+  val g = graphOf([pkg("-y", 1), pkg("git", 2, [("version", StrV(">=2"))]), pkg("vim", 3, [("version", StrV(""))])])
+  val ctx = contextOn("debian12", g)
+  assertEq(PackageProvider().probes(g.nodes(0), ctx), Err("`-y` is not a package name"))
+  assertEq(
+    PackageProvider().probes(g.nodes(1), ctx),
+    Err("`>=2` is not a package version (exact, such as `2.8.4-1`, or `latest`)")
+  )
+  assertEq(PackageProvider().probes(g.nodes(2), ctx).isErr, true)
+  // A name that is not a package name is left out of the probe the others share.
+  val mixed = graphOf([pkg("git", 2), pkg("-y", 1)])
+  assertEq(PackageProvider().probes(mixed.nodes(0), contextOn("debian12", mixed)), Ok([Shell(aptProbe("git", ""))]))
+
+// What apt's probe prints on Debian 12 for caddy installed at 2.8.4 with 2.9.1 in the index, curl
+// installed and current, git removed with its configuration left, and vim unknown.
+val debianProbe: string = "index-age=120\n"
+  + "installed:caddy=installed 2.8.4\n"
+  + "installed:curl=installed 7.88.1-10+deb12u8\n"
+  + "installed:git=config-files 1:2.39.5-0+deb12u1\n"
+  + "candidate:caddy=2.9.1\n"
+  + "candidate:curl=7.88.1-10+deb12u8\n"
+  + "candidate:git=1:2.39.5-0+deb12u1\n"
+  + "candidate:vim=(none)\n"
+
+@test("apt on Debian 12: missing, present, wrong version, latest with a newer candidate, absent")
+debianDeltas()
+  assertEq(needs(pkg("curl", 1), "debian12", debianProbe), "=")
+  assertEq(needs(pkg("caddy", 1), "debian12", debianProbe), "=")
+  assertEq(needs(pkg("git", 1), "debian12", debianProbe), "+ install 1:2.39.5-0+deb12u1")
+  assertEq(needs(pkg("vim", 1), "debian12", debianProbe), "+ install")
+  assertEq(needs(pkg("nano", 1), "debian12", debianProbe), "+ install")
+  assertEq(needs(pkg("nano", 1, [("version", StrV("7.2-1"))]), "debian12", debianProbe), "+ install 7.2-1")
+  assertEq(needs(pkg("caddy", 1, [("version", StrV("latest"))]), "debian12", debianProbe), "~ upgrade 2.8.4 -> 2.9.1")
+  assertEq(needs(pkg("curl", 1, [("version", StrV("latest"))]), "debian12", debianProbe), "=")
+  assertEq(needs(pkg("caddy", 1, [("version", StrV("2.8.4"))]), "debian12", debianProbe), "=")
+  assertEq(needs(pkg("caddy", 1, [("version", StrV("2.7.6"))]), "debian12", debianProbe), "~ 2.8.4 -> 2.7.6")
+  assertEq(needs(pkg("caddy", 1, [("present", BoolV(false))]), "debian12", debianProbe), "- remove 2.8.4")
+  assertEq(needs(pkg("git", 1, [("present", BoolV(false))]), "debian12", debianProbe), "=")
+  assertEq(needs(pkg("vim", 1, [("present", BoolV(false))]), "debian12", debianProbe), "=")
+  assertEq(needs(pkg("caddy", 1), "debian12", ""), "+ install")
+
+@test("`latest` with an index older than `refresh` refreshes it to look for a newer version")
+latestStale()
+  val old = debianProbe.replace("index-age=120", "index-age=7200")
+  val latest = pkg("curl", 1, [("version", StrV("latest"))])
+  assertEq(needs(latest, "debian12", old), "~ 7.88.1-10+deb12u8; refresh the index (older than 1h) for a newer version")
+  assertEq(needs(latest, "debian12", old.replace("index-age=7200\n", "")), needs(latest, "debian12", old))
+  assertEq(needs(pkg("curl", 1, [("version", StrV("latest")), ("refresh", DurationV(86400000))]), "debian12", old), "=")
+  assertEq(needs(pkg("curl", 1, [("version", StrV("latest")), ("refresh", DurationV(7200000))]), "debian12", old), "=")
+  assertEq(
+    needs(
+      pkg("curl", 1, [("version", StrV("latest")), ("refresh", DurationV(7199000))]),
+      "debian12",
+      old
+    ).startsWith("~ "),
+    true
+  )
+  // A run that has refreshed the index already takes the candidate as it stands.
+  val g = graphOf([latest])
+  val ctx = contextOn("debian12", g)
+  ctx.mark("index")
+  assertEq(deltaFor(latest, ctx, old).op, InSync)
+  // Not `latest`: an old index changes nothing about a package that is installed.
+  assertEq(needs(pkg("curl", 1), "debian12", old), "=")
+
+@test("apt on Ubuntu 24.04: nginx's Ubuntu revision is compared exactly")
+ubuntuDeltas()
+  val probe = "index-age=60\ninstalled:nginx=installed 1.24.0-2ubuntu7\ncandidate:nginx=1.24.0-2ubuntu7.1\n"
+  assertEq(
+    needs(pkg("nginx", 1, [("version", StrV("latest"))]), "ubuntu2404", probe),
+    "~ upgrade 1.24.0-2ubuntu7 -> 1.24.0-2ubuntu7.1"
+  )
+  assertEq(needs(pkg("nginx", 1, [("version", StrV("1.24.0"))]), "ubuntu2404", probe), "~ 1.24.0-2ubuntu7 -> 1.24.0")
+  assertEq(needs(pkg("nginx", 1, [("version", StrV("1.24.0-2ubuntu7"))]), "ubuntu2404", probe), "=")
+
+@test("dnf on Rocky 9: a version matches with or without its release, and there is no index age")
+rockyDeltas()
+  val probe = "installed:nginx=installed 1.20.1-14.el9_2.1\ncandidate:nginx=1.20.1-16.el9_4.1\ncandidate:git=2.43.5-1.el9_4\n"
+  assertEq(needs(pkg("nginx", 1), "rocky93", probe), "=")
+  assertEq(needs(pkg("nginx", 1, [("version", StrV("1.20.1"))]), "rocky93", probe), "=")
+  assertEq(needs(pkg("nginx", 1, [("version", StrV("1.20.1-14.el9_2.1"))]), "rocky93", probe), "=")
+  assertEq(needs(pkg("nginx", 1, [("version", StrV("1.20"))]), "rocky93", probe), "~ 1.20.1-14.el9_2.1 -> 1.20")
+  assertEq(
+    needs(pkg("nginx", 1, [("version", StrV("latest"))]), "rocky93", probe),
+    "~ upgrade 1.20.1-14.el9_2.1 -> 1.20.1-16.el9_4.1"
+  )
+  assertEq(needs(pkg("git", 1), "rocky93", probe), "+ install 2.43.5-1.el9_4")
+  val current = "installed:git=installed 2.43.5-1.el9_4\ncandidate:git=2.43.5-1.el9_4\n"
+  assertEq(needs(pkg("git", 1, [("version", StrV("latest"))]), "rocky93", current), "=")
+
+@test("apk on Alpine 3.20: the newer version comes from `apk version`, keyed by the installed one")
+alpineDeltas()
+  val probe = "index-age=30\ninstalled:caddy=installed 2.7.6-r6\ninstalled:curl=installed 8.9.0-r0\nupgrade:caddy-2.7.6-r6=2.8.4-r3\n"
+  assertEq(needs(pkg("caddy", 1, [("version", StrV("latest"))]), "alpine320", probe), "~ upgrade 2.7.6-r6 -> 2.8.4-r3")
+  assertEq(needs(pkg("curl", 1, [("version", StrV("latest"))]), "alpine320", probe), "=")
+  assertEq(needs(pkg("curl", 1, [("version", StrV("8.9.0-r0"))]), "alpine320", probe), "=")
+  assertEq(needs(pkg("jq", 1), "alpine320", probe), "+ install")
+  assertEq(needs(pkg("caddy", 1, [("present", BoolV(false))]), "alpine320", probe), "- remove 2.7.6-r6")
+  assertEq(packageState(Apk, "curl", readProbed(probe)), PackageState(Some("8.9.0-r0"), Some("8.9.0-r0")))
+  assertEq(packageState(Apk, "jq", readProbed(probe)), PackageState(None, None))
+  assertEq(packageState(Apt, "vim", readProbed(debianProbe)), PackageState(None, None))
+  assertEq(packageState(Dnf, "vim", readProbed("")), PackageState(None, None))
+
+@test("a failed probe cannot be planned and says why")
+failedProbe()
+  val n = pkg("caddy", 1)
+  val r = PackageProvider().delta(
+    n,
+    [Output(1, "", "dpkg-query is not on this host\n")],
+    contextOn("debian12", graphOf([n]))
+  )
+  assertEq(r, Err("the probe failed with status 1: dpkg-query is not on this host"))
+  assertEq(PackageProvider().delta(n, [], contextOn("debian12", graphOf([n]))), Err("the probe gave no output"))
+
+@test("packages install in one transaction, after one refresh of a stale index")
+oneTransaction()
+  val stale = "installed:caddy=installed 2.8.4\ncandidate:caddy=2.9.1\ncandidate:curl=7.88.1\ncandidate:git=1:2.39.5\n"
+  val fresh = "index-age=10\n" + stale
+  val install = "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold"
+  assertEq(stepsFor([pkg("curl", 1), pkg("git", 2)], "debian12", stale), s"apt-get update\n$install curl git")
+  assertEq(stepsFor([pkg("curl", 1), pkg("git", 2)], "debian12", fresh), s"$install curl git")
+  assertEq(stepsFor([pkg("curl", 1)], "debian12", fresh), s"$install curl")
+  assertEq(
+    stepsFor(
+      [pkg("curl", 1), pkg("caddy", 2, [("version", StrV("latest"))]), pkg("git", 3, [("version", StrV("1:2.39.5"))])],
+      "debian12",
+      fresh
+    ),
+    s"$install curl caddy 'git=1:2.39.5'"
+  )
+  assertEq(
+    stepsFor([pkg("caddy", 1, [("version", StrV("2.7.6"))])], "debian12", fresh),
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold --allow-downgrades 'caddy=2.7.6'"
+  )
+  assertEq(
+    stepsFor([pkg("caddy", 1, [("present", BoolV(false))]), pkg("curl", 2)], "debian12", stale),
+    s"apt-get update\nDEBIAN_FRONTEND=noninteractive apt-get remove -y caddy\n$install curl"
+  )
+  assertEq(
+    stepsFor([pkg("caddy", 1, [("present", BoolV(false))])], "debian12", stale),
+    "DEBIAN_FRONTEND=noninteractive apt-get remove -y caddy"
+  )
+  assertEq(stepsFor([pkg("caddy", 1)], "debian12", stale), "")
+
+@test("dnf installs and upgrades in two transactions and never refreshes; apk refreshes with `apk update`")
+otherTransactions()
+  val rocky = "installed:nginx=installed 1.20.1-14.el9_2.1\ncandidate:nginx=1.20.1-16.el9_4.1\ncandidate:git=2.43.5-1.el9_4\n"
+  assertEq(
+    stepsFor(
+      [pkg("git", 1), pkg("nginx", 2, [("version", StrV("latest"))]), pkg("vim", 3, [("version", StrV("8.2.2637"))])],
+      "rocky93",
+      rocky
+    ),
+    "dnf install -y git vim-8.2.2637\ndnf upgrade -y nginx"
+  )
+  assertEq(stepsFor([pkg("nginx", 1, [("present", BoolV(false))])], "rocky93", rocky), "dnf remove -y nginx")
+  val alpine = "installed:caddy=installed 2.7.6-r6\nupgrade:caddy-2.7.6-r6=2.8.4-r3\n"
+  assertEq(
+    stepsFor(
+      [pkg("curl", 1), pkg("caddy", 2, [("version", StrV("latest"))]), pkg("jq", 3, [("version", StrV("1.7.1-r0"))])],
+      "alpine320",
+      alpine
+    ),
+    "apk update\napk add curl 'jq=1.7.1-r0'\napk add -u caddy"
+  )
+  assertEq(stepsFor([pkg("curl", 1)], "alpine320", "index-age=5\n" + alpine), "apk add curl")
+  assertEq(stepsFor([pkg("caddy", 1, [("present", BoolV(false))])], "alpine320", alpine), "apk del caddy")
+
+@test("the index is refreshed at most once a run, whatever installs after")
+refreshOnce()
+  val g = graphOf([pkg("curl", 1), pkg("git", 2)])
+  val ctx = contextOn("debian12", g)
+  val first = PackageProvider().together([(g.nodes(0), deltaFor(g.nodes(0), ctx, "candidate:curl=1\n"))], ctx)
+  val second = PackageProvider().together([(g.nodes(1), deltaFor(g.nodes(1), ctx, "candidate:git=2\n"))], ctx)
+  assertEq(first.map(s -> s.length), Ok(2))
+  assertEq(
+    second.map(s -> shownOf(s)),
+    Ok(
+      "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold git"
+    )
+  )
+  assertEq(ctx.marked("index"), true)
+
+// --- on a stub host ----------------------------------------------------------------------------
+
+// A Debian stub host whose index offers caddy 2.9.1, curl and git, with nothing installed.
+debianHost(name: string) -> string
+  val dir = stubHost(name)
+  put(dir, "repo/caddy", "2.9.1")
+  put(dir, "repo/curl", "7.88.1-10+deb12u8")
+  put(dir, "repo/git", "1:2.39.5-0+deb12u1")
+  dir
+
+@test("N packages are one probe in the plan and one install in the apply, and a second plan is empty")
+batchedOnStub()
+  val dir = debianHost("pkg-batch")
+  val g = graphOf([pkg("caddy", 1), pkg("curl", 2), pkg("git", 3)])
+  val t = StubTransport(dir)
+  val e = stubEngine(dir, t)
+  val p = stubPlan(e, g, "debian12")
+  assertEq(t.scripts.length, 1)
+  assertEq(t.scripts(0).split("dpkg-query -W").length, 2)
+  assertEq(
+    planText(p, dir).lines.slice(1, 4),
+    [
+      " + package caddy install 2.9.1",
+      " + package curl install 7.88.1-10+deb12u8",
+      " + package git install 1:2.39.5-0+deb12u1"
+    ]
+  )
+  val a = e.apply(p)
+  assertEq(outcomesOf(a), "changed changed changed")
+  assertEq(
+    logOf(dir),
+    "apt-get update\napt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold caddy curl git\n"
+  )
+  // The plan's probe, the refresh, the install, and one verifying probe that all three share.
+  assertEq(t.scripts.length, 4)
+  assertEq(textAt(s"$dir/dpkg/git"), "installed 1:2.39.5-0+deb12u1\n")
+  val again = stubPlan(stubEngine(dir, StubTransport(dir)), g, "debian12")
+  assertEq(again.hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("packages split by another resource install in two transactions with one refresh")
+splitByFile()
+  val dir = debianHost("pkg-split")
+  val g = graphOf([pkg("caddy", 1), node("file", s"$dir/x", 2, [("content", StrV("x"))]), pkg("curl", 3)])
+  val e = stubEngine(dir, StubTransport(dir))
+  assertEq(outcomesOf(e.apply(stubPlan(e, g, "debian12"))), "changed changed changed")
+  assertEq(
+    logOf(dir),
+    "apt-get update\napt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold caddy\n" + "apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold curl\n"
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("an `after` between two packages keeps them in separate transactions")
+afterSplits()
+  val dir = debianHost("pkg-after")
+  val b = GraphBuilder()
+  val c = b.add(pkg("caddy", 1))
+  val u = b.add(pkg("curl", 2))
+  b.order(c, u, After, at(2))
+  val e = stubEngine(dir, StubTransport(dir))
+  _ = e.apply(stubPlan(e, b.finish(), "debian12"))
+  assertEq(logOf(dir).lines.length, 3)
+  _ = fs.removeDirAll(dir)
+
+@test("a fresh index is not refreshed; `latest` with a newer candidate upgrades")
+freshIndexOnStub()
+  val dir = debianHost("pkg-fresh")
+  _ = fs.createDirAll(s"$dir/root/var/lib/apt/lists")
+  put(dir, "dpkg/caddy", "installed 2.8.4")
+  val g = graphOf([pkg("caddy", 1, [("version", StrV("latest"))]), pkg("curl", 2)])
+  val e = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e, g, "debian12")
+  assertEq(
+    planText(p, dir).lines.slice(1, 3),
+    [" ~ package caddy upgrade 2.8.4 -> 2.9.1", " + package curl install 7.88.1-10+deb12u8"]
+  )
+  assertEq(outcomesOf(e.apply(p)), "changed changed")
+  assertEq(logOf(dir), "apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold caddy curl\n")
+  assertEq(textAt(s"$dir/dpkg/caddy"), "installed 2.9.1\n")
+  _ = fs.removeDirAll(dir)
+
+@test("`latest` on a stale index refreshes once, then upgrades to what the refresh found")
+latestRefreshOnStub()
+  val dir = debianHost("pkg-latest")
+  put(dir, "dpkg/caddy", "installed 2.8.4")
+  put(dir, "repo/caddy", "2.8.4")
+  put(dir, "next/caddy", "2.9.1")
+  val g = graphOf([pkg("caddy", 1, [("version", StrV("latest"))])])
+  val e = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e, g, "debian12")
+  assertEq(planText(p, dir).lines(1), " ~ package caddy 2.8.4; refresh the index (older than 1h) for a newer version")
+  assertEq(outcomesOf(e.apply(p)), "changed")
+  assertEq(
+    logOf(dir),
+    "apt-get update\napt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold caddy\n"
+  )
+  assertEq(textAt(s"$dir/dpkg/caddy"), "installed 2.9.1\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a wrong exact version is installed with downgrades allowed; an absent package is removed")
+versionAndAbsentOnStub()
+  val dir = debianHost("pkg-version")
+  _ = fs.createDirAll(s"$dir/root/var/lib/apt/lists")
+  put(dir, "dpkg/caddy", "installed 2.9.1")
+  put(dir, "dpkg/git", "installed 1:2.39.5-0+deb12u1")
+  val g = graphOf([pkg("caddy", 1, [("version", StrV("2.8.4"))]), pkg("git", 2, [("present", BoolV(false))])])
+  val e = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e, g, "debian12")
+  assertEq(
+    planText(p, dir).lines.slice(1, 3),
+    [" ~ package caddy 2.9.1 -> 2.8.4", " - package git remove 1:2.39.5-0+deb12u1"]
+  )
+  assertEq(outcomesOf(e.apply(p)), "changed changed")
+  assertEq(
+    logOf(dir),
+    "apt-get remove -y git\napt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold --allow-downgrades caddy=2.8.4\n"
+  )
+  assertEq(fs.exists(s"$dir/dpkg/git"), false)
+  _ = fs.removeDirAll(dir)
+
+@test("a failed transaction fails every package in it, and what depends on them is skipped")
+failedTransaction()
+  val dir = debianHost("pkg-fail")
+  put(dir, "fail", "")
+  val b = GraphBuilder()
+  b.add(pkg("caddy", 1))
+  b.add(pkg("curl", 2))
+  val f = b.add(node("file", s"$dir/conf", 3, [("content", StrV("x"))]))
+  b.order(1, f, After, at(3))
+  val e = stubEngine(dir, StubTransport(dir))
+  val a = e.apply(stubPlan(e, b.finish(), "debian12"))
+  assertEq(outcomesOf(a), "failed failed skipped")
+  assertEq(logOf(dir), "apt-get update\n")
+  _ = fs.removeDirAll(dir)
+
+@test("Ubuntu 24.04, Rocky 9 and Alpine 3.20 stub hosts install through their own managers")
+otherManagersOnStub()
+  val ubuntu = stubHost("pkg-ubuntu")
+  put(ubuntu, "repo/nginx", "1.24.0-2ubuntu7.1")
+  val eu = stubEngine(ubuntu, StubTransport(ubuntu))
+  assertEq(outcomesOf(eu.apply(stubPlan(eu, graphOf([pkg("nginx", 1)]), "ubuntu2404"))), "changed")
+  assertEq(textAt(s"$ubuntu/dpkg/nginx"), "installed 1.24.0-2ubuntu7.1\n")
+  _ = fs.removeDirAll(ubuntu)
+
+  val rocky = stubHost("pkg-rocky")
+  put(rocky, "repo/nginx", "1.20.1-16.el9_4.1")
+  put(rocky, "dpkg/nginx", "installed 1.20.1-14.el9_2.1")
+  put(rocky, "repo/git", "2.43.5-1.el9_4")
+  val g = graphOf([pkg("nginx", 1, [("version", StrV("latest"))]), pkg("git", 2)])
+  val er = stubEngine(rocky, StubTransport(rocky))
+  val pr = stubPlan(er, g, "rocky93")
+  assertEq(
+    planText(pr, rocky).lines.slice(1, 3),
+    [" ~ package nginx upgrade 1.20.1-14.el9_2.1 -> 1.20.1-16.el9_4.1", " + package git install 2.43.5-1.el9_4"]
+  )
+  val ar = er.apply(pr)
+  if outcomesOf(ar) != "changed changed" then fail(showApplied([ar], 0))
+  assertEq(logOf(rocky), "dnf install -y git\ndnf upgrade -y nginx\n")
+  _ = fs.removeDirAll(rocky)
+
+  val alpine = stubHost("pkg-alpine")
+  put(alpine, "repo/caddy", "2.8.4-r3")
+  put(alpine, "repo/curl", "8.9.1-r0")
+  put(alpine, "dpkg/curl", "installed 8.9.0-r0")
+  apkDb(alpine)
+  val ga = graphOf([pkg("caddy", 1), pkg("curl", 2, [("version", StrV("latest"))])])
+  val ea = stubEngine(alpine, StubTransport(alpine))
+  val pa = stubPlan(ea, ga, "alpine320")
+  assertEq(
+    planText(pa, alpine).lines.slice(1, 3),
+    [" + package caddy install", " ~ package curl upgrade 8.9.0-r0 -> 8.9.1-r0"]
+  )
+  assertEq(outcomesOf(ea.apply(pa)), "changed changed")
+  assertEq(logOf(alpine), "apk update\napk add caddy\napk add -u curl\n")
+  assertEq(stubPlan(stubEngine(alpine, StubTransport(alpine)), ga, "alpine320").hasWork, false)
+  _ = fs.removeDirAll(alpine)
