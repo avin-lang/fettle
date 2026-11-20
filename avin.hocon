@@ -6,10 +6,6 @@ dependencies {
   ssh { git = "github.com/avin-lang/ssh", version = "0.0.1" }
 }
 
-c-linking {
-  static = ["ssh/libssh2"]
-}
-
 c-libraries {
   sodium {
     pkg-config = "libsodium"
@@ -19,6 +15,7 @@ c-libraries {
   libc { headers = ["<sys/stat.h>"] }
 }
 
+// One block: a second `c-linking` would replace this list rather than add to it.
 c-linking {
-  static = ["sodium"]
+  static = ["sodium", "ssh/libssh2"]
 }

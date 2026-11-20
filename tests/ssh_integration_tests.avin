@@ -3,8 +3,10 @@ module tests
 // Integration tests against the containers of `tests/integration/` (its README). Each needs the
 // targets up (`tests/integration/targets.zsh up`), which writes `tests/integration/.state/ssh_config`;
 // where that file is missing or a target does not answer, the test says it is skipped and passes, so
-// `avin test .` stays green on a machine without them. `avin test . "ssh target"` runs only these.
+// `avin test .` stays green on a machine without them. `tests/integration/run.zsh` brings the targets
+// up and runs only these with `FETTLE_INTEGRATION=required`, under which a skip is a failure.
 import avin.fs
+import avin.process
 import avin.time.{Duration, seconds}
 import dev.avinlang.fettle.cli.{factsText, trust}
 import dev.avinlang.fettle.facts.{factsScript, gather, parseFacts}
@@ -16,14 +18,19 @@ private val targetsConfig = "tests/integration/.state/ssh_config"
 // The targets' SSH configuration, or `None`, saying the test is skipped, where they are not up.
 targetConfig() -> Option[ssh.SshConfig]
   if !fs.exists(targetsConfig)
-    println(s"skipped: $targetsConfig is missing; run `tests/integration/targets.zsh up`")
+    skipping(s"$targetsConfig is missing")
     return None
   ssh.SshConfig.read(targetsConfig).ok
+
+// Says the test is skipped because of `why`, or fails it where `FETTLE_INTEGRATION` is `required`.
+private skipping(why: string)
+  assertEq(process.env("FETTLE_INTEGRATION") == Some("required") && why.nonEmpty, false)
+  println(s"skipped: $why; run `tests/integration/targets.zsh up`")
 
 // Says the test is skipped where `e` says the target is not reachable, and fails it otherwise.
 private skippedFor(alias: string, e: TransportError) -> unit
   if e.failure == Unreachable
-    println(s"skipped: $alias does not answer (${e.reason}); run `tests/integration/targets.zsh up`")
+    skipping(s"$alias does not answer (${e.reason})")
   else assertEq(e.reason, s"connected to $alias")
 
 // A transport to the target `alias` (`fettle-debian12`, `fettle-alpine3-pw`, …), or `None` where it
@@ -253,21 +260,74 @@ private makeUser(t: Transport, name: string, sudoers: string, password: string) 
   ].mkString("\n")
   root.run(s"set -e\nset -- '${sudoers.replace("'", "'\\''")}'\n$script", Array.empty[byte]()).map(r -> r.succeeded).getOrElse(false)
 
-@test("ssh target: sudo with requiretty is refused without a terminal and runs through one")
-requirettyOverSsh()
-  val admin = onTarget("fettle-ubuntu2404") match
+@test("ssh target: a script that closes its output early still reports how it ended")
+closesOutputEarly()
+  val t = onTarget("fettle-debian12") match
     Some(x) -> x
     None -> return
+  assertEq(t.run("exec >/dev/null 2>&1\nsleep 1\nexit 3", Array.empty[byte]()).map(x -> x.ending), Ok(ExitCode(3)))
+  assertEq(t.run("echo before\nexec >/dev/null 2>&1\nsleep 1\nkill -9 $$", Array.empty[byte]()).map(x -> (x.out, x.ending)), Ok(("before\n", KilledBy(9))))
+  _ = t.close()
+
+@test("ssh target: a script on a terminal: a tty, its error output merged, a line of input, its exit code")
+onTerminal()
+  val t = onTarget("fettle-debian12") match
+    Some(x) -> x
+    None -> return
+  val r = t.runOnTerminal("tty; echo err >&2; IFS= read -r line; printf '<%s>' \"$line\"; exit 6", "a line\n".utf8)
+  assertEq(r.map(x -> (x.ending, x.out.startsWith("/dev/pts/"), x.out.contains("err"), x.out.contains("<a line>"))), Ok((ExitCode(6), true, true, true)))
+  assertEq(r.map(x -> x.stderr.length), Ok(0))
+  assertEq(t.runOnTerminal("echo plain", Array.empty[byte]()).map(x -> (x.ending, x.out.trim)), Ok((ExitCode(0), "plain")))
+  // The session goes on running plain scripts after one on a terminal.
+  assertEq(outOf(t, "echo after"), "after\n")
+  _ = t.close()
+
+// Makes the users `fettletty` (requiretty, no password) and `fettlettypw` (requiretty, a password)
+// on ubuntu2404, and answers its configuration, or `None` where the targets are not up.
+private requirettyUsers() -> Option[ssh.SshConfig]
+  val admin = onTarget("fettle-ubuntu2404") match
+    Some(x) -> x
+    None -> return None
   assertEq(makeUser(admin, "fettletty", "Defaults:fettletty requiretty\nfettletty ALL=(ALL) NOPASSWD:ALL", "fettletty"), true)
   assertEq(makeUser(admin, "fettlettypw", "Defaults:fettlettypw requiretty\nfettlettypw ALL=(ALL) ALL", "fettlettypw"), true)
   _ = admin.close()
-  val config = targetConfig().get
-  val h = config.host("fettle-ubuntu2404").ok.get
+  targetConfig()
+
+@test("ssh target: sudo with requiretty is refused without a terminal, saying so")
+requirettyRefused()
+  val config = requirettyUsers() match
+    Some(c) -> c
+    None -> return
   for (user, how) in [("fettletty", Sudo), ("fettlettypw", SudoPassword("fettlettypw"))]
     val t = connectSsh(SshTarget("fettle-ubuntu2404", user = Some(user)), config).ok.get
     BecomeTransport(t, how).run("true", Array.empty[byte]()) match
-      Err(e) -> assertEq(e.reason.contains("requiretty"), true)
+      Err(e) ->
+        assertEq(e.failure, BecomeRefused)
+        assertEq(e.reason.contains("requiretty"), true)
       Ok(_) -> assertEq("ran", "refused")
+    _ = t.close()
+
+// TODO: un-ignore when avin-lang/ssh's `Exec.wait` waits for the server's exit status and close
+// before sending its own close: on a terminal, output ends as soon as nothing holds the terminal open,
+// and the early close hangs the terminal up, killing the command with `HUP`.
+@test("ssh target: a script on a terminal that closes its output early still reports how it ended", ignore: "avin-lang/ssh Exec.wait closes the channel at the end of output, before the exit status")
+terminalClosesOutputEarly()
+  val t = onTarget("fettle-debian12") match
+    Some(x) -> x
+    None -> return
+  assertEq(t.runOnTerminal("exec >/dev/null 2>&1 </dev/null\nsleep 1\nexit 3", Array.empty[byte]()).map(x -> x.ending), Ok(ExitCode(3)))
+  _ = t.close()
+
+// TODO: un-ignore when avin-lang/ssh's `Exec.wait` waits for the server's exit status and close
+// before sending its own close (see `terminalClosesOutputEarly`): sudo's command is killed by `HUP`.
+@test("ssh target: sudo with requiretty runs through a terminal, input and output through files", ignore: "avin-lang/ssh Exec.wait closes the channel at the end of output, before the exit status")
+requirettyOverSsh()
+  val config = requirettyUsers() match
+    Some(c) -> c
+    None -> return
+  val h = config.host("fettle-ubuntu2404").ok.get
+  for (user, how) in [("fettletty", Sudo), ("fettlettypw", SudoPassword("fettlettypw"))]
+    val t = connectSsh(SshTarget("fettle-ubuntu2404", user = Some(user)), config).ok.get
     val root = BecomeTransport(t, how, "root", Some((s, i) -> t.runOnTerminal(s, i)))
     assertEq(outOf(root, "id -un"), "root\n")
     val r = root.run("cat; echo err >&2; exit 3", allBytes()).ok.get
@@ -358,7 +418,7 @@ trustCommand()
   val name = s"${target.user.get}@${target.host}:${target.port.get}"
   val args = [name, "--yes", "--ssh-config", "/dev/null", "--known-hosts", kh]
   if trust(args) == 1 && fs.readText(kh) == Ok("")
-    println("skipped: alpine3 does not answer")
+    skipping("alpine3 does not answer")
     return
   assertEq(fs.readText(kh).map(t -> t.contains("ssh-ed25519") || t.contains("ecdsa") || t.contains("ssh-rsa")), Ok(true))
   assertEq(trust(args), 0)
@@ -411,8 +471,9 @@ authFailures()
       if e.failure == Unreachable
         skippedFor("fettle-debian12", e)
         return
+      // The agent's keys may use up the server's tries before the key files, so the words vary.
       assertEq(e.failure, LoginRefused)
-      assertEq(e.reason.contains("refused"), true)
+      assertEq(e.reason.startsWith(s"ssh no-such-user@${target.host}:${target.port.get}: "), true)
     Ok(_) -> assertEq("logged in", "refused")
   val keygen = LocalTransport().run(s"ssh-keygen -q -t ed25519 -N '' -f '$dir/other'", Array.empty[byte]())
   assertEq(keygen.map(r -> r.succeeded), Ok(true))

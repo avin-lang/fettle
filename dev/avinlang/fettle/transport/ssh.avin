@@ -185,10 +185,13 @@ private logIn(session: ssh.Session, plan: SshPlan, target: SshTarget) -> Result[
     session.authAgent(plan.user) match
       Ok(_) -> return Ok(())
       Err(e) -> last = Some(e)
+  // A key the target names that is not there is the likeliest reason for a refusal, so it is the one
+  // reported, whatever failed after it.
+  var missing: Option[ssh.SshError] = None
   for k in plan.keys
     if !session.isOpen then break
     if !fs.exists(k)
-      if plan.named.contains(k) then last = Some(ssh.KeyFile(k, "there is no such file"))
+      if plan.named.contains(k) && missing.isEmpty then missing = Some(ssh.KeyFile(k, "there is no such file"))
       continue
     session.authKey(plan.user, k) match
       Ok(_) -> return Ok(())
@@ -207,7 +210,7 @@ private logIn(session: ssh.Session, plan: SshPlan, target: SshTarget) -> Result[
         Ok(_) -> return Ok(())
         Err(e) -> last = Some(e)
     _ -> ()
-  Err(last.getOrElse(ssh.AuthFailed("publickey", [])))
+  Err(missing.orElse(last).getOrElse(ssh.AuthFailed("publickey", [])))
 
 // A transport to the host `target` names: connected, its host key checked, logged in, `config`
 // filling in what the target leaves out.
@@ -231,7 +234,8 @@ class SshTransport(private val session: ssh.Session, val where: string): Transpo
 
   // `script` run as `run` runs it but on a pseudo-terminal, as `ssh -t` runs a command, with echo off:
   // its standard error arrives merged into its standard output, and its input goes through the
-  // terminal, so it is a line of text, not bytes. For what needs a terminal (sudo's `requiretty`).
+  // terminal, so it is a line of text, not bytes, and it is never ended: the script reads only the
+  // lines it is given. For what needs a terminal (sudo's `requiretty`).
   runOnTerminal(script: string, input: Array[byte]) -> Result[Ran, TransportError] =
     runOn(script, input, Some(ssh.Pty("dumb", 200, 50, [(ssh.TerminalMode.Echo, 0)])))
 
@@ -241,7 +245,9 @@ class SshTransport(private val session: ssh.Session, val where: string): Transpo
     val running = session.exec(s"exec /bin/sh -c $quoted", pty = pty).mapErr(e -> broke(e))?
     defer _ = running.close()
     if input.length > 0 then running.stdin(input).mapErr(e -> broke(e))?
-    running.closeStdin().mapErr(e -> broke(e))?
+    // On a terminal, the end of the input hangs the terminal up, which kills the script with `HUP`; a
+    // script run on one reads only the lines it is given, so its input is left open.
+    if pty.isEmpty then running.closeStdin().mapErr(e -> broke(e))?
     val out = Buffer[byte]()
     val err = Buffer[byte]()
     loop

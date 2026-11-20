@@ -4,6 +4,7 @@ module dev.avinlang.fettle.hosts
 // settings evaluated, or one named ad hoc as `[user@]host[:port]`.
 import avin.fs
 import avin.process
+import dev.avinlang.fettle.check.{Unopened}
 import dev.avinlang.fettle.eval.{Evaluator}
 import dev.avinlang.fettle.graph.{IntV, SecretV, StrV, Value, VariantV}
 import dev.avinlang.fettle.syntax.{GroupD, SourceFile}
@@ -22,7 +23,7 @@ inInventory(files: List[SourceFile], name: string) -> bool =
 // `password`, `hostKey`, `become`) from `connect all`, its groups' `connect`, its own, its groups and
 // itself, a later one over an earlier. A host with no `become` runs as the login user.
 reachOf(files: List[SourceFile], name: string) -> Result[Reach, string]
-  val (address, settings) = Evaluator(files, _ -> None, []).connectionOf(name)?
+  val (address, settings) = Evaluator(files, _ -> None, [], _ -> Unopened).connectionOf(name)?
   var target = address match
     StrV(a) if a.nonEmpty -> SshTarget(a)
     _ -> return Err(s"the address of host `$name` is not a host name")

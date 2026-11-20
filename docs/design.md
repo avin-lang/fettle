@@ -1058,3 +1058,48 @@ user.
 32. **`Facts` and `readFacts` live in the `facts` module**, beside the script and its parser, and the
     evaluator imports them. `fettle facts` without `--local` is refused until the ssh transport
     exists. Review with the user.
+33. **A `TransportError` has a kind** (`failure`, defaulting to `Broken`): `Unreachable`,
+    `HostKeyRefused`, `LoginRefused`, `BecomeRefused`, `Broken`, so a report can tell "the network is
+    wrong" (5.5) from the rest. The trait is unchanged. Review with the user.
+34. **The SSH transport runs `exec /bin/sh -c '<script>'`**: `exec` makes the shell the session's own
+    process, so a signal that kills the script is reported as one (`KilledBy`), Linux's numbering
+    for SSH's signal names. The script travels as one argument, so a single script is bounded by the
+    host's argument length (128 KiB on Linux); files go over standard input. A script reads its input
+    before printing more than the channel window (2 MiB). Review with the user.
+35. **Host keys**: strict by default; `hostKey` pins and reads no file; `--accept-new` and the SSH
+    configuration's `StrictHostKeyChecking accept-new` record a new key and never take a changed
+    one. `fettle trust` records a key by connecting again with accept-new into a scratch file and
+    copying that line only when its fingerprint is the one shown, so a key that changed in between is
+    never recorded; a changed key is refused, its old line to be removed with `ssh-keygen -R`. Review
+    with the user.
+36. **Logging in**: agent, then the inventory's `key`, then the configuration's identity files (or
+    ssh's defaults), a key under a passphrase retried with `FETTLE_SSH_PASSPHRASE` or one typed at the
+    terminal, then `password`. A named key that is missing is the error reported. Through a
+    `ProxyJump` the session is made by `SshConfig.connect` over a generated configuration (the
+    target's block, then the user's configuration for every other host), whose login is the agent and
+    key files without a passphrase. Review with the user.
+37. **`become` wraps the script**: `sudo -n` / `sudo -k -S -p ''` / `doas -n`, `-u <user> -- /bin/sh -c`
+    an inner script that prints a random marker line on standard error and then `exec`s the script,
+    passed as `$1`. No marker means the script never ran: that is a `BecomeRefused` error naming why
+    (password wanted, password refused, terminal wanted, not permitted, not installed), never a
+    `Ran`. `-k` makes sudo read the password every time, so the password line can never reach the
+    script. `SudoPassword` checks the password once, alone, before the first script, so a wrong one
+    never has the script's input read as further attempts. Review with the user.
+38. **`requiretty`**: once sudo says it wants a terminal, every later run of that `BecomeTransport`
+    goes through a pseudo-terminal for sudo alone, the script's input, output and error output through
+    files in a private `mktemp -d` directory made and removed by plain runs, the password over the
+    terminal (echo off), never a file. It does not work yet over SSH: avin-lang/ssh's `Exec.wait`
+    closes the channel when output ends, which on a terminal is before the command exits, and the
+    hang-up kills it (tests ignored until fixed). Review with the user.
+39. **`fettle facts <host>`** takes an inventory host (from `--dir`, the current directory by
+    default) when the inventory holds one by that name, else `[user@]host[:port]`, `host` possibly an
+    SSH configuration alias. Facts are gathered as the login user. A host with no `become` runs as
+    the login user (10, decision 14). Connection secrets are read from `secret.env` and `secret.file`
+    only; `secret.vault` for a connection waits for the run that opens the vault. Review with the user.
+40. **libssh2 is linked statically** (`c-linking { static = ["ssh/libssh2"] }`), with OpenSSL's
+    `libssl`/`libcrypto` archives; `libz` and the system's libraries stay dynamic. Review with the
+    user.
+41. **Integration tests skip, not fail, without targets**; `tests/integration/run.zsh` brings the
+    targets up and runs only them with `FETTLE_INTEGRATION=required`, under which a skip fails. Tests
+    that need special users or tools (requiretty users, doas) set them up themselves on the target.
+    Review with the user.
