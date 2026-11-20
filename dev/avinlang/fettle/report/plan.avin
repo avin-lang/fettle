@@ -1,0 +1,189 @@
+module dev.avinlang.fettle.report
+
+import avin.diff.{diffLines, renderUnified}
+
+import dev.avinlang.fettle.engine.{
+  Applied, Changed, Create, Entry, Failed, Modify, Op, Outcome, Plan, PlannedAction, Remove, Skipped, Unchanged
+}
+
+import dev.avinlang.fettle.facts.{Facts}
+import dev.avinlang.fettle.graph.{Node, ResourceId, quote}
+
+// The plan and apply output, as section 2.7 of the design prints it:
+//
+//   web2 (debian 12, amd64)
+//     ~ file /etc/nginx/conf.d/b.example.com.conf
+//         @@ -2 +2 @@
+//         -  listen 80 ssl;
+//         +  listen 443 ssl;
+//     > service nginx                                   reload (file /etc/nginx/conf.d/b.example.com.conf)
+//
+//   Plan: 1 host; 0 to create, 1 to change, 0 to remove, 1 action.
+
+// The column a plan line's description starts at, counted from the resource's kind.
+val labelWidth: int = 48
+
+// A host as a plan's heading names it: `web1 (debian 12, amd64)`.
+hostHeading(host: string, f: Facts) -> string =
+  if f.version.isEmpty then s"$host (${f.distro.toLower}, ${f.arch.toLower})"
+  else s"$host (${f.distro.toLower} ${f.version}, ${f.arch.toLower})"
+
+// A resource as a plan names it: its kind and title, the title quoted when it is empty or holds a
+// control character, which would otherwise break the line.
+resourceLabel(id: ResourceId) -> string =
+  if id.title.isEmpty || id.title.exists(c -> int(c) < 32 || int(c) == 127) then s"${id.kind} ${quote(id.title)}"
+  else id.shown
+
+// One line of a plan: the mark, the resource, and its description from column `labelWidth`.
+private planLine(mark: string, id: ResourceId, description: string) -> string
+  val label = resourceLabel(id)
+  if description.isEmpty then return s"  $mark $label\n"
+  val padded = if label.charCount < labelWidth then label.padEnd(labelWidth) else label + "  "
+  s"  $mark $padded$description\n"
+
+// The mark of an operation: `+` create, `~` change, `-` remove.
+private mark(op: Op) -> string = op match
+  Create -> "+"
+  Modify -> "~"
+  Remove -> "-"
+  _ -> " "
+
+// The hunks of a unified diff of `before` and `after` with no context lines, without the `---` and
+// `+++` lines naming the two sides.
+diffHunks(before: string, after: string) -> Vector[string] =
+  renderUnified(diffLines(before, after), "", "", 0).lines.drop(2)
+
+// What an action line says: the action and why it runs.
+private actionText(p: Plan, a: PlannedAction) -> string
+  val why = Buffer[string]()
+  if !a.sources.isEmpty then why += a.sources.map(s -> resourceLabel(p.graph.nodes(s).id)).mkString(", ")
+  if a.pending then why += "pending from an earlier run"
+  s"${a.action} (${why.mkString("; ")})"
+
+// One host's part of the plan text.
+showHostPlan(p: Plan) -> string
+  val out = StringWriter()
+  out.write(hostHeading(p.host, p.facts) + "\n")
+  var lines = 0
+  var i = 0
+  for e in p.entries
+    e.delta match
+      Err(why) ->
+        out.write(planLine("x", e.node.id, s"cannot be planned: $why"))
+        lines += 1
+      Ok(d) if !d.inSync ->
+        out.write(planLine(mark(d.op), e.node.id, d.summary))
+        d.textDiff match
+          Some((before, after)) -> for h in diffHunks(before, after)
+            out.write(s"      $h\n")
+          None -> ()
+        lines += 1
+      _ -> ()
+    for a in p.actions
+      if a.target == i
+        out.write(planLine(">", e.node.id, actionText(p, a)))
+        lines += 1
+    i += 1
+  for d in p.dropped
+    out.write(planLine(">", d.id, s"${d.action} (pending, but no longer declared: dropped)"))
+    lines += 1
+  if lines == 0 then out.write("  no changes\n")
+  out.text
+
+// `n` and a noun, plural unless `n` is 1.
+private counted(n: int, noun: string) -> string = if n == 1 then s"1 $noun" else s"$n ${noun}s"
+
+// The plan text of every host and the summary line.
+showPlan(plans: Vector[Plan]) -> string
+  val out = StringWriter()
+  for p in plans
+    out.write(showHostPlan(p))
+  val creates = plans.map(p -> p.count(Create)).sum
+  val changes = plans.map(p -> p.count(Modify)).sum
+  val removes = plans.map(p -> p.count(Remove)).sum
+  val actions = plans.map(p -> p.actions.length).sum
+  val errors = plans.map(p -> p.errors).sum
+  out.write(
+    s"\nPlan: ${counted(plans.length, "host")}; $creates to create, $changes to change, $removes to remove, ${counted(actions, "action")}."
+  )
+  if errors > 0 then out.write(s" ${counted(errors, "resource")} cannot be planned.")
+  out.write("\n")
+  out.text
+
+// The exit status of `fettle plan`: 1 when a resource cannot be planned, 2 when there are changes,
+// 0 when there are none.
+planStatus(plans: Vector[Plan]) -> int =
+  if plans.exists(p -> p.errors > 0) then 1 else if plans.exists(p -> p.hasWork) then 2 else 0
+
+// A resource's outcome as a progress line names it: `changed`, `failed`, `skipped`, `ok`.
+outcomeWord(o: Outcome) -> string = o match
+  Failed(_) -> "failed"
+  Skipped(_) -> "skipped"
+  Unchanged -> "ok"
+  _ -> "changed"
+
+// The progress line of a resource, or of the action `action` on it (empty for the resource itself),
+// that ended `o` on `host`; nothing for a resource that was already as declared.
+progressLine(host: string, node: Node, action: string, o: Outcome) -> string = o match
+  Unchanged -> ""
+  _ if action.nonEmpty -> s"$host  ${outcomeWord(o).padEnd(8)}${resourceLabel(node.id)}: $action\n"
+  _ -> s"$host  ${outcomeWord(o).padEnd(8)}${resourceLabel(node.id)}\n"
+
+// The number of items a host's apply works through: the resources to change or that cannot be
+// planned, and the actions; and how many of them it got to.
+private progress(a: Applied) -> (int, int)
+  var total = 0
+  var done = 0
+  var i = 0
+  for e in a.plan.entries
+    if e.changing || e.op.isEmpty
+      total += 1
+      a.outcomes(i) match
+        Skipped(_) -> ()
+        _ -> done += 1
+    i += 1
+  total += a.plan.actions.length
+  done += a.actions.length
+  (done, total)
+
+// Where a resource is declared: `site.fettle:12:3`.
+private declaredAt(n: Node) -> string = s"${n.span.file}:${n.span.start.line}:${n.span.start.column}"
+
+// The apply's ending: one line per host with its counts, the summary line, then each failure with
+// where the resource is declared, the command, how it ended and its error output, and each resource
+// skipped because of one.
+showApplied(results: Vector[Applied], seconds: long) -> string
+  val out = StringWriter()
+  val width = results.map(a -> a.plan.host.charCount).maxOption.getOrElse(0)
+  for a in results
+    val (done, total) = progress(a)
+    val counts = Buffer[string]()
+    counts += s"changed ${a.changed}"
+    if a.failed > 0 then counts += s"failed ${a.failed}"
+    if a.skipped > 0 then counts += s"skipped ${a.skipped}"
+    out.write(s"${a.plan.host.padEnd(width)}  [$done/$total]  ${counts.mkString(", ")}\n")
+  val hosts = results.map(a -> a.plan.host).mkString(", ")
+  val changed = results.map(a -> a.changed).sum
+  val failed = results.map(a -> a.failed).sum
+  out.write(s"$hosts: done in $seconds s. $changed changed, $failed failed, 0 unreachable.\n")
+  for a in results
+    var i = 0
+    for o in a.outcomes
+      val node = a.plan.graph.nodes(i)
+      o match
+        Failed(f) ->
+          out.write(s"\nfailed: ${a.plan.host} ${resourceLabel(node.id)} (${declaredAt(node)}): ${f.reason}\n")
+          if f.command.nonEmpty then out.write(s"  command: ${f.command}\n")
+          if f.ending.nonEmpty then out.write(s"  ${f.ending}\n")
+          for l in f.stderr
+            out.write(s"  | $l\n")
+        Skipped(k) ->
+          out.write(
+            s"\nskipped: ${a.plan.host} ${resourceLabel(node.id)}: `${resourceLabel(a.plan.graph.nodes(k).id)}` did not apply\n"
+          )
+        _ -> ()
+      i += 1
+  out.text
+
+// The exit status of `fettle apply`: 1 when anything failed, else 0.
+applyStatus(results: Vector[Applied]) -> int = if results.exists(a -> a.failed > 0) then 1 else 0

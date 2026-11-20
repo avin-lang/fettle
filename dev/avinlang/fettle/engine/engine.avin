@@ -1,0 +1,344 @@
+module dev.avinlang.fettle.engine
+
+import avin.random.{Random}
+import dev.avinlang.json.{Arr, Str, parse as parseJson, quote as jsonQuote}
+import dev.avinlang.fettle.facts.{Facts}
+import dev.avinlang.fettle.graph.{Graph, Node, ResourceId}
+import dev.avinlang.fettle.shell.{Command, Output, Shell, parseProbe, probeScript, quote}
+import dev.avinlang.fettle.transport.{Transport}
+
+// The engine: a host's graph probed in one round trip and compared with what it declares (the
+// plan), then applied in the graph's order, each resource probed again just before it is changed and
+// once more after, to verify it. A resource that fails skips what depends on it and nothing else.
+// Triggers keep a pending record on the host, written before the change that triggers an action and
+// cleared once the action has run, so an action a failed run left behind runs on the next.
+
+// Where the pending record is kept on a host: under `/var/lib/fettle` for a root login, under the
+// login's `~/.local/state/fettle` otherwise.
+pendingRecord(root: bool) -> string = if root then "/var/lib/fettle/pending" else "~/.local/state/fettle/pending"
+
+// An action a trigger asked for that has not run yet: the resource it runs on and its name.
+data Pending(id: ResourceId, action: string)
+
+impl Pending
+  // The record's line for it: a JSON array of the kind, the title and the action.
+  line -> string = s"[${jsonQuote(id.kind)},${jsonQuote(id.title)},${jsonQuote(action)}]"
+
+// The pending record's lines read back; a line that is not one of them is passed over.
+readPending(text: string) -> Vector[Pending]
+  val out = Buffer[Pending]()
+  for line in text.lines
+    parseJson(line) match
+      Ok(Arr(items)) if items.length == 3 -> (items(0), items(1), items(2)) match
+        (Str(k), Str(t), Str(a)) -> if !out.contains(
+          Pending(ResourceId(k, t), a)
+        ) then out += Pending(ResourceId(k, t), a)
+        _ -> ()
+      _ -> ()
+  out.toVector
+
+// One resource of a plan: what it needs, or why it cannot be planned.
+data Entry(node: Node, delta: Result[Delta, string])
+
+impl Entry
+  // What the resource needs, when it could be planned.
+  op -> Option[Op] = delta match
+    Ok(d) -> Some(d.op)
+    Err(_) -> None
+
+  // Whether the resource is to be changed: created, changed or removed.
+  changing -> bool = op match
+    Some(o) -> o != InSync
+    None -> false
+
+// An action the plan runs: `action` on the resource at `target`, because the resources at
+// `sources` change, or because an earlier run left it pending.
+data PlannedAction(target: int, action: string, sources: Vector[int], pending: bool)
+
+// A host's plan: its graph, what each resource needs (one entry per node, in the graph's order), the
+// actions to run, what the host's pending record holds, and the pending actions whose resource the
+// program no longer declares, which are dropped.
+data Plan(
+    host: string,
+    facts: Facts,
+    graph: Graph,
+    entries: Vector[Entry],
+    actions: Vector[PlannedAction],
+    recorded: Vector[Pending],
+    dropped: Vector[Pending]
+)
+
+impl Plan
+  // The number of resources that need `op`.
+  count(op: Op) -> int = entries.count(e -> e.op == Some(op))
+
+  // The number of resources that cannot be planned.
+  errors -> int = entries.count(e -> e.op.isEmpty)
+
+  // Whether applying the plan would change anything.
+  hasWork -> bool = entries.exists(e -> e.changing) || !actions.isEmpty || !dropped.isEmpty
+
+// Why a resource or an action failed: the reason, the command that failed as a report shows it
+// (empty when none ran), how it ended, and the last lines of its error output.
+data Failure(reason: string, command: string, ending: string, stderr: Vector[string])
+
+// How a resource ended.
+data Outcome
+  // It was as declared already.
+  Unchanged
+  Changed
+  Failed(failure: Failure)
+  // A resource it depends on, the one at `because`, failed or was skipped.
+  Skipped(because: int)
+
+impl Outcome
+  // Whether the resource failed or was skipped, which skips what depends on it.
+  blocks -> bool = self match
+    Failed(_) -> true
+    Skipped(_) -> true
+    _ -> false
+
+// An action that ran: on the resource at `target`, `Changed` when it succeeded.
+data ActionRun(target: int, action: string, outcome: Outcome)
+
+// What applying a plan did: each resource's outcome, in the graph's order, and the actions run.
+data Applied(plan: Plan, outcomes: Vector[Outcome], actions: Vector[ActionRun])
+
+impl Applied
+  // The resources and actions that changed something.
+  changed -> int = outcomes.count(o -> o == Changed) + actions.count(a -> a.outcome == Changed)
+
+  // The resources that failed.
+  failed -> int = outcomes.count(o -> o match
+    Failed(_) -> true
+    _ -> false
+  )
+
+  // The resources skipped because one they depend on failed.
+  skipped -> int = outcomes.count(o -> o match
+    Skipped(_) -> true
+    _ -> false
+  )
+
+// The last `n` lines of `text`.
+lastLines(text: string, n: int) -> Vector[string]
+  val all = text.lines
+  if all.length <= n then all else all.slice(all.length - n, all.length)
+
+// A path on the host as a shell word: a leading `~/` stands for the login's home directory.
+private hostPath(file: string) -> Result[string, string] =
+  if file.startsWith("~/") then quote(file.slice(2, file.byteLength)).map(rest -> s"\"$$HOME\"/$rest")
+  else quote(file)
+
+// The engine for one host, reached through `transport`. `ctx` reads local files and secrets,
+// `pendingFile` is where the host keeps its pending record (see `pendingRecord`), `providers`
+// answers the provider of a kind, and `listener` hears each resource's outcome as it is decided
+// (with the empty action), then the outcome of each action run on it (with the action's name). A
+// failed action makes its resource's outcome `Failed` too, so what depends on it is skipped.
+class Engine(
+    val transport: Transport,
+    val ctx: Context,
+    val pendingFile: string,
+    val providers: (string) -> Option[Provider] = k -> builtinProvider(k),
+    val listener: (Node, string, Outcome) -> unit = (_, _, _) -> ()
+)
+  // Whether the host has been changed during this apply, so that a plan's probe may be stale.
+  private var touched = false
+
+  // The plan of `graph` on the host `host`, whose facts are `facts`: every resource's probe and the
+  // pending record read in one round trip. An error is a host that could not be probed.
+  plan(host: string, facts: Facts, graph: Graph) -> Result[Plan, string]
+    val f = hostPath(pendingFile)?
+    val commands = Buffer[Command]()
+    commands += Shell(s"f=$f\nif [ -f \"$$f\" ]; then cat \"$$f\"; fi")
+    val slots = Buffer[Result[(int, int), string]]()
+    for node in graph.nodes
+      providers(node.id.kind) match
+        None -> slots += Err(s"there is no provider for `${node.id.kind}` yet")
+        Some(p) -> p.probes(node, ctx) match
+          Ok(cs) ->
+            slots += Ok((commands.length, cs.length))
+            commands ++= cs
+          Err(e) -> slots += Err(e)
+    val outputs = runProbes(commands.toVector)?
+    if !outputs(0).succeeded then return Err(s"the pending record cannot be read: ${outputs(0).stderr.trim}")
+    val recorded = readPending(outputs(0).stdout)
+    val entries = Buffer[Entry]()
+    var i = 0
+    for node in graph.nodes
+      val delta = slots(i) match
+        Ok((start, n)) -> providers(node.id.kind).get.delta(node, outputs.slice(start, start + n), ctx)
+        Err(e) -> Err(e)
+      entries += Entry(node, delta)
+      i += 1
+    val declared = recorded.filter(r -> graph.nodes.exists(n -> n.id == r.id))
+    val dropped = recorded.filter(r -> !graph.nodes.exists(n -> n.id == r.id))
+    Ok(Plan(host, facts, graph, entries.toVector, actionsOf(graph, entries.toVector, declared), recorded, dropped))
+
+  // The actions a plan runs: each trigger with a source that changes, and each pending action, once
+  // each, in the order of the resources they run on.
+  private actionsOf(graph: Graph, entries: Vector[Entry], pending: Vector[Pending]) -> Vector[PlannedAction]
+    val out = Buffer[PlannedAction]()
+    for t in graph.triggers
+      val changing = t.sources.filter(s -> entries(s).changing).toVector
+      val left = pending.contains(Pending(graph.nodes(t.target).id, t.action))
+      if !changing.isEmpty || left
+        val at = out.indexWhere(a -> a.target == t.target && a.action == t.action)
+        if at < 0 then out += PlannedAction(t.target, t.action, changing, left)
+        else
+          val a = out(at)
+          out(at) = PlannedAction(
+            a.target,
+            a.action,
+            a.sources ++ changing.filter(s -> !a.sources.contains(s)),
+            a.pending || left
+          )
+    for p in pending
+      val target = graph.nodes.indexWhere(n -> n.id == p.id)
+      if !out.exists(
+        a -> a.target == target && a.action == p.action
+      ) then out += PlannedAction(target, p.action, [], true)
+    out.toVector.sortBy(a -> a.target)
+
+  // Runs `commands` as one probe script, answering their outputs.
+  private runProbes(commands: Vector[Command]) -> Result[Vector[Output], string]
+    val marker = s"fettle${Random.nextLong(9223372036854775807)}"
+    val script = probeScript(commands, marker)?
+    val ran = transport.run(script, Array.empty[byte]()).mapErr(e -> e.message)?
+    parseProbe(ran.stdout, marker, commands.length).mapErr(e -> s"$e (the probe ${ran.endingText}: ${ran.err.trim})")
+
+  // What `node` needs now, from a probe of it alone.
+  private probeOne(p: Provider, node: Node) -> Result[Delta, string]
+    val outputs = runProbes(p.probes(node, ctx)?)?
+    p.delta(node, outputs, ctx)
+
+  // Runs one step, answering why it failed, if it did.
+  private run(step: Step) -> Option[Failure] = transport.run(step.script, step.input) match
+    Err(e) -> Some(Failure(e.message, step.shown, "", []))
+    Ok(r) if r.succeeded -> None
+    Ok(r) ->
+      val err = if step.withheld then ["(not shown: the step handles a secret)"] else lastLines(r.err, 20)
+      Some(Failure("a command failed", step.shown, r.endingText, err))
+
+  // Writes the pending record as `record` holds it, removing it when it is empty.
+  private writeRecord(record: Buffer[Pending]) -> Option[Failure]
+    val f = hostPath(pendingFile) match
+      Ok(w) -> w
+      Err(e) -> return Some(Failure(e, "", "", []))
+    val step =
+      if record.isEmpty then Step(s"rm -f $f\n", Array.empty[byte](), s"rm -f $f")
+      else
+        val text = record.map(p -> p.line + "\n").mkString("")
+        val script = s"set -e\numask 077\nf=$f\nmkdir -p \"$$(dirname \"$$f\")\"\ncat >\"$$f.new\"\nmv -f \"$$f.new\" \"$$f\"\n"
+        Step(script, text.utf8, s"write the pending record $f")
+    run(step).map(x -> Failure(s"the pending record cannot be written", x.command, x.ending, x.stderr))
+
+  // Applies `plan`: each resource in the graph's order, then the actions on it.
+  apply(plan: Plan) -> Applied
+    touched = false
+    val g = plan.graph
+    val outcomes = Buffer[Outcome]()
+    for _ in 0 ..< g.nodes.length
+      outcomes += Unchanged
+    val runs = Buffer[ActionRun]()
+    val record = Buffer[Pending]()
+    record ++= plan.recorded
+    val fired = Buffer[(int, string)]()
+    if !plan.dropped.isEmpty
+      record.filterInPlace(p -> !plan.dropped.contains(p))
+      _ = writeRecord(record)
+    for i in 0 ..< g.nodes.length
+      val node = g.nodes(i)
+      val blocker = g.edges.find(e -> e.to == i && outcomes(e.from).blocks)
+      outcomes(i) = blocker match
+        Some(e) -> Skipped(e.from)
+        None -> resource(plan, i, record, fired)
+      listener(node, "", outcomes(i))
+      if !outcomes(i).blocks
+        for a in actionsFor(plan, i, record, fired)
+          val outcome = action(node, a, record)
+          runs += ActionRun(i, a, outcome)
+          listener(node, a, outcome)
+          if outcome.blocks
+            outcomes(i) = outcome
+            break
+    Applied(plan, outcomes.toVector, runs.toVector)
+
+  // The actions to run on the resource at `i`: those a source fired this run, then those pending.
+  private actionsFor(plan: Plan, i: int, record: Buffer[Pending], fired: Buffer[(int, string)]) -> Vector[string]
+    val id = plan.graph.nodes(i).id
+    val out = Buffer[string]()
+    for t in plan.graph.triggers
+      if t.target == i && !out.contains(t.action) && (
+        fired.contains((i, t.action)) || record.contains(Pending(id, t.action))
+      )
+        out += t.action
+    for p in record
+      if p.id == id && !out.contains(p.action) then out += p.action
+    out.toVector
+
+  // Applies the resource at `i`.
+  private resource(plan: Plan, i: int, record: Buffer[Pending], fired: Buffer[(int, string)]) -> Outcome
+    val g = plan.graph
+    val node = g.nodes(i)
+    val provider = providers(node.id.kind) match
+      Some(p) -> p
+      None -> return Failed(Failure(s"there is no provider for `${node.id.kind}` yet", "", "", []))
+    var delta = plan.entries(i).delta match
+      Ok(d) -> d
+      Err(e) -> return Failed(Failure(e, "", "", []))
+    if touched
+      delta = probeOne(provider, node) match
+        Ok(d) -> d
+        Err(e) -> return Failed(Failure(e, "", "", []))
+    if delta.inSync then return Unchanged
+    // Record the actions this change triggers before making it.
+    val triggers = g.triggers.filter(t -> t.sources.contains(i))
+    var added = false
+    for t in triggers
+      val p = Pending(g.nodes(t.target).id, t.action)
+      if !record.contains(p)
+        record += p
+        added = true
+    if added
+      writeRecord(record) match
+        Some(f) -> return Failed(f)
+        None -> ()
+    val steps = provider.steps(node, delta, ctx) match
+      Ok(s) -> s
+      Err(e) -> return Failed(Failure(e, "", "", []))
+    touched = true
+    for s in steps
+      run(s) match
+        Some(f) -> return Failed(f)
+        None -> ()
+    val after = probeOne(provider, node) match
+      Ok(d) -> d
+      Err(e) -> return Failed(Failure(s"it cannot be verified: $e", "", "", []))
+    if !after.inSync
+      val what = if after.summary.nonEmpty then after.summary else after.changes.map(c -> c.field).mkString(", ")
+      return Failed(Failure(s"it did not converge: $what", "", "", []))
+    for t in triggers
+      if !fired.contains((t.target, t.action)) then fired += (t.target, t.action)
+    Changed
+
+  // Runs the action `a` on `node`, and clears it from the pending record once it has run.
+  private action(node: Node, a: string, record: Buffer[Pending]) -> Outcome
+    val provider = providers(node.id.kind) match
+      Some(p) -> p
+      None -> return Failed(Failure(s"there is no provider for `${node.id.kind}` yet", "", "", []))
+    val steps = provider.action(node, a, ctx) match
+      Ok(s) -> s
+      Err(e) -> return Failed(Failure(e, "", "", []))
+    touched = true
+    for s in steps
+      run(s) match
+        Some(f) -> return Failed(Failure(s"the action `$a` failed", f.command, f.ending, f.stderr))
+        None -> ()
+    val p = Pending(node.id, a)
+    if record.contains(p)
+      record.filterInPlace(x -> x != p)
+      writeRecord(record) match
+        Some(f) -> return Failed(f)
+        None -> ()
+    Changed

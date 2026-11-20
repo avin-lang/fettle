@@ -1,0 +1,118 @@
+module dev.avinlang.fettle.engine
+
+import avin.collections.mutable.{Map as Table}
+import dev.avinlang.fettle.graph.{Node, Value}
+import dev.avinlang.fettle.shell.{Command, Output}
+
+// What a provider is: for one kind, the commands that print a resource's current state (its probe),
+// the comparison of that state with what the program declares (its delta), the steps that make the
+// two agree, and the steps of each action a trigger may name. The engine batches every resource's
+// probe into one round trip, applies the steps in the graph's order, and runs the probe again after
+// them to verify that the resource converged.
+
+// What a probe printed: its `key=value` lines in order, and, after a line holding only `--`, the
+// text that follows to the end of its output (a file's current content, for a diff).
+data Probed(entries: Vector[(string, string)], rest: Option[string])
+
+impl Probed
+  // The value of `key`, if the probe printed one.
+  get(key: string) -> Option[string] = entries.find((k, _) -> k == key).map((_, v) -> v)
+
+  // The value of `key`, or the empty string.
+  value(key: string) -> string = get(key).getOrElse("")
+
+// `text` read as a probe's output: each line `key=value` up to a line `--`, the rest after it raw.
+// A value is trimmed of white space at its ends; a line with no `=` is passed over.
+readProbed(text: string) -> Probed
+  val entries = Buffer[(string, string)]()
+  var at = 0
+  while at < text.byteLength
+    val eol = text.indexOf("\n", at)
+    val stop = if eol < 0 then text.byteLength else eol
+    val line = text.slice(at, stop)
+    val next = if eol < 0 then text.byteLength else eol + 1
+    if line == "--" then return Probed(entries.toVector, Some(text.slice(next, text.byteLength)))
+    val eq = line.indexOf("=")
+    if eq > 0 then entries += (line.slice(0, eq), line.slice(eq + 1, line.byteLength).trim)
+    at = next
+  Probed(entries.toVector, None)
+
+// One field that differs: its name, and the current and declared values as the plan shows them.
+data FieldChange(field: string, before: string, after: string)
+
+// What a resource needs.
+data Op
+  // Nothing: it is as declared.
+  InSync
+  // It does not exist and is to be made.
+  Create
+  // It exists and differs.
+  Modify
+  // It exists and is declared `present = false`.
+  Remove
+
+// What a provider found a resource to need: the operation, its text for the plan's line, the fields
+// that differ, the current and declared text of its content where the plan shows a line diff of
+// them, and the state the probe found, which the steps work from.
+data Delta(op: Op, summary: string, changes: Vector[FieldChange], textDiff: Option[(string, string)], current: Probed)
+
+impl Delta
+  // Whether the resource is as declared.
+  inSync -> bool = op == InSync
+
+// One step of applying a resource: a POSIX `sh` script, the bytes on its standard input (a file's
+// content, which is never part of the script), and the command as a report shows it. A step whose
+// `withheld` is set handles a secret, so its error output is never shown.
+data Step(script: string, input: Array[byte], shown: string, withheld: bool = false)
+
+// The resources of one kind on a host, as the engine drives them. `probes` and `delta` change
+// nothing; `steps` and `action` give the scripts that do.
+trait Provider
+  // The commands that print the current state of `node`, run in the batch probe and again before
+  // and after the resource is applied.
+  probes(node: Node, ctx: Context) -> Result[Vector[Command], string]
+
+  // What `node` needs, from what its probes printed (one output per probe command). An error is a
+  // resource that cannot be planned (a source file that cannot be read, a field it cannot take).
+  delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+
+  // The steps that bring the resource from the state `delta` found to the declared one.
+  steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string]
+
+  // The steps of the action `action` on `node`, which a trigger runs.
+  action(node: Node, action: string, ctx: Context) -> Result[Vector[Step], string] = Err(
+    s"`${node.id.kind}` has no action `$action`"
+  )
+
+// What the providers may read on the operator's machine, each read once a run: local files (a
+// `file`'s `source`) and secrets. `root` says whether the host's login is root.
+class Context(
+    val root: bool,
+    private val readLocal: (string) -> Result[Array[byte], string],
+    private val revealSecret: (Value) -> Result[string, string]
+)
+  private val files = Table[string, Result[Array[byte], string]]()
+  private val secrets = Table[Value, Result[string, string]]()
+
+  // The bytes of the local file `file`.
+  bytesOf(file: string) -> Result[Array[byte], string] = files.get(file) match
+    Some(r) -> r
+    None ->
+      val r = readLocal(file)
+      files(file) = r
+      r
+
+  // The text of the secret `secret`.
+  secretOf(secret: Value) -> Result[string, string] = secrets.get(secret) match
+    Some(r) -> r
+    None ->
+      val r = revealSecret(secret)
+      secrets(secret) = r
+      r
+
+// The providers of the built-in kinds: `file`, `directory` and `symlink`.
+builtinProvider(kind: string) -> Option[Provider] = kind match
+  "file" -> Some(FileProvider())
+  "directory" -> Some(DirectoryProvider())
+  "symlink" -> Some(SymlinkProvider())
+  _ -> None

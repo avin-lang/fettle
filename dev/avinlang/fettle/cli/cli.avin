@@ -10,7 +10,7 @@ import dev.avinlang.fettle.facts.{factsJson, gather, readFacts, showFacts}
 import dev.avinlang.fettle.graph.{showGraph}
 import dev.avinlang.fettle.transport.{LocalTransport}
 
-val usage: string = "usage: fettle check [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [dir]\n       fettle facts --local [--json]"
+val usage: string = "usage: fettle check [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [dir]\n       fettle facts --local [--json]\n       fettle plan --local [--host <name>] [dir]\n       fettle apply --local [--host <name>] [--yes] [dir]"
 
 // Runs the command `args` names, answering the exit status.
 main(args: Vector[string]) -> int
@@ -23,6 +23,8 @@ main(args: Vector[string]) -> int
     "fmt" -> fmt(rest)
     "graph" -> graph(rest)
     "facts" -> facts(rest)
+    "plan" -> plan(rest)
+    "apply" -> apply(rest)
     _ ->
       eprintln(s"fettle: unknown command `${args(0)}`\n$usage")
       2

@@ -1,0 +1,451 @@
+module tests
+
+import avin.fs
+import dev.avinlang.fettle.engine.{Applied, Plan}
+import dev.avinlang.fettle.graph.{After, BoolV, CommandV, GraphBuilder, ModeV, Node, PathV, StrV}
+import dev.avinlang.fettle.report.{outcomeWord, showApplied}
+
+// The engine and the file-system kinds, run on this machine inside scratch directories.
+
+// Each resource's outcome, in the graph's order.
+outcomesOf(a: Applied) -> string = a.outcomes.map(o -> outcomeWord(o)).mkString(" ")
+
+// The inode number of `file`, to tell a file rewritten from one changed in place.
+inodeOf(file: string) -> string = shOut(s"ls -i ${sq(file)}").trim.split(' ')(0)
+
+@test("a file, a directory and a symlink are created, and a second plan is empty")
+createsAndConverges()
+  val dir = scratchDir("create")
+  val g = graphOf(
+    [
+      node("directory", s"$dir/d", 1, [("mode", ModeV(0o750))]),
+      node("file", s"$dir/d/a.conf", 2, [("content", StrV("one\ntwo\n")), ("mode", ModeV(0o640))]),
+      node("symlink", s"$dir/link", 3, [("target", PathV(s"$dir/d/a.conf"))])
+    ]
+  )
+  val e = engineIn(dir)
+  val p = planWith(e, g)
+  assertEq(
+    planText(p, dir),
+    "web1 (debian 12, amd64)\n + directory /T/d mode 0750\n + file /T/d/a.conf 2 lines\n + symlink /T/link -> /T/d/a.conf\n\nPlan: 1 host; 3 to create, 0 to change, 0 to remove, 0 actions.\n"
+  )
+  val a = e.apply(p)
+  assertEq(outcomesOf(a), "changed changed changed")
+  assertEq(textAt(s"$dir/d/a.conf"), "one\ntwo\n")
+  assertEq(modeOf(s"$dir/d/a.conf"), "640")
+  assertEq(modeOf(s"$dir/d"), "750")
+  assertEq(linkOf(s"$dir/link"), s"$dir/d/a.conf")
+  assertEq(entriesOf(s"$dir/d"), "a.conf\n")
+  val again = planWith(engineIn(dir), g)
+  assertEq(again.hasWork, false)
+  assertEq(
+    planText(again, dir),
+    "web1 (debian 12, amd64)\n no changes\n\nPlan: 1 host; 0 to create, 0 to change, 0 to remove, 0 actions.\n"
+  )
+  assertEq(outcomesOf(engineIn(dir).apply(again)), "ok ok ok")
+  _ = fs.removeDirAll(dir)
+
+@test("a new file with no mode is 0644, a new directory 0755, and a file with no content is empty")
+defaultModes()
+  val dir = scratchDir("defaults")
+  val g = graphOf(
+    [node("directory", s"$dir/d", 1), node("file", s"$dir/f", 2), node("file", s"$dir/g", 3, [("content", StrV(""))])]
+  )
+  val p = planWith(engineIn(dir), g)
+  assertEq(planText(p, dir).lines.slice(1, 4), [" + directory /T/d", " + file /T/f empty", " + file /T/g 0 lines"])
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed changed changed")
+  assertEq(modeOf(s"$dir/d"), "755")
+  assertEq(modeOf(s"$dir/f"), "644")
+  assertEq(textAt(s"$dir/f"), "")
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("a changed content shows a line diff, and a changed mode its old and new value")
+changesContentAndMode()
+  val dir = scratchDir("change")
+  val f = s"$dir/f"
+  _ = applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("a\nb\nc\n")), ("mode", ModeV(0o644))])]))
+  val g = graphOf([node("file", f, 1, [("content", StrV("a\nB\nc\n")), ("mode", ModeV(0o600))])])
+  val p = planWith(engineIn(dir), g)
+  assertEq(
+    planText(p, dir),
+    "web1 (debian 12, amd64)\n ~ file /T/f mode 0644 -> 0600\n @@ -2 +2 @@\n -b\n +B\n\nPlan: 1 host; 0 to create, 1 to change, 0 to remove, 0 actions.\n"
+  )
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(textAt(f), "a\nB\nc\n")
+  assertEq(modeOf(f), "600")
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("a change of mode alone is made in place, not by rewriting the file")
+modeInPlace()
+  val dir = scratchDir("chmod")
+  val f = s"$dir/f"
+  _ = applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("x\n")), ("mode", ModeV(0o644))])]))
+  val before = inodeOf(f)
+  val g = graphOf([node("file", f, 1, [("content", StrV("x\n")), ("mode", ModeV(0o640))])])
+  val p = planWith(engineIn(dir), g)
+  assertEq(planText(p, dir).lines(1), " ~ file /T/f mode 0644 -> 0640")
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(inodeOf(f), before)
+  assertEq(modeOf(f), "640")
+  _ = fs.removeDirAll(dir)
+
+@test("a mode left out keeps the mode of the file it replaces")
+modeKept()
+  val dir = scratchDir("keep")
+  val f = s"$dir/f"
+  _ = applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("1\n")), ("mode", ModeV(0o604))])]))
+  val p = planWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("2\n"))])]))
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(modeOf(f), "604")
+  _ = fs.removeDirAll(dir)
+
+@test("the line diff stops at 256 KiB: past it, the plan gives the sizes")
+diffLimit()
+  val dir = scratchDir("limit")
+  val at = s"$dir/at"
+  val past = s"$dir/past"
+  val big = (n: int, c: string) -> c.repeat(n - 1) + "\n"
+  _ = applyWith(
+    engineIn(dir),
+    graphOf(
+      [
+        node("file", at, 1, [("content", StrV(big(262144, "a")))]),
+        node("file", past, 2, [("content", StrV(big(262145, "a")))])
+      ]
+    )
+  )
+  val g = graphOf(
+    [
+      node("file", at, 1, [("content", StrV(big(262144, "b")))]),
+      node("file", past, 2, [("content", StrV(big(262145, "b")))])
+    ]
+  )
+  val lines = planText(planWith(engineIn(dir), g), dir).lines
+  assertEq(lines(1), " ~ file /T/at")
+  assertEq(lines(2), " @@ -1 +1 @@")
+  assertEq(lines(5), " ~ file /T/past content changed (256.0 KiB -> 256.0 KiB)")
+  assertEq(lines(6), "")
+  _ = fs.removeDirAll(dir)
+
+@test("a file that fails `validate` leaves the target as it was, and no staged file behind")
+validateFails()
+  val dir = scratchDir("validate")
+  val f = s"$dir/site.conf"
+  _ = applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("good old\n"))])]))
+  val check = CommandV("grep", [StrV("-q"), StrV("good"), StrV("%s")], None, false)
+  val a = applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("bad new\n")), ("validate", check)])]))
+  assertEq(outcomesOf(a), "failed")
+  assertEq(textAt(f), "good old\n")
+  assertEq(entriesOf(dir), "site.conf\n")
+  val shown = showApplied([a], 3).replace(dir, "/T")
+  assertEq(squeeze(shown).lines(0), "web1 [1/1] changed 0, failed 1")
+  assertEq(shown.contains("web1: done in 3 s. 0 changed, 1 failed, 0 unreachable."), true)
+  assertEq(
+    shown.contains(
+      "failed: web1 file /T/site.conf (g.fettle:1:1): a command failed\n  command: write /T/site.conf\n  exited with status 1\n"
+    ),
+    true
+  )
+  val good = applyWith(
+    engineIn(dir),
+    graphOf([node("file", f, 1, [("content", StrV("good new\n")), ("validate", check)])])
+  )
+  assertEq(outcomesOf(good), "changed")
+  assertEq(textAt(f), "good new\n")
+  _ = fs.removeDirAll(dir)
+
+@test("`validate` as shell text, with `%s` inside a word, and without `%s`")
+validateForms()
+  val dir = scratchDir("validate-forms")
+  val f = s"$dir/x y.conf"
+  val shell = CommandV("test \"$(cat %s)\" = ok", [], None, true)
+  val a = applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("ok")), ("validate", shell)])]))
+  assertEq(outcomesOf(a), "changed")
+  val inWord = CommandV(
+    "/bin/sh",
+    [StrV("-c"), StrV("grep -q ok \"${1#--config=}\""), StrV("sh"), StrV("--config=%s")],
+    None,
+    false
+  )
+  assertEq(
+    outcomesOf(
+      applyWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("ok\n")), ("validate", inWord)])]))
+    ),
+    "changed"
+  )
+  assertEq(textAt(f), "ok\n")
+  val none = CommandV("true", [], None, false)
+  val p = planWith(engineIn(dir), graphOf([node("file", f, 1, [("content", StrV("x")), ("validate", none)])]))
+  assertEq(
+    planText(p, dir).lines(1),
+    " x file /T/x y.conf cannot be planned: a `validate` command names the file it checks as `%s`"
+  )
+  assertEq(
+    planText(p, dir).lines(3),
+    "Plan: 1 host; 0 to create, 0 to change, 0 to remove, 0 actions. 1 resource cannot be planned."
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("`present = false` removes a file, a symlink and an empty directory, and nothing that is absent")
+removes()
+  val dir = scratchDir("remove")
+  _ = shOut(s"cd ${sq(dir)} && echo x >f && ln -s f l && mkdir d")
+  val g = graphOf(
+    [
+      node("file", s"$dir/f", 1, [("present", BoolV(false))]),
+      node("symlink", s"$dir/l", 2, [("present", BoolV(false))]),
+      node("directory", s"$dir/d", 3, [("present", BoolV(false))]),
+      node("file", s"$dir/never", 4, [("present", BoolV(false))])
+    ]
+  )
+  val p = planWith(engineIn(dir), g)
+  assertEq(
+    planText(p, dir),
+    "web1 (debian 12, amd64)\n - file /T/f\n - symlink /T/l\n - directory /T/d\n\nPlan: 1 host; 0 to create, 0 to change, 3 to remove, 0 actions.\n"
+  )
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed changed changed ok")
+  assertEq(entriesOf(dir), "")
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("removal refuses what is not of the kind, and a directory that is not empty")
+removeRefuses()
+  val dir = scratchDir("remove-refuse")
+  _ = shOut(s"cd ${sq(dir)} && mkdir d full && echo x >f && echo y >full/y")
+  val g = graphOf(
+    [
+      node("file", s"$dir/d", 1, [("present", BoolV(false))]),
+      node("symlink", s"$dir/f", 2, [("present", BoolV(false))]),
+      node("directory", s"$dir/full", 3, [("present", BoolV(false))])
+    ]
+  )
+  val p = planWith(engineIn(dir), g)
+  assertEq(planText(p, dir).lines(1), " x file /T/d cannot be planned: the path is a directory, not a file")
+  assertEq(planText(p, dir).lines(2), " x symlink /T/f cannot be planned: the path is a file, not a symlink")
+  val a = engineIn(dir).apply(p)
+  assertEq(outcomesOf(a), "failed failed failed")
+  assertEq(textAt(s"$dir/full/y"), "y\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a symlink is retargeted, also when it points at a directory, and replaces a file")
+symlinkRetarget()
+  val dir = scratchDir("symlink")
+  _ = shOut(s"cd ${sq(dir)} && mkdir a b && echo x >plain")
+  val link = s"$dir/link"
+  _ = applyWith(engineIn(dir), graphOf([node("symlink", link, 1, [("target", PathV(s"$dir/a"))])]))
+  assertEq(linkOf(link), s"$dir/a")
+  val g = graphOf(
+    [
+      node("symlink", link, 1, [("target", PathV(s"$dir/b"))]),
+      node("symlink", s"$dir/plain", 2, [("target", PathV(s"$dir/b"))])
+    ]
+  )
+  val p = planWith(engineIn(dir), g)
+  assertEq(
+    planText(p, dir).lines.slice(1, 3),
+    [" ~ symlink /T/link target /T/a -> /T/b", " ~ symlink /T/plain replace the file with a symlink to /T/b"]
+  )
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed changed")
+  assertEq(linkOf(link), s"$dir/b")
+  assertEq(linkOf(s"$dir/plain"), s"$dir/b")
+  assertEq(entriesOf(s"$dir/a"), "")
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("a file replaces a symlink at its path rather than writing through it")
+fileReplacesLink()
+  val dir = scratchDir("unlink")
+  _ = shOut(s"cd ${sq(dir)} && mkdir d && ln -s d f")
+  val g = graphOf([node("file", s"$dir/f", 1, [("content", StrV("text\n"))])])
+  val p = planWith(engineIn(dir), g)
+  assertEq(planText(p, dir).lines(1), " ~ file /T/f replace the symlink with a file")
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(textAt(s"$dir/f"), "text\n")
+  assertEq(entriesOf(s"$dir/d"), "")
+  _ = fs.removeDirAll(dir)
+
+@test("a directory comes before the files declared in it, whatever the declaration order")
+directoryWithFiles()
+  val dir = scratchDir("tree")
+  val order = Buffer[string]()
+  val g = graphOf(
+    [
+      node("file", s"$dir/etc/app/a.conf", 1, [("content", StrV("a\n"))]),
+      node("symlink", s"$dir/etc/app/current", 2, [("target", PathV(s"$dir/etc/app/a.conf"))]),
+      node("directory", s"$dir/etc/app", 3, [("mode", ModeV(0o700))]),
+      node("directory", s"$dir/etc", 4)
+    ]
+  )
+  val e = engineIn(dir, listener = (n, _, _) -> order += n.id.title.replace(dir, ""))
+  val a = applyWith(e, g)
+  assertEq(order.mkString(" "), "/etc /etc/app /etc/app/a.conf /etc/app/current")
+  assertEq(outcomesOf(a), "changed changed changed changed")
+  assertEq(textAt(s"$dir/etc/app/a.conf"), "a\n")
+  assertEq(modeOf(s"$dir/etc/app"), "700")
+  _ = fs.removeDirAll(dir)
+
+@test("`after` orders a resource after another, and ties keep declaration order")
+afterOrdering()
+  val dir = scratchDir("after")
+  val b = GraphBuilder()
+  val first = b.add(node("file", s"$dir/1", 1, [("content", StrV("1"))]))
+  val second = b.add(node("file", s"$dir/2", 2, [("content", StrV("2"))]))
+  _ = b.add(node("file", s"$dir/3", 3, [("content", StrV("3"))]))
+  b.order(second, first, After, at(1))
+  val seen = Buffer[string]()
+  _ = applyWith(engineIn(dir, listener = (n, _, _) -> seen += n.id.title.replace(dir, "")), b.finish())
+  assertEq(seen.mkString(" "), "/2 /1 /3")
+  _ = fs.removeDirAll(dir)
+
+@test("a failing resource skips only what depends on it")
+failureSkipsDependents()
+  val dir = scratchDir("skip")
+  val b = GraphBuilder()
+  val broken = b.add(node("file", s"$dir/no-such-dir/x", 1, [("content", StrV("x"))]))
+  val dependent = b.add(node("file", s"$dir/dependent", 2, [("content", StrV("d"))]))
+  val further = b.add(node("file", s"$dir/further", 3, [("content", StrV("f"))]))
+  _ = b.add(node("file", s"$dir/independent", 4, [("content", StrV("i"))]))
+  b.order(broken, dependent, After, at(2))
+  b.order(dependent, further, After, at(3))
+  val a = applyWith(engineIn(dir), b.finish())
+  assertEq(outcomesOf(a), "failed skipped skipped changed")
+  assertEq(textAt(s"$dir/independent"), "i")
+  assertEq(textAt(s"$dir/dependent"), "(missing)")
+  val shown = squeeze(showApplied([a], 0).replace(dir, "/T"))
+  assertEq(shown.lines(0), "web1 [2/4] changed 1, failed 1, skipped 2")
+  assertEq(shown.contains("failed: web1 file /T/no-such-dir/x (g.fettle:1:1): a command failed"), true)
+  assertEq(shown.contains("skipped: web1 file /T/dependent: `file /T/no-such-dir/x` did not apply"), true)
+  assertEq(shown.contains("skipped: web1 file /T/further: `file /T/dependent` did not apply"), true)
+  _ = fs.removeDirAll(dir)
+
+@test("binary content from a local source travels byte for byte")
+binaryContent()
+  val dir = scratchDir("binary")
+  val source = s"$dir/source.bin"
+  _ = fs.writeBytes(source, allBytes())
+  val target = s"$dir/target.bin"
+  val g = graphOf([node("file", target, 1, [("source", PathV(source))])])
+  val p = planWith(engineIn(dir), g)
+  assertEq(planText(p, dir).lines(1), " + file /T/target.bin 256 B")
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(fs.readBytes(target).map(b -> b.toVector), Ok(allBytes().toVector))
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = fs.writeBytes(source, allBytes().slice(1, 256))
+  assertEq(planText(planWith(engineIn(dir), g), dir).lines(1), " ~ file /T/target.bin content changed (256 B -> 255 B)")
+  val missing = graphOf([node("file", target, 1, [("source", PathV(s"$dir/nowhere"))])])
+  assertEq(
+    planText(planWith(engineIn(dir), missing), dir).lines(1).startsWith(
+      " x file /T/target.bin cannot be planned: the source `/T/nowhere` cannot be read"
+    ),
+    true
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("Unicode in paths and content")
+unicodePaths()
+  val dir = scratchDir("unicode")
+  val f = s"$dir/日本 é/🙂.conf"
+  val g = graphOf([node("directory", s"$dir/日本 é", 1), node("file", f, 2, [("content", StrV("é 日本 🙂\n"))])])
+  val p = planWith(engineIn(dir), g)
+  assertEq(planText(p, dir).lines.slice(1, 3), [" + directory /T/日本 é", " + file /T/日本 é/🙂.conf 1 line"])
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed changed")
+  assertEq(textAt(f), "é 日本 🙂\n")
+  _ = applyWith(
+    engineIn(dir),
+    graphOf([node("directory", s"$dir/日本 é", 1), node("file", f, 2, [("content", StrV("é 日本 🙃\n"))])])
+  )
+  val q = planWith(engineIn(dir), g)
+  assertEq(planText(q, dir).lines.slice(1, 5), [" ~ file /T/日本 é/🙂.conf", " @@ -1 +1 @@", " -é 日本 🙃", " +é 日本 🙂"])
+  _ = fs.removeDirAll(dir)
+
+@test("paths with spaces, quotes, a newline, `$` and backquotes")
+awkwardPaths()
+  val dir = scratchDir("awkward")
+  val names = ["a b", "it's", "say \"hi\"", "line\nbreak", "$HOME", "`date`", "-dash", "tab\there", "back\\slash"]
+  val nodes = Buffer[Node]()
+  var line = 1
+  for n in names
+    nodes += node("file", s"$dir/$n", line, [("content", StrV(n))])
+    line += 1
+  nodes += node("symlink", s"$dir/link 'to' \"it\"\n", line, [("target", PathV(s"$dir/line\nbreak"))])
+  val g = graphOf(nodes.toVector)
+  val p = planWith(engineIn(dir), g)
+  assertEq(planText(p, dir).contains(" + file \"/T/line\\nbreak\" 2 lines\n"), true)
+  assertEq(planText(p, dir).contains(" + file \"/T/tab\\there\" 1 line\n"), true)
+  assertEq(planText(p, dir).contains(" + file /T/say \"hi\" 1 line\n"), true)
+  val a = engineIn(dir).apply(p)
+  assertEq(a.failed, 0)
+  for n in names
+    assertEq(textAt(s"$dir/$n"), n)
+  assertEq(linkOf(s"$dir/link 'to' \"it\"\n"), s"$dir/line\nbreak")
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("what is at a path and is not of the kind cannot be planned")
+wrongKinds()
+  val dir = scratchDir("kinds")
+  _ = shOut(s"cd ${sq(dir)} && mkdir d && echo x >f && mkfifo p")
+  val g = graphOf(
+    [
+      node("file", s"$dir/d", 1, [("content", StrV("x"))]),
+      node("directory", s"$dir/f", 2),
+      node("symlink", s"$dir/d", 3, [("target", PathV("/"))]),
+      node("file", s"$dir/p", 4, [("content", StrV("x"))]),
+      node("symlink", s"$dir/nowhere", 5),
+      node("directory", s"$dir/purged", 6, [("purge", BoolV(true))]),
+      node("file", s"$dir/both", 7, [("content", StrV("x")), ("source", PathV("/etc/hosts"))])
+    ]
+  )
+  val lines = planText(planWith(engineIn(dir), g), dir).lines
+  assertEq(
+    lines.slice(1, 8),
+    [
+      " x file /T/d cannot be planned: the path is a directory, not a file",
+      " x directory /T/f cannot be planned: the path is a file, not a directory",
+      " x symlink /T/d cannot be planned: the path is a directory, not a symlink",
+      " x file /T/p cannot be planned: the path is a special file (a device, a pipe or a socket), not a file",
+      " x symlink /T/nowhere cannot be planned: a symlink needs a `target`",
+      " x directory /T/purged cannot be planned: `purge` is not supported yet",
+      " x file /T/both cannot be planned: a file takes `content` or `source`, not both"
+    ]
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("a kind with no provider cannot be planned, and the rest of the plan stands")
+noProvider()
+  val dir = scratchDir("noprovider")
+  val g = graphOf([node("package", "nginx", 1), node("file", s"$dir/f", 2, [("content", StrV("x"))])])
+  val p = planWith(engineIn(dir), g)
+  assertEq(
+    planText(p, dir).lines.slice(1, 3),
+    [" x package nginx cannot be planned: there is no provider for `package` yet", " + file /T/f 1 line"]
+  )
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "failed changed")
+  _ = fs.removeDirAll(dir)
+
+@test("the probe batches every resource into one round trip")
+oneRoundTrip()
+  val dir = scratchDir("batch")
+  val t = Recording()
+  val g = graphOf(
+    [
+      node("file", s"$dir/a", 1),
+      node("file", s"$dir/b", 2),
+      node("directory", s"$dir/c", 3),
+      node("symlink", s"$dir/d", 4, [("target", PathV("/"))])
+    ]
+  )
+  _ = planWith(engineIn(dir, t), g)
+  assertEq(t.scripts.length, 1)
+  _ = fs.removeDirAll(dir)
+
+@test("a host the probe cannot reach is an error, not a plan")
+closedHost()
+  val dir = scratchDir("closed")
+  val t = Recording()
+  _ = t.close()
+  val r = engineIn(dir, t).plan("web1", facts("debian12"), graphOf([node("file", s"$dir/a", 1)]))
+  assertEq(r.map(p -> p.host), Err("local: the transport is closed"))
+  _ = fs.removeDirAll(dir)

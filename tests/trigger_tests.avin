@@ -1,0 +1,241 @@
+module tests
+
+import avin.crypto
+import avin.encoding
+import avin.fs
+import avin.process
+import dev.avinlang.fettle.engine.{Pending, readPending, reveal}
+import dev.avinlang.fettle.eval.{evaluate}
+import dev.avinlang.fettle.graph.{CommandV, Graph, GraphBuilder, ModeV, ResourceId, SecretV, StrV, Value}
+import dev.avinlang.fettle.report.{outcomeWord, progressLine, showApplied, showPlan}
+
+// Triggers and the pending record, and secrets: their content travels on standard input and never
+// reaches the plan, the apply's output or a script.
+
+// A graph of the file `conf` holding `content` and the command `reload`, which `on conf -> run`
+// triggers.
+triggered(conf: string, content: string) -> Graph
+  val b = GraphBuilder()
+  val c = b.add(node("file", conf, 1, [("content", StrV(content))]))
+  val r = b.add(node("command", "reload", 2))
+  b.trigger([c], r, "run", at(2))
+  b.finish()
+
+@test("an action runs once after its source changes, and not when nothing changed")
+triggerRuns()
+  val dir = scratchDir("trigger")
+  val log = s"$dir/log"
+  val providers = withLogging(log, s"$dir/flag")
+  val p = planWith(engineIn(dir, providers = providers), triggered(s"$dir/conf", "v1\n"))
+  assertEq(
+    planText(p, dir),
+    "web1 (debian 12, amd64)\n + file /T/conf 1 line\n > command reload run (file /T/conf)\n\nPlan: 1 host; 1 to create, 0 to change, 0 to remove, 1 action.\n"
+  )
+  val heard = Buffer[string]()
+  val a = engineIn(
+    dir,
+    providers = providers,
+    listener = (n, act, o) -> heard += progressLine("web1", n, act, o).replace(dir, "/T")
+  ).apply(p)
+  assertEq(outcomesOf(a), "changed ok")
+  assertEq(a.actions.map(x -> s"${x.action} ${outcomeWord(x.outcome)}"), ["run changed"])
+  assertEq(a.changed, 2)
+  assertEq(heard.mkString(""), "web1  changed file /T/conf\nweb1  changed command reload: run\n")
+  assertEq(textAt(log), "reload run\n")
+  assertEq(fs.exists(pendingIn(dir)), false)
+  val again = planWith(engineIn(dir, providers = providers), triggered(s"$dir/conf", "v1\n"))
+  assertEq(again.hasWork, false)
+  _ = engineIn(dir, providers = providers).apply(again)
+  assertEq(textAt(log), "reload run\n")
+  _ = fs.removeDirAll(dir)
+
+@test("an action triggered by several changed sources runs once")
+triggerOnce()
+  val dir = scratchDir("trigger-once")
+  val log = s"$dir/log"
+  val b = GraphBuilder()
+  val x = b.add(node("file", s"$dir/x", 1, [("content", StrV("x"))]))
+  val y = b.add(node("file", s"$dir/y", 2, [("content", StrV("y"))]))
+  val r = b.add(node("command", "reload", 3))
+  b.trigger([x, y], r, "run", at(3))
+  val p = planWith(engineIn(dir, providers = withLogging(log, s"$dir/flag")), b.finish())
+  assertEq(planText(p, dir).lines(3), " > command reload run (file /T/x, file /T/y)")
+  _ = engineIn(dir, providers = withLogging(log, s"$dir/flag")).apply(p)
+  assertEq(textAt(log), "reload run\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a failed action stays pending on the host and runs on the next apply, though nothing changed")
+pendingSurvives()
+  val dir = scratchDir("pending")
+  val log = s"$dir/log"
+  val flag = s"$dir/flag"
+  _ = fs.writeText(flag, "")
+  val providers = withLogging(log, flag)
+  val g = triggered(s"$dir/conf", "v1\n")
+  val first = engineIn(dir, providers = providers).apply(planWith(engineIn(dir, providers = providers), g))
+  assertEq(outcomesOf(first), "changed failed")
+  assertEq(textAt(s"$dir/conf"), "v1\n")
+  assertEq(readPending(textAt(pendingIn(dir))), [Pending(ResourceId("command", "reload"), "run")])
+  val shown = squeeze(showApplied([first], 1))
+  assertEq(
+    shown.contains(
+      "failed: web1 command reload (g.fettle:2:1): the action `run` failed\n command: log reload run\n exited with status 3\n | flagged\n"
+    ),
+    true
+  )
+  val second = planWith(engineIn(dir, providers = providers), g)
+  assertEq(
+    planText(second, dir),
+    "web1 (debian 12, amd64)\n > command reload run (pending from an earlier run)\n\nPlan: 1 host; 0 to create, 0 to change, 0 to remove, 1 action.\n"
+  )
+  _ = fs.remove(flag)
+  val a = engineIn(dir, providers = providers).apply(second)
+  assertEq(outcomesOf(a), "ok ok")
+  assertEq(a.actions.length, 1)
+  assertEq(a.changed, 1)
+  assertEq(textAt(log), "reload run\n")
+  assertEq(fs.exists(pendingIn(dir)), false)
+  assertEq(planWith(engineIn(dir, providers = providers), g).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("the pending record is written before the triggering change, so a change that fails part way still triggers")
+pendingBeforeChange()
+  val dir = scratchDir("pending-before")
+  val log = s"$dir/log"
+  val providers = withLogging(log, s"$dir/flag")
+  val b = GraphBuilder()
+  val c = b.add(
+    node(
+      "file",
+      s"$dir/conf",
+      1,
+      [("content", StrV("bad")), ("validate", CommandV("false", [StrV("%s")], None, false))]
+    )
+  )
+  val r = b.add(node("command", "reload", 2))
+  b.trigger([c], r, "run", at(2))
+  val g = b.finish()
+  val first = engineIn(dir, providers = providers).apply(planWith(engineIn(dir, providers = providers), g))
+  assertEq(outcomesOf(first), "failed skipped")
+  assertEq(readPending(textAt(pendingIn(dir))), [Pending(ResourceId("command", "reload"), "run")])
+  assertEq(textAt(log), "(missing)")
+  val fixed = triggered(s"$dir/conf", "good")
+  val p = planWith(engineIn(dir, providers = providers), fixed)
+  assertEq(planText(p, dir).lines(2), " > command reload run (file /T/conf; pending from an earlier run)")
+  val a = engineIn(dir, providers = providers).apply(p)
+  assertEq(outcomesOf(a), "changed ok")
+  assertEq(a.changed, 2)
+  assertEq(textAt(log), "reload run\n")
+  assertEq(fs.exists(pendingIn(dir)), false)
+  _ = fs.removeDirAll(dir)
+
+@test("a pending action whose resource is no longer declared is dropped from the record")
+pendingDropped()
+  val dir = scratchDir("pending-dropped")
+  _ = shOut(
+    s"mkdir -p ${sq(dir)}/state && printf '%s\\n' '[\"service\",\"gone\",\"reload\"]' 'not json' '[\"command\",\"reload\",\"run\"]' >${sq(pendingIn(dir))}"
+  )
+  val log = s"$dir/log"
+  val providers = withLogging(log, s"$dir/flag")
+  val p = planWith(engineIn(dir, providers = providers), triggered(s"$dir/conf", "x"))
+  assertEq(
+    planText(p, dir).lines.slice(1, 4),
+    [
+      " + file /T/conf 1 line",
+      " > command reload run (file /T/conf; pending from an earlier run)",
+      " > service gone reload (pending, but no longer declared: dropped)"
+    ]
+  )
+  _ = engineIn(dir, providers = providers).apply(p)
+  assertEq(textAt(log), "reload run\n")
+  assertEq(fs.exists(pendingIn(dir)), false)
+  _ = fs.removeDirAll(dir)
+
+@test("the pending record's lines survive any title")
+pendingLines()
+  val odd = Pending(ResourceId("file", "/a \"b\"\n\\c 日本"), "run")
+  assertEq(
+    readPending(odd.line + "\n" + Pending(ResourceId("service", "x"), "reload").line + "\n"),
+    [odd, Pending(ResourceId("service", "x"), "reload")]
+  )
+  assertEq(readPending(""), [])
+  assertEq(readPending("[1,2,3]\n[\"a\",\"b\"]\n{}\n"), [])
+  assertEq(readPending(odd.line + "\n" + odd.line + "\n"), [odd])
+
+// The graph of one file at `f` holding the secret `text`, with `more` fields.
+secretFile(f: string, text: string, more: List[(string, Value)] = []) -> Graph =
+  graphOf([node("file", f, 1, ("content", SecretV("literal", [StrV(text)])) :: ("mode", ModeV(0o600)) :: more)])
+
+@test("a secret's content never appears in the plan, the output or a script, and travels on standard input")
+secretsStayHidden()
+  val dir = scratchDir("secret")
+  val f = s"$dir/key"
+  val secret = "hunter2-SECRET-日本"
+  val t = Recording()
+  val e = engineIn(dir, t)
+  val p = planWith(e, secretFile(f, secret))
+  assertEq(planText(p, dir).lines(1), " + file /T/key (secret)")
+  val a = e.apply(p)
+  assertEq(outcomesOf(a), "changed")
+  assertEq(textAt(f), secret)
+  assertEq(modeOf(f), "600")
+  val p2 = planWith(e, secretFile(f, secret + "2"))
+  assertEq(planText(p2, dir).lines(1), " ~ file /T/key content: (secret) changed")
+  assertEq(p2.entries(0).delta.map(d -> d.textDiff), Ok(None))
+  val a2 = e.apply(p2)
+  assertEq(textAt(f), secret + "2")
+  val leak = CommandV("cat %s >&2; exit 1", [], None, true)
+  val a3 = e.apply(planWith(e, secretFile(f, secret + "3", [("validate", leak)])))
+  assertEq(outcomesOf(a3), "failed")
+  assertEq(textAt(f), secret + "2")
+  val out3 = showApplied([a3], 0)
+  assertEq(out3.contains("  | (not shown: the step handles a secret)\n"), true)
+  val hash = encoding.toHex(crypto.sha256(secret.utf8.toVector))
+  for text in [showPlan([p]), showPlan([p2]), showApplied([a], 0), showApplied([a2], 0), out3] ++ t.scripts.toVector
+    assertEq(text.contains("hunter2"), false)
+    assertEq(text.contains(hash), false)
+  assertEq(t.inputs.exists(i -> string.fromUtf8Lossy(i) == secret), true)
+  _ = fs.removeDirAll(dir)
+
+@test("secrets are read from the environment, a file and a command only when a run needs them")
+revealing()
+  val dir = scratchDir("reveal")
+  assertEq(reveal(SecretV("env HOME", [])), Ok(process.env("HOME").getOrElse("")))
+  assertEq(
+    reveal(SecretV("env FETTLE_NO_SUCH_VARIABLE", [])),
+    Err("the secret from the environment variable `FETTLE_NO_SUCH_VARIABLE` is not set")
+  )
+  _ = fs.writeText(s"$dir/s", "from a file\n")
+  assertEq(reveal(SecretV(s"file $dir/s", [])), Ok("from a file\n"))
+  assertEq(reveal(SecretV(s"file $dir/none", [])).isErr, true)
+  assertEq(reveal(SecretV("command printf 'a b\\n\\n'", [])), Ok("a b\n"))
+  assertEq(reveal(SecretV("command exit 3", [])).isErr, true)
+  assertEq(reveal(SecretV("concat", [StrV("pw="), SecretV("literal", [StrV("x")]), StrV("!")])), Ok("pw=x!"))
+  assertEq(reveal(SecretV("literal", [StrV("")])), Ok(""))
+  assertEq(
+    reveal(SecretV("vault s.vault db", [])),
+    Err("the secret from `vault s.vault db` cannot be read by this version of fettle")
+  )
+  val g = graphOf([node("file", s"$dir/k", 1, [("content", SecretV("env FETTLE_NO_SUCH_VARIABLE", []))])])
+  assertEq(
+    planText(planWith(engineIn(dir), g), dir).lines(1),
+    " x file /T/k cannot be planned: the secret from the environment variable `FETTLE_NO_SUCH_VARIABLE` is not set"
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("evaluation keeps what a literal or joined secret is made of, and where any other comes from")
+secretValues()
+  val lines = [
+    "role r()",
+    "  file \"/k\"",
+    "    content = secret.concat(\"pw=\", secret.literal(\"x\"))",
+    "  file \"/e\"",
+    "    content = secret.env(\"HOME\")"
+  ]
+  val inventory = ["", "group web", "  host web1 at \"10.0.0.1\"", "", "apply web -> r()"]
+  val p = projectOf([("main.fettle", src(lines ++ inventory))])
+  val e = evaluate(p.files, "web1", facts("debian12"), x -> p.read(x), p.templates)
+  assertEq(e.diagnostics.length, 0)
+  assertEq(e.graph.nodes(0).field("content"), Some(SecretV("concat", [StrV("pw="), SecretV("literal", [StrV("x")])])))
+  assertEq(e.graph.nodes(1).field("content"), Some(SecretV("env HOME", [])))
+  assertEq(e.graph.nodes(0).field("content").map(v -> v.shown), Some("(secret)"))

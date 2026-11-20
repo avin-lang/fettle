@@ -1,0 +1,148 @@
+module dev.avinlang.fettle.cli
+
+import avin.fs
+import avin.io
+import avin.time
+import dev.avinlang.fettle.engine.{Applied, Context, Engine, Plan, pendingRecord, reveal}
+import dev.avinlang.fettle.eval.{evaluate}
+import dev.avinlang.fettle.facts.{gather}
+import dev.avinlang.fettle.project.{Project, checkProject}
+import dev.avinlang.fettle.report.{applyStatus, planStatus, progressLine, showApplied, showPlan}
+import dev.avinlang.fettle.syntax.{GroupD}
+import dev.avinlang.fettle.transport.{LocalTransport, Transport}
+
+// `fettle plan` and `fettle apply`: the project checked, each target host's facts gathered and the
+// program evaluated for it, its plan printed, and for `apply` the plan applied after a confirmation.
+
+@sysl("sysl.posix.tty.is_tty")
+private isTerminal(fd: int) -> bool
+
+// What `plan` or `apply` was asked to do: run against this machine (`--local`), as the inventory's
+// host `host` (empty: the inventory's only host), without asking (`--yes`), for the project in `dir`.
+data RunArgs(local: bool, host: string, yes: bool, dir: string)
+
+// The arguments of `plan` (`yes` not allowed) or `apply`, or the message refusing them.
+runArgs(args: Vector[string], apply: bool) -> Result[RunArgs, string]
+  var local = false
+  var host = ""
+  var yes = false
+  var dir = ""
+  var i = 0
+  while i < args.length
+    args(i) match
+      "--local" -> local = true
+      "--yes" if apply -> yes = true
+      "--host" if i + 1 < args.length ->
+        host = args(i + 1)
+        i += 1
+      a if a.startsWith("-") -> return Err(s"fettle: unknown argument `$a`\n$usage")
+      a if dir.isEmpty -> dir = a
+      a -> return Err(s"fettle: unexpected argument `$a`\n$usage")
+    i += 1
+  if !local then return Err(s"fettle: remote hosts are not reached yet; use --local\n$usage")
+  Ok(RunArgs(local, host, yes, if dir.isEmpty then "." else dir))
+
+// The inventory's host names, in the order they are declared.
+inventoryHosts(p: Project) -> Vector[string]
+  val out = Buffer[string]()
+  for f in p.files
+    for d in f.decls
+      d match
+        GroupD(g) -> for h in g.hosts
+          if !out.contains(h.name) then out += h.name
+        _ -> ()
+  out.toVector
+
+// The hosts to run against, each with its name in the inventory and the transport that reaches it.
+// With `--local` it is this machine, as the host `--host` names or the inventory's only host.
+targets(a: RunArgs, p: Project) -> Result[Vector[(string, Transport)], string]
+  val hosts = inventoryHosts(p)
+  val name =
+    if a.host.nonEmpty
+      if !hosts.contains(a.host) then return Err(s"fettle: the inventory has no host `${a.host}`")
+      a.host
+    else if hosts.length == 1 then hosts(0)
+    else if hosts.isEmpty then return Err("fettle: the inventory declares no host")
+    else return Err(s"fettle: name the host to apply here with --host (one of ${hosts.mkString(", ")})")
+  Ok([(name, LocalTransport())])
+
+// A host's engine and plan: its facts gathered, the program evaluated for it, and the plan made.
+// `progress` hears each resource's outcome when the plan is applied.
+private planned(p: Project, name: string, t: Transport, progress: bool) -> Result[(Engine, Plan), string]
+  val facts = gather(t).mapErr(e -> s"fettle: $name: $e")?
+  val e = evaluate(p.files, name, facts, x -> p.read(x), p.templates)
+  if report(p, e.diagnostics) > 0 then return Err("")
+  val ctx = Context(facts.root, file -> fs.readBytes(file).mapErr(x -> x.message), v -> reveal(v))
+  val engine = Engine(
+    t,
+    ctx,
+    pendingRecord(facts.root),
+    listener = (node, action, outcome) -> if progress then print(progressLine(name, node, action, outcome))
+  )
+  val plan = engine.plan(name, facts, e.graph).mapErr(x -> s"fettle: $name: $x")?
+  Ok((engine, plan))
+
+// The engines and plans of every target, or the exit status and message of the first that fails.
+private plans(a: RunArgs, progress: bool) -> Result[Vector[(Engine, Plan)], string]
+  val p = loaded(a.dir) match
+    Some(x) -> x
+    None -> return Err("")
+  if report(p, checkProject(p)) > 0 then return Err("")
+  val out = Buffer[(Engine, Plan)]()
+  for (name, t) in targets(a, p)?
+    out += planned(p, name, t, progress)?
+  Ok(out.toVector)
+
+// Prints `message` on standard error unless it is empty (the error was reported already).
+private failed(message: string) -> int
+  if message.nonEmpty then eprintln(message)
+  1
+
+// `fettle plan --local [--host <name>] [dir]`: the plan of the program for this machine. Exit
+// status 0 when nothing would change, 2 when something would, 1 on an error.
+plan(args: Vector[string]) -> int
+  val a = runArgs(args, false) match
+    Ok(x) -> x
+    Err(e) ->
+      eprintln(e)
+      return 2
+  val made = plans(a, false) match
+    Ok(x) -> x
+    Err(e) -> return failed(e)
+  val ps = made.map((_, p) -> p)
+  print(showPlan(ps))
+  planStatus(ps)
+
+// `fettle apply --local [--host <name>] [--yes] [dir]`: the plan printed and, once confirmed at a
+// terminal (or with `--yes`), applied, each changed or failed resource printed as it ends, then the
+// summary. Exit status 0 when everything applied, 1 when anything failed or on an error.
+apply(args: Vector[string]) -> int
+  val a = runArgs(args, true) match
+    Ok(x) -> x
+    Err(e) ->
+      eprintln(e)
+      return 2
+  val made = plans(a, true) match
+    Ok(x) -> x
+    Err(e) -> return failed(e)
+  val ps = made.map((_, p) -> p)
+  print(showPlan(ps))
+  if planStatus(ps) == 1 then return 1
+  if !ps.exists(p -> p.hasWork)
+    println("Nothing to apply.")
+    return 0
+  if !a.yes
+    if !isTerminal(0) || !isTerminal(1) then return failed(
+      "fettle: not at a terminal; pass --yes to apply without asking"
+    )
+    print("Apply this plan? [y/N] ")
+    val answer = io.readLine().getOrElse("").trim.toLower
+    if answer != "y" && answer != "yes"
+      println("Nothing applied.")
+      return 1
+  val start = time.monotonic()
+  val results = made.map((engine, p) -> engine.apply(p))
+  for (engine, _) in made
+    _ = engine.transport.close()
+  print(showApplied(results, (time.monotonic() - start).toSeconds))
+  applyStatus(results)

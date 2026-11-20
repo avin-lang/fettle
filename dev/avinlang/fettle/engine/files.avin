@@ -1,0 +1,418 @@
+module dev.avinlang.fettle.engine
+
+import avin.crypto
+import avin.encoding
+import dev.avinlang.fettle.graph.{BoolV, CommandV, IntV, ModeV, Node, PathV, SecretV, StrV, Value, octalDigits}
+import dev.avinlang.fettle.shell.{Command, Output, Shell, quote}
+
+// The providers of `file`, `directory` and `symlink`. All three share one probe, which prints what
+// is at the path without following a final symlink: `type=` `absent`, `file`, `dir`, `link` or
+// `other`; for a file or a directory `attrs=<mode> <owner> <group>` (octal, from GNU or BSD
+// `stat`); for a file `size=` and `sha256=` (from `sha256sum`, `shasum -a 256` or `openssl`,
+// whichever the host has); for a link `target=` in hexadecimal, so any byte survives a line. When a
+// file's SHA-256 differs from a non-secret declared content, both are under the diff limit, the
+// probe also prints `--` and the file, for the plan's line diff.
+
+// The largest content, current or declared, the plan shows a line diff of: 256 KiB.
+val diffLimit: int = 262144
+
+// The probe of `path`; `wanted` is the SHA-256 of the declared content when the plan may show a
+// diff of it, which makes the probe print the current content when it differs.
+private pathProbe(path: string, wanted: Option[string]) -> Result[Command, string]
+  val p = quote(path)?
+  val stat = "stat -c '%a %U %G' \"$p\" 2>/dev/null || stat -f '%Mp%Lp %Su %Sg' \"$p\""
+  val content = wanted match
+    Some(h) -> s"  if [ \"$$h\" != $h ] && [ \"$$s\" -le $diffLimit ]; then echo --; cat \"$$p\"; fi\n"
+    None -> ""
+  Ok(
+    Shell(
+      s"p=$p\n" + "if [ -L \"$p\" ]; then\n"
+        + "  echo type=link\n"
+        + "  printf 'target=%s\\n' \"$(printf '%s' \"$(readlink \"$p\")\" | od -An -tx1 | tr -d ' \\n')\"\n"
+        + "elif [ -d \"$p\" ]; then\n"
+        + "  echo type=dir\n"
+        + s"  printf 'attrs=%s\\n' \"$$($stat)\"\n"
+        + "elif [ -f \"$p\" ]; then\n"
+        + "  echo type=file\n"
+        + s"  printf 'attrs=%s\\n' \"$$($stat)\"\n"
+        + "  s=$(wc -c <\"$p\" | tr -d ' ')\n"
+        + "  printf 'size=%s\\n' \"$s\"\n"
+        + "  if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum <\"$p\")\n"
+        + "  elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 <\"$p\")\n"
+        + "  else h=$(openssl dgst -sha256 -r <\"$p\"); fi\n"
+        + "  h=${h%% *}\n"
+        + "  printf 'sha256=%s\\n' \"$h\"\n"
+        + content
+        + "elif [ -e \"$p\" ] || [ -h \"$p\" ]; then\n"
+        + "  echo type=other\n"
+        + "else\n"
+        + "  echo type=absent\n"
+        + "fi"
+    )
+  )
+
+// What is at a path, as the probe found it.
+private data Found(
+    kind: string,
+    mode: long,
+    owner: string,
+    group: string,
+    size: long,
+    sha256: string,
+    target: string,
+    content: Option[string]
+)
+
+// The probe's output for a path read into what it found; a probe that failed is an error.
+private found(outputs: Vector[Output]) -> Result[(Found, Probed), string]
+  if outputs.length != 1 then return Err("the probe gave no output")
+  val o = outputs(0)
+  if !o.succeeded then return Err(s"the probe failed with status ${o.code}: ${o.stderr.trim}")
+  val p = readProbed(o.stdout)
+  Ok((foundIn(p)?, p))
+
+// What a path's probe found, from what it printed.
+private foundIn(p: Probed) -> Result[Found, string]
+  val kind = p.value("type")
+  if kind.isEmpty then return Err("the probe printed no type")
+  val attrs = p.value("attrs").split(' ').filter(w -> w.nonEmpty)
+  val mode = if attrs.length > 0 then attrs(0).toLongOption(8).getOrElse(-1) else -1
+  val owner = if attrs.length > 1 then attrs(1) else ""
+  val group = if attrs.length > 2 then attrs(2) else ""
+  val target = encoding.fromHex(p.value("target")) match
+    Ok(bytes) -> string.fromUtf8Lossy(bytes.toArray())
+    Err(_) -> ""
+  Ok(Found(kind, mode, owner, group, p.value("size").toLongOption().getOrElse(-1), p.value("sha256"), target, p.rest))
+
+// A field's value as the word a command takes.
+private word(v: Value) -> string = v match
+  StrV(t) -> t
+  PathV(p) -> p
+  IntV(n) -> s"$n"
+  _ -> v.shown
+
+// The string field `name` of `node`, if set.
+private text(node: Node, name: string) -> Option[string] = node.field(name) match
+  Some(StrV(t)) -> Some(t)
+  Some(PathV(p)) -> Some(p)
+  _ -> None
+
+// The mode field of `node`, if set.
+private modeOf(node: Node) -> Option[long] = node.field("mode") match
+  Some(ModeV(m)) -> Some(m)
+  _ -> None
+
+// Whether `node` is declared present (the default).
+private present(node: Node) -> bool = node.field("present") match
+  Some(BoolV(b)) -> b
+  _ -> true
+
+// A mode as the plan and `chmod` write it: octal, at least four digits (`0644`).
+modeText(m: long) -> string = octalDigits(m).padStart(4, '0')
+
+// A size as the plan writes it: `512 B`, `1.8 KiB`, `3.0 MiB`.
+sizeShown(n: long) -> string
+  if n < 1024 then return s"$n B"
+  val units = ["KiB", "MiB", "GiB", "TiB"]
+  var v = real(n) / 1024.0
+  var u = 0
+  while v >= 1024.0 && u < units.length - 1
+    v = v / 1024.0
+    u += 1
+  val tenths = long(v * 10.0 + 0.5)
+  s"${tenths / 10}.${tenths % 10} ${units(u)}"
+
+// The kind of what is at a path, in words: `a directory`, `a symlink`.
+private kindWords(kind: string) -> string = kind match
+  "file" -> "a file"
+  "dir" -> "a directory"
+  "link" -> "a symlink"
+  _ -> "a special file (a device, a pipe or a socket)"
+
+// The owner and group of `node` as the plan writes them: `owner root:root`, `owner root`, `group
+// adm`, or nothing.
+private ownership(owner: Option[string], group: Option[string]) -> Option[string] = (owner, group) match
+  (Some(o), Some(g)) -> Some(s"owner $o:$g")
+  (Some(o), None) -> Some(s"owner $o")
+  (None, Some(g)) -> Some(s"group $g")
+  (None, None) -> None
+
+// The changes of mode, owner and group between what was found and what `node` declares.
+private attributeChanges(node: Node, f: Found) -> Vector[FieldChange]
+  val out = Buffer[FieldChange]()
+  modeOf(node) match
+    Some(m) if m != f.mode -> out += FieldChange("mode", modeText(f.mode), modeText(m))
+    _ -> ()
+  text(node, "owner") match
+    Some(o) if o != f.owner -> out += FieldChange("owner", f.owner, o)
+    _ -> ()
+  text(node, "group") match
+    Some(g) if g != f.group -> out += FieldChange("group", f.group, g)
+    _ -> ()
+  out.toVector
+
+// The changes as the plan's line writes them: `mode 0644 -> 0600, owner ed -> root`.
+private changesText(cs: Vector[FieldChange]) -> string = cs.map(
+  c -> s"${c.field} ${c.before} -> ${c.after}"
+).mkString(", ")
+
+// The attributes `node` declares, as a new resource's line writes them: `mode 0750, owner root:root`.
+private declaredAttributes(node: Node) -> Vector[string]
+  val out = Buffer[string]()
+  modeOf(node) match
+    Some(m) -> out += s"mode ${modeText(m)}"
+    None -> ()
+  ownership(text(node, "owner"), text(node, "group")) match
+    Some(o) -> out += o
+    None -> ()
+  out.toVector
+
+// The script lines that give `target` (a shell word) the declared owner, group and mode, or, for
+// the ones not declared, those of what is replaced (`f`) when there is one, else `fallback` mode.
+private attributeLines(
+    node: Node,
+    target: string,
+    f: Option[Found],
+    fallback: long,
+    root: bool
+) -> Result[string, string]
+  val out = StringWriter()
+  val owner = text(node, "owner").orElse(if root then f.map(x -> x.owner).filter(o -> o.nonEmpty) else None)
+  val group = text(node, "group").orElse(if root then f.map(x -> x.group).filter(g -> g.nonEmpty) else None)
+  (owner, group) match
+    (Some(o), Some(g)) -> out.write(s"chown ${quote(s"$o:$g")?} $target\n")
+    (Some(o), None) -> out.write(s"chown ${quote(o)?} $target\n")
+    (None, Some(g)) -> out.write(s"chgrp ${quote(g)?} $target\n")
+    (None, None) -> ()
+  val mode = modeOf(node).orElse(f.map(x -> x.mode).filter(m -> m >= 0)).getOrElse(fallback)
+  out.write(s"chmod ${modeText(mode)} $target\n")
+  Ok(out.text)
+
+// The script lines that set only the attributes in `changes` on `target`.
+private changedAttributeLines(node: Node, target: string, changes: Vector[FieldChange]) -> Result[string, string]
+  val out = StringWriter()
+  val owner = changes.exists(c -> c.field == "owner")
+  val group = changes.exists(c -> c.field == "group")
+  if owner || group
+    val o = text(node, "owner")
+    val g = text(node, "group")
+    if owner && g.isDefined then out.write(s"chown ${quote(s"${o.get}:${g.get}")?} $target\n")
+    else if owner then out.write(s"chown ${quote(o.get)?} $target\n")
+    else out.write(s"chgrp ${quote(g.get)?} $target\n")
+  if changes.exists(c -> c.field == "mode") then out.write(s"chmod ${modeText(modeOf(node).get)} $target\n")
+  Ok(out.text)
+
+// The directory part of an absolute path: `/etc` of `/etc/hosts`, `/` of `/hosts`.
+private parentOf(path: string) -> string
+  val slash = path.lastIndexOf("/")
+  if slash <= 0 then "/" else path.slice(0, slash)
+
+// A script made of `body`, which stops at the first command that fails.
+private script(body: string) -> string = "set -e\n" + body
+
+// --- file ------------------------------------------------------------------------------------------
+
+// What a `file` declares its content to be: its bytes, whether they are a secret, and their text
+// when they are UTF-8 with no NUL. `None` when the file declares neither `content` nor `source`.
+private data Content(bytes: Array[byte], secret: bool, text: Option[string])
+
+impl Content
+  sha256 -> string = encoding.toHex(crypto.sha256(bytes.toVector))
+
+  // The content as a new file's line describes it: `(secret)`, `9 lines`, or its size.
+  shown -> string =
+    if secret then "(secret)"
+    else text match
+      Some(t) if bytes.length <= diffLimit -> lineCount(t)
+      _ -> sizeShown(long(bytes.length))
+
+// The number of lines in `t` in words: `1 line`, `9 lines`; a last line without its end counts.
+private lineCount(t: string) -> string
+  var n = t.count(c -> c == '\n')
+  if t.nonEmpty && !t.endsWith("\n") then n += 1
+  if n == 1 then "1 line" else s"$n lines"
+
+// `bytes` as text, when they are UTF-8 holding no NUL.
+private textOf(bytes: Array[byte]) -> Option[string] = string.fromUtf8(bytes) match
+  Ok(t) if !t.exists(c -> int(c) == 0) -> Some(t)
+  _ -> None
+
+// The content `node` declares.
+private contentOf(node: Node, ctx: Context) -> Result[Option[Content], string] = (
+  node.field("content"),
+  node.field("source")
+) match
+  (Some(_), Some(_)) -> Err("a file takes `content` or `source`, not both")
+  (Some(StrV(t)), None) -> Ok(Some(Content(t.utf8, false, textOf(t.utf8))))
+  (Some(SecretV(source, parts)), None) ->
+    val t = ctx.secretOf(SecretV(source, parts))?
+    Ok(Some(Content(t.utf8, true, None)))
+  (None, Some(PathV(p))) ->
+    val bytes = ctx.bytesOf(p).mapErr(e -> s"the source `$p` cannot be read: $e")?
+    Ok(Some(Content(bytes, false, textOf(bytes))))
+  (None, None) -> Ok(None)
+  _ -> Err("a file's `content` is a string or a secret, and its `source` a path")
+
+// The `validate` command of `node` as a line of shell checking the staged file `"$t"`: each `%s`
+// in it stands for that file, and one must be there.
+private validateLine(node: Node) -> Result[Option[string], string] = node.field("validate") match
+  None -> Ok(None)
+  Some(CommandV(_, _, Some(_), _)) -> Err("a `validate` command takes no standard input")
+  Some(CommandV(t, _, None, true)) ->
+    if !t.contains("%s") then return Err("a `validate` command names the file it checks as `%s`")
+    Ok(Some(s"/bin/sh -c ${quote(t.replace("%s", "\"$1\""))?} fettle \"$$t\" </dev/null"))
+  Some(CommandV(program, args, None, false)) ->
+    val words = word(StrV(program)) :: args.map(a -> word(a))
+    if !words.exists(w -> w.contains("%s")) then return Err("a `validate` command names the file it checks as `%s`")
+    val out = Buffer[string]()
+    for w in words
+      val pieces = w.split("%s")
+      val quoted = Buffer[string]()
+      for piece in pieces
+        quoted += quote(piece)?
+      out += quoted.mkString("\"$t\"")
+    Ok(Some(out.mkString(" ") + " </dev/null"))
+  Some(other) -> Err(s"`validate` is a command, not `${other.shown}`")
+
+class FileProvider(): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string]
+    val c = if present(node) then contentOf(node, ctx)? else None
+    val wanted = c.filter(x -> !x.secret && x.text.isDefined && x.bytes.length <= diffLimit).map(x -> x.sha256)
+    Ok([pathProbe(node.id.title, wanted)?])
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    val (f, probed) = found(outputs)?
+    if !present(node)
+      return f.kind match
+        "absent" -> Ok(Delta(InSync, "", [], None, probed))
+        "file" -> Ok(Delta(Remove, "", [], None, probed))
+        "link" -> Ok(Delta(Remove, "", [], None, probed))
+        k -> Err(s"the path is ${kindWords(k)}, not a file")
+    _ = validateLine(node)?
+    val content = contentOf(node, ctx)?
+    f.kind match
+      "absent" -> Ok(Delta(Create, content.map(c -> c.shown).getOrElse("empty"), [], None, probed))
+      "link" ->
+        Ok(Delta(Modify, "replace the symlink with a file", [FieldChange("type", "symlink", "file")], None, probed))
+      "file" ->
+        val changes = Buffer[FieldChange]()
+        var diff: Option[(string, string)] = None
+        val words = Buffer[string]()
+        content match
+          Some(c) if c.sha256 != f.sha256 ->
+            changes += FieldChange("content", sizeShown(f.size), sizeShown(long(c.bytes.length)))
+            val shownDiff = (c.text, f.content) match
+              (
+                Some(after),
+                Some(before)
+              ) if !c.secret && textOf(before.utf8).isDefined && !before.contains("\u{FFFD}") ->
+                Some((before, after))
+              _ -> None
+            diff = shownDiff
+            if c.secret then words += "content: (secret) changed"
+            else if diff.isEmpty then words += s"content changed (${sizeShown(f.size)} -> ${sizeShown(long(c.bytes.length))})"
+          _ -> ()
+        val attrs = attributeChanges(node, f)
+        changes ++= attrs
+        if !attrs.isEmpty then words += changesText(attrs)
+        if changes.isEmpty then Ok(Delta(InSync, "", [], None, probed))
+        else Ok(Delta(Modify, words.mkString(", "), changes.toVector, diff, probed))
+      k -> Err(s"the path is ${kindWords(k)}, not a file")
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string]
+    val path = node.id.title
+    val p = quote(path)?
+    if delta.op == Remove then return Ok([Step(script(s"rm -f $p\n"), Array.empty[byte](), s"rm -f $p")])
+    val content = contentOf(node, ctx)?
+    val f = foundIn(delta.current)?
+    val rewrite = delta.op == Create || f.kind == "link" || delta.changes.exists(c -> c.field == "content")
+    if !rewrite
+      val lines = changedAttributeLines(node, p, delta.changes)?
+      return Ok([Step(script(lines), Array.empty[byte](), lines.trim)])
+    val body = StringWriter()
+    body.write(s"t=$$(mktemp ${quote(parentOf(path) + "/.fettle.XXXXXX")?})\n")
+    body.write("trap 'rm -f \"$t\"' EXIT\n")
+    body.write("cat >\"$t\"\n")
+    val existing = if f.kind == "file" then Some(f) else None
+    body.write(attributeLines(node, "\"$t\"", existing, 420, ctx.root)?)
+    validateLine(node)? match
+      Some(v) -> body.write(v + "\n")
+      None -> ()
+    if f.kind == "link" then body.write(s"rm -f $p\n")
+    body.write(s"mv -f \"$$t\" $p\n")
+    body.write("trap - EXIT\n")
+    val c = content.getOrElse(Content(Array.empty[byte](), false, Some("")))
+    Ok([Step(script(body.text), c.bytes, s"write $p", c.secret)])
+
+// --- directory -------------------------------------------------------------------------------------
+
+class DirectoryProvider(): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string] = Ok([pathProbe(node.id.title, None)?])
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    node.field("purge") match
+      Some(BoolV(true)) -> return Err("`purge` is not supported yet")
+      _ -> ()
+    val (f, probed) = found(outputs)?
+    if !present(node)
+      return f.kind match
+        "absent" -> Ok(Delta(InSync, "", [], None, probed))
+        "dir" -> Ok(Delta(Remove, "", [], None, probed))
+        k -> Err(s"the path is ${kindWords(k)}, not a directory")
+    f.kind match
+      "absent" -> Ok(Delta(Create, declaredAttributes(node).mkString(", "), [], None, probed))
+      "dir" ->
+        val changes = attributeChanges(node, f)
+        if changes.isEmpty then Ok(Delta(InSync, "", [], None, probed))
+        else Ok(Delta(Modify, changesText(changes), changes, None, probed))
+      k -> Err(s"the path is ${kindWords(k)}, not a directory")
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string]
+    val p = quote(node.id.title)?
+    delta.op match
+      Remove -> Ok([Step(script(s"rmdir $p\n"), Array.empty[byte](), s"rmdir $p")])
+      Create ->
+        val lines = s"mkdir $p\n" + attributeLines(node, p, None, 493, ctx.root)?
+        Ok([Step(script(lines), Array.empty[byte](), s"mkdir $p")])
+      _ ->
+        val lines = changedAttributeLines(node, p, delta.changes)?
+        Ok([Step(script(lines), Array.empty[byte](), lines.trim)])
+
+// --- symlink ---------------------------------------------------------------------------------------
+
+class SymlinkProvider(): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string] = Ok([pathProbe(node.id.title, None)?])
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    val (f, probed) = found(outputs)?
+    if !present(node)
+      return f.kind match
+        "absent" -> Ok(Delta(InSync, "", [], None, probed))
+        "link" -> Ok(Delta(Remove, "", [], None, probed))
+        k -> Err(s"the path is ${kindWords(k)}, not a symlink")
+    val target = text(node, "target") match
+      Some(t) -> t
+      None -> return Err("a symlink needs a `target`")
+    f.kind match
+      "absent" -> Ok(Delta(Create, s"-> $target", [], None, probed))
+      "link" if f.target == target -> Ok(Delta(InSync, "", [], None, probed))
+      "link" -> Ok(
+        Delta(Modify, s"target ${f.target} -> $target", [FieldChange("target", f.target, target)], None, probed)
+      )
+      "file" -> Ok(
+        Delta(
+          Modify,
+          s"replace the file with a symlink to $target",
+          [FieldChange("type", "file", "symlink")],
+          None,
+          probed
+        )
+      )
+      k -> Err(s"the path is ${kindWords(k)}, not a symlink")
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string]
+    val p = quote(node.id.title)?
+    if delta.op == Remove then return Ok([Step(script(s"rm -f $p\n"), Array.empty[byte](), s"rm -f $p")])
+    val target = quote(text(node, "target").getOrElse(""))?
+    val line = s"ln -sfn $target $p"
+    Ok([Step(script(line + "\n"), Array.empty[byte](), line)])

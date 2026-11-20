@@ -1,0 +1,68 @@
+module tests
+
+import avin.fs
+import dev.avinlang.fettle.cli.{RunArgs, apply as applyCommand, inventoryHosts, plan as planCommand, runArgs, targets}
+
+// `fettle plan` and `fettle apply` against this machine.
+
+@test("the arguments of plan and apply")
+runArguments()
+  assertEq(runArgs(["--local"], false), Ok(RunArgs(true, "", false, ".")))
+  assertEq(runArgs(["--local", "--host", "web1", "site"], true), Ok(RunArgs(true, "web1", false, "site")))
+  assertEq(runArgs(["site", "--yes", "--local"], true), Ok(RunArgs(true, "", true, "site")))
+  assertEq(runArgs(["--local", "--yes"], false).isErr, true)
+  assertEq(
+    runArgs(["site"], false).map(_ -> ()).mapErr(e -> e.lines(0)),
+    Err("fettle: remote hosts are not reached yet; use --local")
+  )
+  assertEq(runArgs(["--local", "a", "b"], false).mapErr(e -> e.lines(0)), Err("fettle: unexpected argument `b`"))
+  assertEq(runArgs(["--local", "--bogus"], false).mapErr(e -> e.lines(0)), Err("fettle: unknown argument `--bogus`"))
+
+@test("the host --local applies as: the one --host names, or the inventory's only host")
+localTargets()
+  val one = projectOf([("main.fettle", src(["group web", "  host web1 at \"10.0.0.1\""]))])
+  val two = projectOf(
+    [("main.fettle", src(["group web", "  host web1 at \"10.0.0.1\"", "  host web2 at \"10.0.0.2\""]))]
+  )
+  val none = projectOf([("main.fettle", src(["role r()", "  file \"/x\""]))])
+  assertEq(inventoryHosts(two), ["web1", "web2"])
+  assertEq(targets(RunArgs(true, "", false, "."), one).map(ts -> ts.map((n, _) -> n)), Ok(["web1"]))
+  assertEq(targets(RunArgs(true, "web2", false, "."), two).map(ts -> ts.map((n, _) -> n)), Ok(["web2"]))
+  assertEq(
+    targets(RunArgs(true, "", false, "."), two).map(ts -> ts.length),
+    Err("fettle: name the host to apply here with --host (one of web1, web2)")
+  )
+  assertEq(
+    targets(RunArgs(true, "db9", false, "."), two).map(ts -> ts.length),
+    Err("fettle: the inventory has no host `db9`")
+  )
+  assertEq(
+    targets(RunArgs(true, "", false, "."), none).map(ts -> ts.length),
+    Err("fettle: the inventory declares no host")
+  )
+
+@test("apply --local --yes makes a project's files here, and a plan after it has nothing to do")
+localApply()
+  val dir = scratchDir("cli")
+  val program = [
+    "role r()",
+    s"  directory \"$dir/out\"",
+    "    mode = 0o700",
+    s"  file \"$dir/out/hello.txt\"",
+    "    content = \"hello\\n\"",
+    "",
+    "group here",
+    "  host me at \"localhost\"",
+    "",
+    "apply here -> r()"
+  ]
+  _ = fs.writeText(s"$dir/main.fettle", src(program))
+  assertEq(planCommand(["--local", dir]), 2)
+  assertEq(textAt(s"$dir/out/hello.txt"), "(missing)")
+  assertEq(applyCommand(["--local", "--yes", dir]), 0)
+  assertEq(textAt(s"$dir/out/hello.txt"), "hello\n")
+  assertEq(modeOf(s"$dir/out"), "700")
+  assertEq(planCommand(["--local", dir]), 0)
+  assertEq(applyCommand(["--local", "--yes", dir]), 0)
+  assertEq(planCommand(["--local", "--host", "nobody", dir]), 1)
+  _ = fs.removeDirAll(dir)
