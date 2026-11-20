@@ -5,10 +5,12 @@ import dev.avinlang.fettle.syntax.{Diagnostic, parseSource}
 import dev.avinlang.fettle.report.{render}
 import dev.avinlang.fettle.project.{Project, checkProject, filesUnder, load}
 import dev.avinlang.fettle.fmt.{format}
-import dev.avinlang.fettle.eval.{evaluate, readFacts}
+import dev.avinlang.fettle.eval.{evaluate}
+import dev.avinlang.fettle.facts.{factsJson, gather, readFacts, showFacts}
 import dev.avinlang.fettle.graph.{showGraph}
+import dev.avinlang.fettle.transport.{LocalTransport}
 
-val usage: string = "usage: fettle check [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [dir]"
+val usage: string = "usage: fettle check [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [dir]\n       fettle facts --local [--json]"
 
 // Runs the command `args` names, answering the exit status.
 main(args: Vector[string]) -> int
@@ -20,6 +22,7 @@ main(args: Vector[string]) -> int
     "check" -> check(if rest.isEmpty then "." else rest(0))
     "fmt" -> fmt(rest)
     "graph" -> graph(rest)
+    "facts" -> facts(rest)
     _ ->
       eprintln(s"fettle: unknown command `${args(0)}`\n$usage")
       2
@@ -114,3 +117,25 @@ graph(args: Vector[string]) -> int
   if report(p, e.diagnostics) > 0 then return 1
   print(showGraph(e.graph))
   0
+
+// `fettle facts --local [--json]`: this machine's facts, gathered by running the facts script under
+// `/bin/sh`, printed one a line or, with `--json`, as the JSON a fact fixture holds.
+facts(args: Vector[string]) -> int = factsText(args) match
+  Ok(text) ->
+    print(text)
+    0
+  Err((code, message)) ->
+    eprintln(message)
+    code
+
+// What `fettle facts` prints for `args`, or the exit status and message it fails with.
+factsText(args: Vector[string]) -> Result[string, (int, string)]
+  val unknown = args.filter(a -> a != "--local" && a != "--json")
+  if !unknown.isEmpty || !args.contains("--local")
+    return Err((2, if unknown.isEmpty then s"fettle: facts of a remote host are not gathered yet; use --local\n$usage" else s"fettle: unknown argument `${unknown(0)}`\n$usage"))
+  val t = LocalTransport()
+  val gathered = gather(t)
+  _ = t.close()
+  gathered match
+    Ok(f) -> Ok(if args.contains("--json") then factsJson(f) + "\n" else showFacts(f))
+    Err(e) -> Err((1, s"fettle: local: $e"))

@@ -1,7 +1,8 @@
 module dev.avinlang.fettle.eval
 
 import avin.collections.mutable.{Map as Table}
-import dev.avinlang.json.{Json, Long as JLong, Obj, Str as JStr, Bool as JBool, parse as parseJson}
+import dev.avinlang.fettle.facts.{Facts}
+import dev.avinlang.fettle.shell.{quote}
 import dev.avinlang.fettle.check.{builtinData, templatePath}
 import dev.avinlang.fettle.kinds.{KindSpec, PathT, kindNamed}
 import dev.avinlang.fettle.graph.{After, BoolV, CommandV, DurationV, Graph, GraphBuilder, GroupV, IntV, ListV, MapV, ModeV, Node, NoneV, PathV, RecordV, RefV, Reference, ResourceId, SecretV, SetV, SizeV, StrV, Value, VariantV}
@@ -13,20 +14,6 @@ import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, Arm, AsS, BinaryE,
 
 // What evaluating for one host gave: the graph, and every error (evaluation's and the graph's).
 data Evaluated(graph: Graph, diagnostics: Vector[Diagnostic])
-
-// The facts of one host, as a fixture or a cached `fettle facts` gives them.
-data Facts(os: string, distro: string, version: string, arch: string, init: string, cpus: long, memory: long, hostname: string, user: string, root: bool)
-
-// Reads a fact fixture: a JSON object with `os`, `distro`, `version`, `arch`, `init`, `cpus`,
-// `memory` (bytes), `hostname`, `user` and `root`.
-readFacts(text: string) -> Result[Facts, string] = parseJson(text) match
-  Err(e) -> Err(s"$e")
-  Ok(j) ->
-    val str = (k: string) -> j.get(k).flatMap(v -> v.asString).getOrElse("")
-    val num = (k: string) -> j.get(k).flatMap(v -> v.asLong).getOrElse(0)
-    for k in ["os", "distro", "arch", "init"]
-      if str(k).isEmpty then return Err(s"the facts have no `$k`")
-    Ok(Facts(str("os"), str("distro"), str("version"), str("arch"), str("init"), num("cpus"), num("memory"), str("hostname"), str("user"), j.get("root").flatMap(v -> v.asBool).getOrElse(false)))
 
 // Evaluates `files` for the host `hostName` of the inventory, with `facts`; `readLocal` reads a file
 // next to the program for `local(…)`.
@@ -310,7 +297,7 @@ class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[s
       BoolE(b, _) -> BoolV(b)
       NoneE(_) -> NoneV
       StrE(parts, _, _) -> StrV(interpolate(parts, env))
-      ShE(parts, _) -> CommandV(interpolate(parts, env), [], None, true)
+      ShE(parts, s) -> CommandV(shellText(parts, env, s), [], None, true)
       NameE(n, s) -> name(n, s, env)
       FieldE(t, f, s) -> fieldOf(expr(t, env), f, s)
       CallE(callee, args, s) -> call(callee, args, s, env)
@@ -408,6 +395,20 @@ class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[s
       p match
         TextP(t) -> out.write(t)
         ExprP(x) -> out.write(text(expr(x, env)))
+    out.text
+
+  // The text of an `sh"…"` form: its literal text as shell, each interpolation quoted as one word. A
+  // value holding a NUL, which no shell word can carry, is an error.
+  private shellText(parts: List[StrPart], env: List[(string, Value)], s: Span) -> string
+    val out = StringWriter()
+    for p in parts
+      p match
+        TextP(t) -> out.write(t)
+        ExprP(x) -> quote(text(expr(x, env))) match
+          Ok(w) -> out.write(w)
+          Err(e) ->
+            error("E0320", e, x.extent, "not a shell word")
+            return ""
     out.text
 
   private truth(v: Value) -> bool = v match

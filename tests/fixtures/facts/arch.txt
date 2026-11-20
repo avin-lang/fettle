@@ -1,0 +1,9 @@
+kernel=Linux
+machine=x86_64
+hostname=archbox
+user=ed
+uid=1000
+cpus=12
+memory=33554432000
+init=systemd
+os-release.ID=arch

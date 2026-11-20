@@ -2,7 +2,8 @@ module tests
 
 import avin.fs
 import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, ApplyDecl, Arm, BinaryE, BindP, CallE, CallS, Decl, Expr, ExprP, FailE, FieldE, ForE, ForS, GroupD, GroupDecl, HostDecl, IfE, ListE, MatchE, ModeE, OnS, Pattern, SourceFile, Stmt, StrE, TextP, TupleE, TupleP, ValS, VariantP, WildP}
-import dev.avinlang.fettle.eval.{Facts, evaluate, readFacts}
+import dev.avinlang.fettle.eval.{evaluate}
+import dev.avinlang.fettle.facts.{Facts, readFacts}
 import dev.avinlang.fettle.graph.{showGraph}
 
 facts(name: string) -> Facts = readFacts(fs.readText(s"tests/fixtures/$name.json").getOrElse("")).getOrElse(Facts("", "", "", "", "", 0, 0, "", "", false))

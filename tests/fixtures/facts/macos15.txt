@@ -1,0 +1,9 @@
+kernel=Darwin
+machine=arm64
+hostname=studio.local
+user=ed
+uid=501
+cpus=12
+memory=34359738368
+init=launchd
+macos=15.6.1

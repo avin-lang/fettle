@@ -1,0 +1,10 @@
+kernel=Linux
+machine=x86_64
+hostname=3f9c2a1b7d4e
+user=root
+uid=0
+cpus=4
+memory=4112060416
+init=none
+os-release.VERSION_ID="12"
+os-release.ID=debian

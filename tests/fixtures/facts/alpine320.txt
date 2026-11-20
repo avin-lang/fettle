@@ -1,0 +1,10 @@
+kernel=Linux
+machine=aarch64
+hostname=edge1
+user=root
+uid=0
+cpus=1
+memory=1073741824
+init=openrc
+os-release.ID=alpine
+os-release.VERSION_ID=3.20.3

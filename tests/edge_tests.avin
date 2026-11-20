@@ -50,3 +50,23 @@ crossModuleScopes()
 secretIntoCommand()
   assertEq(errorsIn(["role r(k: secret)", "  command \"c\"", "    run = sh\"login ${k}\"", "    always = true"]), "main.fettle:3:22 E0209 a secret cannot be in a command's argument list")
   assertEq(errorsIn(["role r(k: secret)", "  command \"c\"", "    run = sh\"login\".stdin(secret.concat(\"pw=\", k))", "    always = true"]), "")
+
+// The graph of a role whose one command runs `sh"…"` written as `run`, after `vals`.
+shGraph(vals: Vector[string], run: string) -> string = graphText(["role r()"] ++ vals ++ ["  command \"c\"", s"    run = $run", "    always = true"])
+
+// The graph `shGraph` gives when the command's shell text is `text`, as the graph quotes it.
+shExpected(text: string) -> string = s"1. command \"c\"\n     run = sh(\"${text.replace("\\", "\\\\").replace("\"", "\\\"")}\")\n     always = true\n"
+
+@test("each interpolation of sh\"…\" is quoted as one word; its literal text stays shell")
+shInterpolationQuoted()
+  assertEq(shGraph(["  val x = \"it's; rm -rf /\""], "sh\"echo ${x} | wc -c\""), shExpected("echo 'it'\\''s; rm -rf /' | wc -c"))
+  assertEq(shGraph(["  val x = \"plain\""], "sh\"echo ${x}\""), shExpected("echo plain"))
+  assertEq(shGraph(["  val x = \"\""], "sh\"test -z ${x}\""), shExpected("test -z ''"))
+  assertEq(shGraph(["  val x = \"$HOME `id` \\\\\""], "sh\"echo ${x}\""), shExpected("echo '$HOME `id` \\'"))
+  assertEq(shGraph(["  val x = \"é 日本\""], "sh\"echo ${x}\""), shExpected("echo 'é 日本'"))
+  assertEq(shGraph([], "sh\"echo ${1 + 2} ${\"a b\"}\""), shExpected("echo 3 'a b'"))
+  assertEq(shGraph(["  val x = \"a b\""], "sh\"echo \\\"${x}\\\" $HOME\""), shExpected("echo \"'a b'\" $HOME"))
+
+@test("a NUL in an interpolation of sh\"…\" is an evaluation error")
+shInterpolationNul()
+  assertEq(shGraph(["  val x = \"a\\0b\""], "sh\"echo ${x}\""), "main.fettle:4:21 E0320 the word `a\\0b` holds a NUL character, which no shell word can carry")

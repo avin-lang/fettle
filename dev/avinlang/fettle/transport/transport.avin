@@ -1,0 +1,78 @@
+module dev.avinlang.fettle.transport
+
+import avin.fs
+import avin.process
+import avin.process.{ExitStatus, Exited, Signalled, TimedOut}
+
+// Where commands run: a host reached over SSH, or this machine. A transport runs a POSIX shell
+// script and gives back how it ended and what it printed; a file reaches the host as the bytes on a
+// script's standard input (`cat >…`), never over a separate channel, so one code path serves every
+// upload and works under `become`.
+
+// How a script ended: it exited with a code, or a signal killed it.
+data Ending
+  ExitCode(code: int)
+  KilledBy(signal: int)
+
+// What a script run gave: how it ended, and its standard output and standard error as bytes.
+data Ran(ending: Ending, stdout: Array[byte], stderr: Array[byte])
+
+impl Ran
+  // Whether the script exited with code 0.
+  succeeded -> bool = ending match
+    ExitCode(c) -> c == 0
+    KilledBy(_) -> false
+
+  // The standard output as text, bytes that are not UTF-8 each replaced with U+FFFD.
+  out -> string = string.fromUtf8Lossy(stdout)
+
+  // The standard error as text, as `out`.
+  err -> string = string.fromUtf8Lossy(stderr)
+
+  // How the script ended, in words: `exited with status 2`, `killed by signal 9`.
+  endingText -> string = ending match
+    ExitCode(c) -> s"exited with status $c"
+    KilledBy(s) -> s"killed by signal $s"
+
+// Why a script could not be run at all: the host could not be reached, the session broke, a local
+// process could not be started. A script that ran and failed is a `Ran`, not this.
+data TransportError(reason: string)
+
+impl Error for TransportError
+  message -> string = reason
+
+// A connection to one host. `run` may be called any number of times, one after the other, until
+// `close`; each call is one round trip.
+trait Transport
+  // Runs `script` with `/bin/sh` on the host, `input` as its standard input (empty for none), and
+  // answers how it ended with everything it printed.
+  run(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+
+  // Ends the connection; later calls of `run` fail.
+  close() -> Result[unit, TransportError]
+
+// This machine, as a transport: each script is run by a `/bin/sh` child process, its input, output
+// and error output going through files in a scratch directory that is removed after.
+class LocalTransport(): Transport
+  private var closed = false
+
+  override run(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+    if closed then return Err(TransportError("local: the transport is closed"))
+    val dir = fs.createTempDir("fettle-local").mapErr(e -> TransportError(s"local: ${e.message}"))?
+    defer _ = fs.removeDirAll(dir)
+    val inFile = dir + "/in"
+    val outFile = dir + "/out"
+    val errFile = dir + "/err"
+    fs.writeBytes(inFile, input).mapErr(e -> TransportError(s"local: ${e.message}"))?
+    val ended = process.Command("/bin/sh", "-c", script).fromFile(inFile).toFile(outFile).errorsToFile(errFile).run()
+    val ending = ended.mapErr(e -> TransportError(s"local: ${e.message}"))? match
+      Exited(c) -> ExitCode(c)
+      Signalled(s) -> KilledBy(s)
+      TimedOut -> return Err(TransportError("local: the script ran out of time"))
+    val stdout = fs.readBytes(outFile).mapErr(e -> TransportError(s"local: ${e.message}"))?
+    val stderr = fs.readBytes(errFile).mapErr(e -> TransportError(s"local: ${e.message}"))?
+    Ok(Ran(ending, stdout, stderr))
+
+  override close() -> Result[unit, TransportError]
+    closed = true
+    Ok(())

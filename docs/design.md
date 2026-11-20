@@ -938,3 +938,33 @@ user.
     that line and are otherwise as written here. Review with the user.
 25. **Phase 1's parser reads no `kind` and no `test` declaration**; the kinds of 2.4 and 2.6 come
     with custom kinds, and a `kind` line is a syntax error until then. Review with the user.
+26. **Shell quoting**: a word of ASCII letters, digits and `_ @ % + : , . / -` is written as it is;
+    any other word, the empty one included, goes in single quotes with each `'` written `'\''`.
+    `=` and `~` are not plain, so a quoted first word is never an assignment or a home directory.
+    A NUL is refused: by `render` for a command, and as `E0320` for an `sh"…"` interpolation, each
+    of which is quoted as one word as 3.2 says (it had been pasted in unquoted). An interpolation
+    inside the text's own double quotes is quoted too, so `"${x}"` keeps the single quotes; write
+    `${x}` bare. Review with the user.
+27. **One probe script, many commands**: each command runs in a subshell with standard input from
+    `/dev/null` (shell text through `/bin/sh -c`, so a syntax error fails only that command), its
+    output and error output go to files in a `mktemp -d` scratch directory, and the script prints a
+    header `<marker> <index> <code> <out bytes> <err bytes>` and then exactly those bytes. Output is
+    counted, never searched, so nothing a command prints can pass for a header; `<marker> begin` and
+    `<marker> end` lines, with a random marker per script, find the start past any banner and catch a
+    cut-off run. Review with the user.
+28. **The transport** is `run(script, input bytes) -> Ran(ending, stdout bytes, stderr bytes)` and
+    `close()`; a script that ran and failed is a `Ran`, and only not reaching the host is an error.
+    The script is run by `/bin/sh`, never the login shell, which may not be POSIX. Review with the
+    user.
+29. **Distributions**: `rocky`, `almalinux` and `centos` are `Rhel` by major version; Alpine's
+    version is its release branch (`3.20` from `3.20.3`); Ubuntu keeps `24.04`. A Debian or Ubuntu
+    without `VERSION_ID` (testing, unstable) and a Linux without `os-release` are refused with a
+    message; any other `ID` is `Other(id)`, and FreeBSD without `os-release` is `Other("freebsd")`.
+    Review with the user.
+30. **`init` is the init system running**, not the one installed: `/run/systemd/system` for systemd,
+    `/run/openrc` for OpenRC, launchd on Darwin, otherwise `NoInit`, so a container started without
+    an init is `NoInit`. Fact fixtures are checked against the same variant names. Review with the
+    user.
+31. **`Facts` and `readFacts` live in the `facts` module**, beside the script and its parser, and the
+    evaluator imports them. `fettle facts` without `--local` is refused until the ssh transport
+    exists. Review with the user.

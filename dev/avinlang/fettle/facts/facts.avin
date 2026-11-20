@@ -1,0 +1,244 @@
+module dev.avinlang.fettle.facts
+
+import avin.collections.mutable.{Map as Table}
+import dev.avinlang.json.{parse as parseJson, quote as jsonQuote}
+import dev.avinlang.fettle.transport.{Transport}
+
+// A host's facts: what one read-only script finds out about it in one round trip, typed. The same
+// facts come from a fixture or a cache as JSON.
+
+// The facts of one host. `os`, `distro`, `arch` and `init` hold the variant names of `Os`, `Distro`,
+// `Cpu` and `Init`; `version` is the distribution's version (a whole number for Debian, Fedora and
+// RHEL, `24.04` for Ubuntu, `3.20` for Alpine, empty for Arch) or, for `Other`, its id; `memory` is in
+// bytes; `user` is the login user and `root` whether it is root.
+data Facts(
+    os: string,
+    distro: string,
+    version: string,
+    arch: string,
+    init: string,
+    cpus: long,
+    memory: long,
+    hostname: string,
+    user: string,
+    root: bool
+)
+
+private val oses: Vector[string] = ["Linux", "Darwin", "FreeBsd"]
+private val distros: Vector[string] = ["Debian", "Ubuntu", "Fedora", "Rhel", "Alpine", "Arch", "Macos", "Other"]
+private val cpuNames: Vector[string] = ["Amd64", "Arm64"]
+private val inits: Vector[string] = ["Systemd", "OpenRc", "Launchd", "NoInit"]
+
+// `f` when each of its names is a variant of its type and a version that must be a whole number is
+// one, otherwise what is wrong.
+private validated(f: Facts) -> Result[Facts, string]
+  if !oses.contains(f.os) then return Err(s"`${f.os}` is not an Os (${oses.mkString(", ")})")
+  if !distros.contains(f.distro) then return Err(s"`${f.distro}` is not a Distro (${distros.mkString(", ")})")
+  if !cpuNames.contains(f.arch) then return Err(s"`${f.arch}` is not a Cpu (${cpuNames.mkString(", ")})")
+  if !inits.contains(f.init) then return Err(s"`${f.init}` is not an Init (${inits.mkString(", ")})")
+  if wholeVersion(f.distro) && f.version.toLongOption().isEmpty
+    return Err(s"the ${f.distro} version `${f.version}` is not a whole number")
+  Ok(f)
+
+// Whether the distribution's version is a whole number.
+private wholeVersion(distro: string) -> bool = distro == "Debian" || distro == "Fedora" || distro == "Rhel"
+
+// Reads facts written as JSON, as a fixture or `fettle facts --json` writes them: an object with
+// `os`, `distro`, `version`, `arch`, `init`, `cpus`, `memory` (bytes), `hostname`, `user` and `root`.
+readFacts(text: string) -> Result[Facts, string] = parseJson(text) match
+  Err(e) -> Err(s"$e")
+  Ok(j) ->
+    val str = (k: string) -> j.get(k).flatMap(v -> v.asString).getOrElse("")
+    val num = (k: string) -> j.get(k).flatMap(v -> v.asLong).getOrElse(0)
+    for k in ["os", "distro", "arch", "init"]
+      if str(k).isEmpty then return Err(s"the facts have no `$k`")
+    validated(
+      Facts(
+        str("os"),
+        str("distro"),
+        str("version"),
+        str("arch"),
+        str("init"),
+        num("cpus"),
+        num("memory"),
+        str("hostname"),
+        str("user"),
+        j.get("root").flatMap(v -> v.asBool).getOrElse(false)
+      )
+    )
+
+// The facts as JSON on one line, in the form `readFacts` reads and the fixtures are written in.
+factsJson(f: Facts) -> string
+  val strings = [
+    ("os", f.os),
+    ("distro", f.distro),
+    ("version", f.version),
+    ("arch", f.arch),
+    ("init", f.init)
+  ].map((k, v) -> s"\"$k\": ${jsonQuote(v)}")
+  val rest = [
+    s"\"cpus\": ${f.cpus}",
+    s"\"memory\": ${f.memory}",
+    s"\"hostname\": ${jsonQuote(f.hostname)}",
+    s"\"user\": ${jsonQuote(f.user)}",
+    s"\"root\": ${f.root}"
+  ]
+  s"{${(strings ++ rest).mkString(", ")}}"
+
+// The facts as a person reads them, one a line.
+showFacts(f: Facts) -> string
+  val distro = if f.version.isEmpty || f.distro == "Other" then f.distro else s"${f.distro} ${f.version}"
+  val shown = if f.distro == "Other" then s"Other(${f.version})" else distro
+  val rows = [
+    ("os", f.os),
+    ("distro", shown),
+    ("arch", f.arch),
+    ("init", f.init),
+    ("cpus", s"${f.cpus}"),
+    ("memory", s"${f.memory} bytes"),
+    ("hostname", f.hostname),
+    ("user", f.user),
+    ("root", s"${f.root}")
+  ]
+  rows.map((k, v) -> s"${k.padEnd(9)}$v\n").mkString("")
+
+// The facts script: POSIX `sh` with `uname`, `id`, `getconf` and `/etc/os-release`, read-only, printing
+// one `key=value` line a fact. `init` is what is running as the init system: systemd when
+// `/run/systemd/system` exists, OpenRC when `/run/openrc` does, launchd on Darwin. (`$$` is how the
+// literal writes the shell's `$` before a name.)
+val factsScript: string = raw"""
+  LC_ALL=C
+  export LC_ALL
+  printf 'kernel=%s\n' "$(uname -s)"
+  printf 'machine=%s\n' "$(uname -m)"
+  printf 'hostname=%s\n' "$(uname -n)"
+  printf 'user=%s\n' "$(id -un)"
+  printf 'uid=%s\n' "$(id -u)"
+  fettle_n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null)
+  printf 'cpus=%s\n' "$$fettle_n"
+  if [ -r /proc/meminfo ]; then
+    while read -r fettle_k fettle_v fettle_u; do
+      if [ "$$fettle_k" = MemTotal: ]; then printf 'memory=%s\n' "$((fettle_v * 1024))"; fi
+    done </proc/meminfo
+  else
+    printf 'memory=%s\n' "$(sysctl -n hw.memsize 2>/dev/null)"
+  fi
+  if [ -d /run/systemd/system ]; then fettle_i=systemd
+  elif [ -d /run/openrc ]; then fettle_i=openrc
+  elif [ "$(uname -s)" = Darwin ]; then fettle_i=launchd
+  else fettle_i=none
+  fi
+  printf 'init=%s\n' "$$fettle_i"
+  for fettle_f in /etc/os-release /usr/lib/os-release; do
+    if [ -r "$$fettle_f" ]; then
+      while IFS= read -r fettle_l || [ -n "$$fettle_l" ]; do
+        case $$fettle_l in ID=*|ID_LIKE=*|VERSION_ID=*) printf 'os-release.%s\n' "$$fettle_l" ;; esac
+      done <"$$fettle_f"
+      break
+    fi
+  done
+  if command -v sw_vers >/dev/null 2>&1; then printf 'macos=%s\n' "$(sw_vers -productVersion)"; fi
+  """
+
+// The facts in the output of `factsScript`. Every line is `key=value`; keys it does not know are
+// passed over, and a key given twice keeps its last value. A missing or garbled fact, and an operating
+// system or architecture fettle does not manage, are each an error saying which.
+parseFacts(text: string) -> Result[Facts, string]
+  val kv = Table[string, string]()
+  for (whole, n) in text.split('\n').zipWithIndex
+    val line = whole.stripSuffix("\r")
+    if line.isEmpty then continue
+    val eq = line.indexOf('=')
+    if eq <= 0 then return Err(s"line ${n + 1} of the facts is not `key=value`: `$line`")
+    kv(line.slice(0, eq)) = line.slice(eq + 1, line.byteLength)
+  val os = osOf(need(kv, "kernel")?)?
+  val arch = cpuOf(need(kv, "machine")?)?
+  val cpus = number(need(kv, "cpus")?, "cpus")?
+  val memory = number(need(kv, "memory")?, "memory")?
+  val uid = number(need(kv, "uid")?, "uid")?
+  val init = initOf(need(kv, "init")?)?
+  val (distro, version) = distroOf(os, kv)?
+  validated(Facts(os, distro, version, arch, init, cpus, memory, need(kv, "hostname")?, need(kv, "user")?, uid == 0))
+
+// The value of the fact `k` in `kv`, or an error when it is missing or empty.
+private need(kv: Table[string, string], k: string) -> Result[string, string] = kv.get(k) match
+  Some(v) if v.nonEmpty -> Ok(v)
+  _ -> Err(s"the facts have no `$k`")
+
+// `text` as a whole number of at least zero, or an error naming the fact `what`.
+private number(text: string, what: string) -> Result[long, string] = text.toLongOption() match
+  Some(n) if n >= 0 -> Ok(n)
+  _ -> Err(s"the fact `$what` is not a number: `$text`")
+
+// The `Os` of the kernel name `uname -s` gives.
+private osOf(kernel: string) -> Result[string, string] = kernel match
+  "Linux" -> Ok("Linux")
+  "Darwin" -> Ok("Darwin")
+  "FreeBSD" -> Ok("FreeBsd")
+  other -> Err(s"fettle does not manage the operating system `$other`")
+
+// The `Cpu` of the machine name `uname -m` gives.
+private cpuOf(machine: string) -> Result[string, string] = machine match
+  "x86_64" | "amd64" -> Ok("Amd64")
+  "aarch64" | "arm64" -> Ok("Arm64")
+  other -> Err(s"fettle does not manage the architecture `$other`")
+
+// The `Init` of the name the facts script prints.
+private initOf(name: string) -> Result[string, string] = name match
+  "systemd" -> Ok("Systemd")
+  "openrc" -> Ok("OpenRc")
+  "launchd" -> Ok("Launchd")
+  "none" -> Ok("NoInit")
+  other -> Err(s"the fact `init` is garbled: `$other`")
+
+// A value of `/etc/os-release` without its quotes: `"…"` with `\"`, `\\`, `\$` and `` \` `` unescaped,
+// or `'…'` as it is.
+private unquoted(v: string) -> string
+  if v.byteLength >= 2 && v.startsWith("\"") && v.endsWith("\"")
+    val inner = v.slice(1, v.byteLength - 1)
+    val out = StringWriter()
+    var escaped = false
+    for c in inner.chars
+      if escaped
+        if !"\"\\$`".contains(c.toString()) then out.write("\\")
+        out.write(c.toString())
+        escaped = false
+      elif c == '\\'
+        escaped = true
+      else
+        out.write(c.toString())
+    if escaped then out.write("\\")
+    return out.text
+  if v.byteLength >= 2 && v.startsWith("'") && v.endsWith("'") then return v.slice(1, v.byteLength - 1)
+  v
+
+// The distribution and its version on `os`, from the `os-release.` and `macos` facts in `kv`.
+private distroOf(os: string, kv: Table[string, string]) -> Result[(string, string), string]
+  val release = (k: string) -> kv.get(s"os-release.$k").map(v -> unquoted(v)).getOrElse("")
+  if os == "Darwin"
+    val v = kv.get("macos").getOrElse("")
+    if v.isEmpty then return Err("the facts have no `macos` version")
+    return Ok(("Macos", v))
+  val id = release("ID").toLower
+  val version = release("VERSION_ID")
+  if id.isEmpty
+    if os == "FreeBsd" then return Ok(("Other", "freebsd"))
+    return Err("the facts have no `ID` from /etc/os-release")
+  val major = version.takeWhile(c -> c != '.')
+  val needing = (name: string, v: string) -> if v.isEmpty then Err(
+    s"$name has no VERSION_ID in /etc/os-release (a testing or rolling release, which fettle does not manage)"
+  ) else Ok((name, v))
+  id match
+    "debian" -> needing("Debian", version)
+    "ubuntu" -> needing("Ubuntu", version)
+    "fedora" -> needing("Fedora", major)
+    "rhel" | "rocky" | "almalinux" | "centos" -> needing("Rhel", major)
+    "alpine" -> needing("Alpine", version.split('.').take(2).mkString("."))
+    "arch" -> Ok(("Arch", ""))
+    other -> Ok(("Other", other))
+
+// The facts of the host `t` reaches: the facts script run there, its output parsed.
+gather(t: Transport) -> Result[Facts, string]
+  val ran = t.run(factsScript, Array.empty[byte]()).mapErr(e -> e.message)?
+  if !ran.succeeded then return Err(s"the facts script ${ran.endingText}: ${ran.err.trim}")
+  parseFacts(ran.out)

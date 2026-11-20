@@ -1,0 +1,76 @@
+module tests
+
+import avin.fs
+import dev.avinlang.fettle.transport.{Ending, ExitCode, KilledBy, LocalTransport, Ran, Transport, TransportError}
+
+// `script` run on this machine with `input`, or the transport's error.
+local(script: string, input: Array[byte] = Array.empty[byte]()) -> Ran = LocalTransport().run(script, input) match
+  Ok(r) -> r
+  Err(e) -> Ran(ExitCode(-1), e.message.utf8, Array.empty[byte]())
+
+// Every byte value, 0 to 255, once each.
+allBytes() -> Array[byte] = Array.tabulate(256, i -> byte(i))
+
+@test("a script's output, error output and exit code come back apart")
+runningLocally()
+  val r = local("echo out; echo err >&2; exit 7")
+  assertEq(r.ending, ExitCode(7))
+  assertEq(r.out, "out\n")
+  assertEq(r.err, "err\n")
+  assertEq(r.succeeded, false)
+  assertEq(r.endingText, "exited with status 7")
+  val ok = local("true")
+  assertEq(ok.succeeded, true)
+  assertEq(ok.stdout.length, 0)
+  assertEq(ok.stderr.length, 0)
+
+@test("a script killed by a signal")
+killedLocally()
+  val r = local("kill -9 $$")
+  assertEq(r.ending, KilledBy(9))
+  assertEq(r.succeeded, false)
+  assertEq(r.endingText, "killed by signal 9")
+
+@test("standard input reaches the script byte for byte, NULs and non-UTF-8 included")
+inputLocally()
+  val r = local("cat", allBytes())
+  assertEq(r.stdout.toVector, allBytes().toVector)
+  assertEq(local("cat").stdout.length, 0)
+  assertEq(local("wc -c", "日本\n".utf8).out.trim, "7")
+
+@test("an upload: bytes over standard input into a file")
+uploadLocally()
+  val dir = fs.createTempDir("fettle-upload").getOrElse("")
+  val file = dir + "/it's here.bin"
+  val t = LocalTransport()
+  val q = file.replace("'", "'\\''")
+  val up = t.run(s"cat >'$q'", allBytes()).ok.get
+  assertEq(up.succeeded, true)
+  assertEq(fs.readBytes(file).map(b -> b.toVector), Ok(allBytes().toVector))
+  _ = fs.removeDirAll(dir)
+
+@test("a large output comes back whole")
+largeLocally()
+  val r = local("i=0; while [ $i -lt 4096 ]; do printf '%0255d\\n' $i; i=$((i + 1)); done")
+  assertEq(r.stdout.length, 4096 * 256)
+  assertEq(r.succeeded, true)
+
+@test("Unicode in a script and its output")
+unicodeLocally()
+  assertEq(local("printf '%s' 'é 日本 🙂'").out, "é 日本 🙂")
+
+@test("a closed transport runs nothing")
+closedLocally()
+  val t = LocalTransport()
+  assertEq(t.close(), Ok(()))
+  assertEq(
+    t.run("true", Array.empty[byte]()).map(r -> r.succeeded),
+    Err(TransportError("local: the transport is closed"))
+  )
+  assertEq(t.close(), Ok(()))
+
+@test("a transport is used through its trait")
+throughTheTrait()
+  val t: Transport = LocalTransport()
+  assertEq(t.run("printf x", Array.empty[byte]()).map(r -> r.out), Ok("x"))
+  assertEq(TransportError("gone").message, "gone")
