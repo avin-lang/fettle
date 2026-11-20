@@ -38,7 +38,9 @@ each target needs only `sshd` and a POSIX shell.
 - A state file. The hosts are the state; Fettle reads them every time (section 4.6 on removal).
 - A pull mode, a central server, or continuous enforcement (mgmt's reactive model).
 - Turing-complete computation in the language (section 3.4).
-- A secrets vault. Secrets come from the environment, a file or a local command.
+- A secrets server. Secrets come from the environment, a file, a local command, or a vault file
+  encrypted with a passphrase and kept in the repository beside the program (decision 16 in
+  section 10).
 - A package registry. Modules come from directories now and git later.
 - Container orchestration and image building (Kamal's territory), though section 2.7 shows a deploy.
 
@@ -763,15 +765,15 @@ resources; a dynamic inventory read from a command's typed JSON.
 
 | Need | Status |
 |---|---|
-| Linking libssh2 and its crypto library **statically** into an Avin executable, so the binary needs no Homebrew at run time. avin-lang/ssh finds libssh2 by `pkg-config` and nothing in the C-bindings or packages chapters describes a static link. | **Known gap** |
-| Avin building and running on **Linux** (x86_64, arm64) for operators and CI on Linux. Nothing in the docs states the platforms. | **Unknown** |
-| avin-lang/ssh: requesting a **PTY** (for hosts whose sudoers say `requiretty`). Not bound. | **Known gap** |
-| avin-lang/ssh: **direct-tcpip channels** for jump hosts (phase 3). Not bound. | **Known gap** |
-| Reading `~/.ssh/config` (phase 3): nothing reads it; whether it belongs in avin-lang/ssh is open. | **Known gap** |
-| A **language server protocol library in Avin** (framing over stdio, the protocol's types). Avin's own server lives in the Sysl compiler. JSON itself is avin-lang/json. | **Known gap** |
-| A **line diff** (Myers) for plan output. The standard library's `diff` methods are set and multiset differences. | **Known gap** |
-| The parsing library over a **token stream with indentation**: Kite reads characters with line-end rules; a parser over a lexer's tokens is not shown. | **Unknown** |
-| Reading a **password or passphrase from the terminal without echo** (`SudoPassword`, key passphrases when not in env). | **Unknown** |
+| Linking libssh2 and its crypto library **statically** into an Avin executable, so the binary needs no Homebrew at run time. | Present (avin 0.0.35: the manifest's `c-linking` block, static or dynamic per library) |
+| Avin building and running on **Linux** (x86_64, arm64) for operators and CI on Linux. | **Planned** (avin's `docs/content/compiler/linux.md`; waits on Sysl's Linux builds) |
+| avin-lang/ssh: requesting a **PTY** (for hosts whose sudoers say `requiretty`). | Present (ssh 0.0.1: `exec(…, pty = Some(Pty(…)))`) |
+| avin-lang/ssh: **direct-tcpip channels** for jump hosts (phase 3). | Present (ssh 0.0.1: `tunnel(host, port)`, `ProxyJump`) |
+| Reading `~/.ssh/config` (phase 3). | Present (ssh 0.0.1: `SshConfig.load()`, `connect(alias)`) |
+| A **language server protocol library in Avin** (framing over stdio, the protocol's types). | Present (avin-lang/lsp; its `--stdio` transport is in progress) |
+| A **line diff** (Myers) for plan output. | Present (avin 0.0.35: `avin.diff`, unified output) |
+| The parsing library over a **token stream with indentation**. | Present (parsing 0.6.0: `Tokens`, `TokenParsers`); an offside-rule helper is in progress |
+| Reading a **password or passphrase from the terminal without echo** (`SudoPassword`, key passphrases when not in env). | Present (avin 0.0.35: `avin.io.readSecret`) |
 | Threads, `withTimeout`, SHA-256, hex, `glob`, processes, signals, TUI, JSON, parser error recovery. | Present |
 
 ---
@@ -849,6 +851,51 @@ functions, `if`, `for`, `match`, typed vars); `become` and `def` as hidden globa
     resource needs it; a host with no `become` runs as the login user.
 15. **The inventory is static in v1**; phase 3 reads a local command's JSON against a declared type,
     so it stays checked.
+
+### Decided 2026-11-19, for the first real use (a VPS)
+
+The user's goal: *"get fettle to a point where i can use it to set up a vps"*, with Caddy as the web
+server, and Fettle staying generally useful. These were decided on the user's delegation. Review with
+the user.
+
+16. **A vault is in phase 1** (the user asked for one, after Ansible's Vault). A vault file
+    (`*.vault`) holds named secrets encrypted with a passphrase, and is meant to be committed beside
+    the program.
+    - **Plaintext:** one `name = "text"` or `name = """…"""` a line, in Fettle's own string syntax.
+    - **Reading:** `secret.vault("secrets.vault", "dbPassword")` reads a secret from it, relative
+      to the file that names it. `fettle check` checks the names when a passphrase is available, and
+      `plan` always does.
+    - **Commands:** `fettle vault create | edit | view | encrypt | decrypt | rekey <file>`.
+    - **The passphrase comes from**, in order: `--vault-password-file`, `--vault-password-command`,
+      `FETTLE_VAULT_PASSWORD`, else a prompt at the terminal without echo. There is one passphrase
+      a run in v1; several vault ids come later if needed.
+    - **Crypto is libsodium, bound directly** (the user: any C library may be bound), and linked
+      statically through the manifest's `c-linking` block, so the binary still stands alone.
+      - Argon2id (`crypto_pwhash`) derives the key from the passphrase and a fresh salt, with its
+        ops and memory limits stored in the header.
+      - The cipher is XChaCha20-Poly1305 IETF with a random 24-byte nonce and the header as
+        associated data.
+      - Adding scrypt and XChaCha20-Poly1305 to `avin.crypto` was the alternative. It was left
+        because a reviewed C library was at hand and Avin has no other user for them yet.
+    - **The file is text:** a header line `$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;<ops>;<mem>`,
+      then base64 lines of 76 characters, so git sees a text file.
+    - **`edit`** decrypts into a fresh `0700` directory, runs `$VISUAL`/`$EDITOR`, re-encrypts with a
+      new salt and nonce, and removes the plaintext. A file that does not parse after editing is
+      offered for re-editing, never saved.
+17. **Caddy needs no Caddy-specific kind.** It is a `package`, a `file` for the Caddyfile (with
+    `validate = cmd("caddy", "validate", "--config", "%s", "--adapter", "caddyfile")` style
+    validation), and a `service` reloaded on change; Caddy obtains its own certificates.
+    - **`aptRepository` joins phase 1's kinds**, since every vendor repository (Caddy, Docker,
+      Node, PostgreSQL) needs one. Its fields are name, URIs, suites, components, and a signing
+      key fetched from a URL and pinned by its SHA-256, written to `/etc/apt/keyrings/` and named by
+      `signed-by` in a deb822 `.sources` file. A changed repository refreshes the package index
+      before any package is applied.
+    - **A `download` kind** (url, sha256, path, owner, mode) joins too, for single binaries and
+      keys that come from no repository.
+18. **A worked VPS example**: one Debian or Ubuntu host. It sets up an admin user with SSH keys,
+    hardens sshd (no passwords, no root login, validated with `sshd -t` and reloaded), enables the
+    firewall with `ufw` through guarded `command`s, turns on unattended upgrades, and runs Caddy
+    serving a site. It ships in `examples/vps` and is run end to end against the test containers.
 
 ### Decided during phase 1a
 
@@ -938,33 +985,40 @@ user.
     that line and are otherwise as written here. Review with the user.
 25. **Phase 1's parser reads no `kind` and no `test` declaration**; the kinds of 2.4 and 2.6 come
     with custom kinds, and a `kind` line is a syntax error until then. Review with the user.
-26. **Shell quoting**: a word of ASCII letters, digits and `_ @ % + : , . / -` is written as it is;
+26. **Integration targets run in their own colima profile `fettle`** (docker runtime, addressed as
+    `docker --context colima-fettle`, never the `default` context), as three images under
+    `tests/integration/images`: `debian12` and `ubuntu2404` (systemd as PID 1, run `--privileged` on
+    cgroup v2) and `alpine3` (OpenRC), each with `sshd`, `sudo`, key-only login for `fettle`
+    (passwordless sudo) and `fettlepw` (sudo needs the password `fettlepw`). `targets.zsh` brings
+    them up on dynamic `127.0.0.1` ports and prints an ssh config; the test keypair is generated
+    into a git-ignored `.state/`. Review with the user.
+27. **Shell quoting**: a word of ASCII letters, digits and `_ @ % + : , . / -` is written as it is;
     any other word, the empty one included, goes in single quotes with each `'` written `'\''`.
     `=` and `~` are not plain, so a quoted first word is never an assignment or a home directory.
     A NUL is refused: by `render` for a command, and as `E0320` for an `sh"…"` interpolation, each
     of which is quoted as one word as 3.2 says (it had been pasted in unquoted). An interpolation
     inside the text's own double quotes is quoted too, so `"${x}"` keeps the single quotes; write
     `${x}` bare. Review with the user.
-27. **One probe script, many commands**: each command runs in a subshell with standard input from
+28. **One probe script, many commands**: each command runs in a subshell with standard input from
     `/dev/null` (shell text through `/bin/sh -c`, so a syntax error fails only that command), its
     output and error output go to files in a `mktemp -d` scratch directory, and the script prints a
     header `<marker> <index> <code> <out bytes> <err bytes>` and then exactly those bytes. Output is
     counted, never searched, so nothing a command prints can pass for a header; `<marker> begin` and
     `<marker> end` lines, with a random marker per script, find the start past any banner and catch a
     cut-off run. Review with the user.
-28. **The transport** is `run(script, input bytes) -> Ran(ending, stdout bytes, stderr bytes)` and
+29. **The transport** is `run(script, input bytes) -> Ran(ending, stdout bytes, stderr bytes)` and
     `close()`; a script that ran and failed is a `Ran`, and only not reaching the host is an error.
     The script is run by `/bin/sh`, never the login shell, which may not be POSIX. Review with the
     user.
-29. **Distributions**: `rocky`, `almalinux` and `centos` are `Rhel` by major version; Alpine's
+30. **Distributions**: `rocky`, `almalinux` and `centos` are `Rhel` by major version; Alpine's
     version is its release branch (`3.20` from `3.20.3`); Ubuntu keeps `24.04`. A Debian or Ubuntu
     without `VERSION_ID` (testing, unstable) and a Linux without `os-release` are refused with a
     message; any other `ID` is `Other(id)`, and FreeBSD without `os-release` is `Other("freebsd")`.
     Review with the user.
-30. **`init` is the init system running**, not the one installed: `/run/systemd/system` for systemd,
+31. **`init` is the init system running**, not the one installed: `/run/systemd/system` for systemd,
     `/run/openrc` for OpenRC, launchd on Darwin, otherwise `NoInit`, so a container started without
     an init is `NoInit`. Fact fixtures are checked against the same variant names. Review with the
     user.
-31. **`Facts` and `readFacts` live in the `facts` module**, beside the script and its parser, and the
+32. **`Facts` and `readFacts` live in the `facts` module**, beside the script and its parser, and the
     evaluator imports them. `fettle facts` without `--local` is refused until the ssh transport
     exists. Review with the user.
