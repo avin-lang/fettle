@@ -51,6 +51,16 @@ known_hosts entry for the port.
 
 `.state/` (keypair, known_hosts, generated config) is git-ignored; no private key is committed.
 
+fettle's own SSH tests (`tests/ssh_integration_tests.avin`, every test named `ssh target: …`) read
+`.state/ssh_config`. Without it, or with a target that does not answer, each says it is skipped and
+passes. To run them for real, from the repository root:
+
+    tests/integration/run.zsh             up, then `avin test . "ssh target"`, a skip failing
+    tests/integration/run.zsh "become"    only the tests whose names hold "become"
+
+Some tests change their target: they add users (`fettletty`, `fettlettypw`, with `requiretty`), a
+key to `fettle`'s `authorized_keys`, and doas on alpine3. `reset <name>` gives a fresh one.
+
 ## Tearing down
 
     ./targets.zsh down            remove the containers

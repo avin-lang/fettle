@@ -1,0 +1,190 @@
+module dev.avinlang.fettle.transport
+
+// Running a script as another user, root by default: through sudo, sudo with a password, or doas.
+import avin.random.Random
+import dev.avinlang.fettle.shell.{quote}
+
+// How a script runs as another user (section 5.6): `sudo -n`, which fails at once rather than ask for
+// a password; `sudo -S` with the password on standard input; `doas -n`; or as the login user.
+data Become
+  Sudo
+  SudoPassword(password: string)
+  Doas
+  NoBecome
+
+// The script that runs `script` as `user` by `how`, or the reason it cannot be written. The script
+// becomes the user, prints `marker` and a line end on standard error, so that what printed before it
+// is known to be sudo's or doas's own, then replaces itself with `/bin/sh -c` and the script, passed
+// as an argument so it is quoted once. `NoBecome` answers the script as it is.
+becomeScript(how: Become, user: string, script: string, marker: string) -> Result[string, string]
+  val inner = s"printf '%s\\n' $marker >&2\nexec /bin/sh -c \"$$1\""
+  val tail = s"-u ${quote(user)?} -- /bin/sh -c ${quote(inner)?} fettle ${quote(script)?}"
+  how match
+    Sudo -> Ok(s"exec sudo -n $tail")
+    SudoPassword(_) -> Ok(s"exec sudo -k -S -p '' $tail")
+    Doas -> Ok(s"exec doas -n $tail")
+    NoBecome -> Ok(script)
+
+// The line `SudoPassword` puts on standard input ahead of the script's own input, or why it cannot.
+passwordLine(password: string) -> Result[Array[byte], string] =
+  if password.exists(c -> c == '\n' || c == '\r' || int(c) == 0)
+    Err("the sudo password holds a line end or a NUL, which sudo cannot read")
+  else Ok(s"$password\n".utf8)
+
+// `a` and then `b`, as one array.
+joined(a: Array[byte], b: Array[byte]) -> Array[byte]
+  val out = Buffer[byte]()
+  out.addAll(a)
+  out.addAll(b)
+  out.toArray()
+
+// Where `needle` first stands in `hay`, or -1.
+indexOfBytes(hay: Array[byte], needle: Array[byte], from: int = 0) -> int
+  var i = from
+  while i + needle.length <= hay.length
+    var j = 0
+    while j < needle.length && hay(i + j) == needle(j)
+      j += 1
+    if j == needle.length then return i
+    i += 1
+  -1
+
+// `ran` with the marker line taken out of its standard error, or `None` where the marker never came,
+// which says the script never ran: becoming the user failed.
+afterMarker(ran: Ran, marker: string) -> Option[Ran]
+  val line = s"$marker\n".utf8
+  val at = indexOfBytes(ran.stderr, line)
+  if at < 0 then return None
+  val rest = Buffer[byte]()
+  rest.addAll(ran.stderr.slice(0, at))
+  rest.addAll(ran.stderr.slice(at + line.length, ran.stderr.length))
+  Some(Ran(ran.ending, ran.stdout, rest.toArray()))
+
+// Why becoming a user failed, from what sudo or doas printed.
+data Refusal
+  // Sudo or doas wanted a password and was given none.
+  NeedsPassword
+  // The password given was refused.
+  WrongPassword
+  // Sudo wanted a terminal (`Defaults requiretty`).
+  NeedsTerminal
+  // The login user may not become the user, or run the command as it.
+  NotPermitted
+  // The program is not installed on the host.
+  NotInstalled
+  // Anything else.
+  OtherRefusal
+
+// What `ran`, a run whose script never started, says about why.
+refusalOf(ran: Ran) -> Refusal
+  val err = ran.err.toLower
+  val says = (words: Vector[string]) -> words.exists(w -> err.contains(w))
+  if says(["must have a tty"]) then return NeedsTerminal
+  if says(["incorrect password", "sorry, try again", "no password was provided"]) then return WrongPassword
+  if says(["password is required", "terminal is required", "authentication required", "authorization required"])
+    return NeedsPassword
+  if says(
+    ["not in the sudoers", "not allowed to", "may not run sudo", "operation not permitted"]
+  ) then return NotPermitted
+  if ran.ending == ExitCode(127) then NotInstalled else OtherRefusal
+
+// The message for a refusal of `how`, `ran` being what the host printed.
+refusalText(how: Become, user: string, refusal: Refusal, ran: Ran) -> string
+  val tool = how match
+    Doas -> "doas"
+    _ -> "sudo"
+  val said = ran.err.trim
+  val detail = if said.isEmpty then ran.endingText else said
+  refusal match
+    NeedsPassword -> how match
+      Doas -> s"doas needs a password to run as `$user`, and `become = Doas` runs it with -n: permit the login user `nopass` in doas.conf ($detail)"
+      _ -> s"sudo needs a password to run as `$user`, and `become = Sudo` gives none: use `SudoPassword(…)` or let the login user run sudo without one (NOPASSWD) ($detail)"
+    WrongPassword -> s"sudo refused the password `SudoPassword` gives ($detail)"
+    NeedsTerminal -> s"sudo wants a terminal (`Defaults requiretty`) and the transport has none to give it ($detail)"
+    NotPermitted -> s"the login user may not use $tool to run as `$user` ($detail)"
+    NotInstalled -> s"$tool is not installed on the host ($detail)"
+    OtherRefusal -> s"$tool could not run the script as `$user` ($detail)"
+
+// A transport that runs every script as `user` by `how` over `inner`, and answers what the script did.
+// Where becoming the user fails, so the script never ran, that is a `TransportError` of the kind
+// `BecomeRefused`, never a `Ran`: a refused sudo is not a failed script. The script's standard input
+// arrives as given; for `SudoPassword` the password line goes ahead of it, read by sudo alone.
+//
+// `SudoPassword` checks the password once, before the first script, with no input but the password,
+// so that a wrong one is reported without the script's input ever reaching sudo, which would read it
+// as more attempts. `terminal`, where given, runs a script on a pseudo-terminal (an
+// `SshTransport`'s `runOnTerminal`); it is used only once sudo has said it wants one
+// (`requiretty`), and only for sudo itself: the script's input, output and error output then go
+// through files in a private scratch directory on the host, made and removed by plain runs, so they
+// stay bytes, and the password through the terminal, never a file.
+class BecomeTransport(
+    private val inner: Transport,
+    val how: Become,
+    val user: string = "root",
+    private val terminal: Option[(string, Array[byte]) -> Result[Ran, TransportError]] = None
+): Transport
+  private var checked = false
+  private var needsTerminal = false
+  private val random = Random()
+
+  override run(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+    how match
+      NoBecome -> return inner.run(script, input)
+      SudoPassword(_) if !checked ->
+        _ = attempt(":", Array.empty[byte]())?
+        checked = true
+      _ -> ()
+    attempt(script, input)
+
+  // `script` run as the user, through a terminal where sudo has asked for one.
+  private attempt(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+    if needsTerminal then return onTerminal(script, input)
+    val marker = newMarker()
+    val wrapped = becomeScript(how, user, script, marker).mapErr(e -> refused(e))?
+    val given: Array[byte] = how match
+      SudoPassword(p) -> joined(passwordLine(p).mapErr(e -> refused(e))?, input)
+      _ -> input
+    val ran = inner.run(wrapped, given)?
+    afterMarker(ran, marker) match
+      Some(r) -> Ok(r)
+      None ->
+        val why = refusalOf(ran)
+        if why == NeedsTerminal && terminal.isDefined
+          needsTerminal = true
+          return onTerminal(script, input)
+        Err(refused(refusalText(how, user, why, ran)))
+
+  // `script` run as the user with sudo on a terminal: its input written to a private scratch directory
+  // first, sudo run on the terminal with its input, output and error output those files, then the
+  // output read back and the directory removed.
+  private onTerminal(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+    val run = terminal.get
+    val made = inner.run(
+      "umask 077\nd=$(mktemp -d \"${TMPDIR:-/tmp}/fettle.XXXXXX\") || exit 1\ncat >\"$d/in\" || exit 1\nprintf '%s' \"$d\"",
+      input
+    )?
+    if !made.succeeded then return Err(refused(s"cannot make a scratch directory on the host: ${made.err.trim}"))
+    val dir = made.out
+    val q = quote(dir).mapErr(e -> refused(e))?
+    val marker = newMarker()
+    val wrapped = becomeScript(how, user, script, marker).mapErr(e -> refused(e))?
+    val viaTerminal = how match
+      SudoPassword(p) ->
+        val line = passwordLine(p).mapErr(e -> refused(e))?
+        val sudo = wrapped.stripPrefix("exec ")
+        run(s"IFS= read -r fettle_p\n{ printf '%s\\n' \"$$fettle_p\"; cat $q/in; } | $sudo >$q/out 2>$q/err", line)
+      _ -> run(s"$wrapped <$q/in >$q/out 2>$q/err", Array.empty[byte]())
+    val back = inner.run(s"cat $q/out\ncat $q/err >&2\nrm -rf $q", Array.empty[byte]())
+    val ending = viaTerminal?.ending
+    val read = back?
+    val ran = Ran(ending, read.stdout, read.stderr)
+    afterMarker(ran, marker) match
+      Some(r) -> Ok(r)
+      None -> Err(refused(refusalText(how, user, refusalOf(ran), ran)))
+
+  private refused(reason: string) -> TransportError = TransportError(s"become $user: $reason", BecomeRefused)
+
+  // A marker no script can have printed before it ran.
+  private newMarker() -> string = "fettle-become-" + random.alphanumeric().take(20).mkString("")
+
+  override close() -> Result[unit, TransportError] = inner.close()

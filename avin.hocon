@@ -3,6 +3,7 @@ package { name = "fettle", version = "0.0.1", description = "Agentless configura
 dependencies {
   json { git = "github.com/avin-lang/json", version = "0.0.3" }
   parsing { git = "github.com/avin-lang/parsing", version = "0.6.0" }
+  ssh { git = "github.com/avin-lang/ssh", version = "0.0.1" }
 }
 
 c-libraries {
@@ -14,6 +15,7 @@ c-libraries {
   libc { headers = ["<sys/stat.h>"] }
 }
 
+// One block: a second `c-linking` would replace this list rather than add to it.
 c-linking {
-  static = ["sodium"]
+  static = ["sodium", "ssh/libssh2"]
 }

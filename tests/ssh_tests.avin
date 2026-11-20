@@ -1,0 +1,196 @@
+module tests
+
+import avin.net.TcpListener
+import avin.process
+import avin.threads.spawn
+import avin.time.{millis, seconds}
+
+import dev.avinlang.fettle.transport.{
+  Broken, HostKeyRefused, LoginRefused, SshTarget, Unreachable, connectSsh, expandHome, jumpConfigText, planFor,
+  signalNumber, sshFailure
+}
+
+import dev.avinlang.ssh
+
+// An SSH configuration read from `text`.
+sshConfig(text: string) -> ssh.SshConfig = ssh.SshConfig.parse(text).ok.get
+
+// The configuration with nothing in it.
+noConfig() -> ssh.SshConfig = sshConfig("")
+
+@test("a plan takes what the target says over the SSH configuration, and the configuration over the defaults")
+plans()
+  val config = sshConfig(
+    "Host web\n  HostName 10.0.0.11\n  Port 2222\n  User deploy\n  IdentityFile /keys/web\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile /kh\n  ConnectTimeout 3\n  ServerAliveInterval 7\n"
+  )
+  val p = planFor(SshTarget("web"), config).ok.get
+  assertEq(p.hostName, "10.0.0.11")
+  assertEq(p.port, 2222)
+  assertEq(p.user, "deploy")
+  assertEq(p.keys, ["/keys/web"])
+  assertEq(p.hostKeys, ssh.AcceptNew)
+  assertEq(p.knownHosts, "/kh")
+  assertEq(p.connectTimeout, 3.seconds)
+  assertEq(p.keepalive, Some(7.seconds))
+  assertEq(p.useAgent, true)
+  assertEq(p.where, "deploy@10.0.0.11:2222")
+  val q = planFor(
+    SshTarget(
+      "web",
+      port = Some(22),
+      user = Some("root"),
+      keys = ["/keys/mine", "/keys/web"],
+      knownHosts = Some("/other"),
+      connectTimeout = Some(1.seconds)
+    ),
+    config
+  ).ok.get
+  assertEq(q.port, 22)
+  assertEq(q.user, "root")
+  assertEq(q.keys, ["/keys/mine", "/keys/web"])
+  assertEq(q.named, ["/keys/mine", "/keys/web"])
+  assertEq(q.knownHosts, "/other")
+  assertEq(q.connectTimeout, 1.seconds)
+
+@test("host-key policy: strict by default, accept-new on request, a pinned key over both")
+hostKeyPolicies()
+  val plain = noConfig()
+  assertEq(planFor(SshTarget("h"), plain).map(p -> p.hostKeys), Ok(ssh.Strict))
+  assertEq(planFor(SshTarget("h", acceptNew = true), plain).map(p -> p.hostKeys), Ok(ssh.AcceptNew))
+  assertEq(
+    planFor(SshTarget("h", acceptNew = true, hostKey = Some("SHA256:abc")), plain).map(p -> p.hostKeys),
+    Ok(ssh.Pinned("SHA256:abc"))
+  )
+  assertEq(
+    planFor(SshTarget("h"), sshConfig("Host h\n  StrictHostKeyChecking yes\n")).map(p -> p.hostKeys),
+    Ok(ssh.Strict)
+  )
+  assertEq(
+    planFor(SshTarget("h"), sshConfig("Host h\n  StrictHostKeyChecking no\n")).map(p -> p.hostKeys),
+    Ok(ssh.AcceptNew)
+  )
+  assertEq(planFor(SshTarget("h"), plain).map(p -> p.knownHosts), Ok(ssh.defaultKnownHosts()))
+
+@test("a plan with nothing configured: port 22, the local user, ssh's default keys, ten seconds to connect")
+planDefaults()
+  val p = planFor(SshTarget("example.org"), noConfig()).ok.get
+  assertEq(p.hostName, "example.org")
+  assertEq(p.port, 22)
+  assertEq(p.user.nonEmpty, true)
+  assertEq(p.keys.map(k -> k.split('/').last), ["id_ed25519", "id_ecdsa", "id_rsa"])
+  assertEq(p.named, [])
+  assertEq(p.connectTimeout, 10.seconds)
+  assertEq(p.keepalive, Some(30.seconds))
+  assertEq(p.proxyJump, None)
+
+@test("IdentitiesOnly turns the agent off; ProxyJump is kept for the connection")
+identitiesAndJumps()
+  val p = planFor(SshTarget("in"), sshConfig("Host in\n  IdentitiesOnly yes\n  ProxyJump admin@bastion:2200\n")).ok.get
+  assertEq(p.useAgent, false)
+  assertEq(p.proxyJump, Some("admin@bastion:2200"))
+
+@test("a key the target names with ~ is read from the home directory")
+homeKeys()
+  val home = process.homeDir().getOrElse("")
+  assertEq(expandHome("~/.ssh/deploy"), home + "/.ssh/deploy")
+  assertEq(expandHome("~"), home)
+  assertEq(expandHome("/abs/~/x"), "/abs/~/x")
+  assertEq(expandHome("~bob/x"), "~bob/x")
+  assertEq(planFor(SshTarget("h", keys = ["~/k"]), noConfig()).map(p -> p.keys(0)), Ok(home + "/k"))
+
+@test("the configuration for a jump: the target's own block first, the user's configuration for every other host")
+jumpConfigs()
+  val p = planFor(
+    SshTarget("app", user = Some("deploy"), keys = ["/k/a b"]),
+    sshConfig("Host app\n  HostName 10.1.1.1\n  ProxyJump bastion\n")
+  ).ok.get
+  val text = jumpConfigText(p, "bastion", "/home/me/.ssh/config", true)
+  assertEq(
+    text.startsWith("Host fettle-target\n  HostName 10.1.1.1\n  Port 22\n  User deploy\n  IdentityFile \"/k/a b\"\n"),
+    true
+  )
+  assertEq(text.contains("  ProxyJump bastion\nHost * !fettle-target\n  Include /home/me/.ssh/config\n"), true)
+  assertEq(jumpConfigText(p, "bastion", "/none", false).contains("Include"), false)
+  val read = ssh.SshConfig.parse(jumpConfigText(p, "j1,j2", "/none", false)).ok.get.host("fettle-target").ok.get
+  assertEq(read.hostName, "10.1.1.1")
+  assertEq(read.user, "deploy")
+  assertEq(read.proxyJump, Some("j1,j2"))
+
+@test("signal names as Linux numbers them")
+signals()
+  assertEq(signalNumber("KILL"), 9)
+  assertEq(signalNumber("TERM"), 15)
+  assertEq(signalNumber("SIGINT"), 2)
+  assertEq(signalNumber("HUP"), 1)
+  assertEq(signalNumber("SEGV"), 11)
+  assertEq(signalNumber("PIPE"), 13)
+  assertEq(signalNumber("WINCH"), 0)
+  assertEq(signalNumber(""), 0)
+
+@test("SSH failures as transport errors of their kind")
+failureKinds()
+  assertEq(sshFailure(ssh.UnknownHostKey("h", 22, "SHA256:x"), "u@h:22", true).failure, HostKeyRefused)
+  assertEq(sshFailure(ssh.UnknownHostKey("h", 22, "SHA256:x"), "u@h:22", true).reason.contains("fettle trust"), true)
+  assertEq(sshFailure(ssh.ChangedHostKey("h", 22, "SHA256:x"), "w", true).failure, HostKeyRefused)
+  assertEq(sshFailure(ssh.UnexpectedHostKey("SHA256:a", "SHA256:b"), "w", true).failure, HostKeyRefused)
+  assertEq(sshFailure(ssh.AuthFailed("publickey", ["publickey"]), "w", true).failure, LoginRefused)
+  assertEq(sshFailure(ssh.KeyFile("/k", "no"), "w", true).failure, LoginRefused)
+  assertEq(sshFailure(ssh.Agent("none"), "w", true).failure, LoginRefused)
+  assertEq(sshFailure(ssh.Handshake("no banner"), "w", true).failure, Unreachable)
+  assertEq(sshFailure(ssh.TimedOut("connect"), "w", true).failure, Unreachable)
+  assertEq(sshFailure(ssh.TimedOut("read"), "w", false).failure, Broken)
+  assertEq(sshFailure(ssh.Disconnected("gone"), "w", false).failure, Broken)
+  assertEq(sshFailure(ssh.ChannelRefused("no"), "w", false).failure, Broken)
+  assertEq(sshFailure(ssh.Disconnected("gone"), "u@h:22", false).reason, "ssh u@h:22: the connection was lost: gone")
+
+@test("a port nothing listens on is unreachable: connection refused")
+connectRefused()
+  val l = TcpListener.bind("127.0.0.1", 0).ok.get
+  val port = l.port()
+  _ = l.close()
+  connectSsh(SshTarget("127.0.0.1", port = Some(port), user = Some("nobody")), noConfig()) match
+    Err(e) ->
+      assertEq(e.failure, Unreachable)
+      assertEq(e.reason.startsWith(s"ssh nobody@127.0.0.1:$port: cannot connect"), true)
+      assertEq(e.reason.contains("refused"), true)
+    Ok(_) -> assertEq("connected", "refused")
+
+@test("a host name that does not resolve is unreachable")
+connectNoSuchHost()
+  connectSsh(SshTarget("no-such-host.invalid", user = Some("nobody")), noConfig()) match
+    Err(e) ->
+      assertEq(e.failure, Unreachable)
+      assertEq(e.reason.startsWith("ssh nobody@no-such-host.invalid:22: "), true)
+    Ok(_) -> assertEq("connected", "unreachable")
+
+@test("a server that never answers the handshake runs out of the connect timeout")
+connectTimesOut()
+  val l = TcpListener.bind("127.0.0.1", 0).ok.get
+  connectSsh(
+    SshTarget("127.0.0.1", port = Some(l.port()), user = Some("nobody"), connectTimeout = Some(300.millis)),
+    noConfig()
+  ) match
+    Err(e) ->
+      assertEq(e.failure, Unreachable)
+      assertEq(e.reason.contains("timed out"), true)
+    Ok(_) -> assertEq("connected", "timed out")
+  _ = l.close()
+
+@test("a server that is not SSH fails the handshake")
+connectNotSsh()
+  val l = TcpListener.bind("127.0.0.1", 0).ok.get
+  val port = l.port()
+  val server = spawn(() ->
+    l.accept() match
+      Ok(c) ->
+        _ = c.writeText("HTTP/1.1 400 Bad Request\r\n\r\n")
+        _ = c.close()
+      Err(_) -> ())
+  connectSsh(
+    SshTarget("127.0.0.1", port = Some(port), user = Some("nobody"), connectTimeout = Some(5.seconds)),
+    noConfig()
+  ) match
+    Err(e) -> assertEq(e.failure, Unreachable)
+    Ok(_) -> assertEq("connected", "handshake failed")
+  server.join()
+  _ = l.close()

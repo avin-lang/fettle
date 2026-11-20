@@ -466,7 +466,7 @@ vaultEvaluated()
   val lacking = evaluate(p.files, "web1", facts("debian12"), x -> p.read(x), p.templates, _ -> Names(["db"]))
   assertEq(
     lacking.diagnostics.map(d -> shown(d)),
-    ["main.fettle:3:15 E0320 the vault `secrets.vault` holds no secret `api`"]
+    ["main.fettle:3:15 E0322 the vault `secrets.vault` holds no secret `api`"]
   )
   val unreadable = evaluate(
     p.files,
@@ -478,7 +478,7 @@ vaultEvaluated()
   )
   assertEq(
     unreadable.diagnostics.map(d -> shown(d)),
-    ["main.fettle:3:15 E0321 the vault `secrets.vault` cannot be opened: no terminal"]
+    ["main.fettle:3:15 E0323 the vault `secrets.vault` cannot be opened: no terminal"]
   )
   val unopened = evaluate(p.files, "web1", facts("debian12"), x -> p.read(x), p.templates, _ -> Unopened)
   assertEq(unopened.diagnostics.length, 0)

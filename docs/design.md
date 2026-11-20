@@ -905,7 +905,7 @@ the user.
     - **The plaintext** allows `//` comments and blank lines, kept as written since the text is sealed
       as it is; a line is not indented, and a string holds no `${…}` (`\$` writes a dollar). Its errors
       are `E05xx` (`E0501` a line that is no secret, `E0502` a name given twice, `E0503` an
-      interpolation); `secret.vault`'s are `E0250`–`E0253` in the checker and `E0320`–`E0321` in
+      interpolation); `secret.vault`'s are `E0250`–`E0253` in the checker and `E0322`–`E0323` in
       evaluation.
     - **Passphrase sources:** a file's or a command's text loses one line end; the command runs under
       `/bin/sh -c`; a source that fails or gives an empty passphrase is an error, never a fall to the
@@ -1216,3 +1216,49 @@ user.
     inside a word (`--config=${staged}`) and in shell text, quoted or not. Until now only a literal
     `%s` was read, so example 2.2's `cmd("visudo", "-cf", staged)` could not be planned. Review with
     the user.
+57. **A `TransportError` has a kind** (`failure`, defaulting to `Broken`): `Unreachable`,
+    `HostKeyRefused`, `LoginRefused`, `BecomeRefused`, `Broken`, so a report can tell "the network is
+    wrong" (5.5) from the rest. The trait is unchanged. Review with the user.
+58. **The SSH transport runs `exec /bin/sh -c '<script>'`**: `exec` makes the shell the session's own
+    process, so a signal that kills the script is reported as one (`KilledBy`), Linux's numbering
+    for SSH's signal names. The script travels as one argument, so a single script is bounded by the
+    host's argument length (128 KiB on Linux); files go over standard input. A script reads its input
+    before printing more than the channel window (2 MiB). Review with the user.
+59. **Host keys**: strict by default; `hostKey` pins and reads no file; `--accept-new` and the SSH
+    configuration's `StrictHostKeyChecking accept-new` record a new key and never take a changed
+    one. `fettle trust` records a key by connecting again with accept-new into a scratch file and
+    copying that line only when its fingerprint is the one shown, so a key that changed in between is
+    never recorded; a changed key is refused, its old line to be removed with `ssh-keygen -R`. Review
+    with the user.
+60. **Logging in**: agent, then the inventory's `key`, then the configuration's identity files (or
+    ssh's defaults), a key under a passphrase retried with `FETTLE_SSH_PASSPHRASE` or one typed at the
+    terminal, then `password`. A named key that is missing is the error reported. Through a
+    `ProxyJump` the session is made by `SshConfig.connect` over a generated configuration (the
+    target's block, then the user's configuration for every other host), whose login is the agent and
+    key files without a passphrase. Review with the user.
+61. **`become` wraps the script**: `sudo -n` / `sudo -k -S -p ''` / `doas -n`, `-u <user> -- /bin/sh -c`
+    an inner script that prints a random marker line on standard error and then `exec`s the script,
+    passed as `$1`. No marker means the script never ran: that is a `BecomeRefused` error naming why
+    (password wanted, password refused, terminal wanted, not permitted, not installed), never a
+    `Ran`. `-k` makes sudo read the password every time, so the password line can never reach the
+    script. `SudoPassword` checks the password once, alone, before the first script, so a wrong one
+    never has the script's input read as further attempts. Review with the user.
+62. **`requiretty`**: once sudo says it wants a terminal, every later run of that `BecomeTransport`
+    goes through a pseudo-terminal for sudo alone, the script's input, output and error output through
+    files in a private `mktemp -d` directory made and removed by plain runs, the password over the
+    terminal (echo off), never a file. It does not work yet over SSH: avin-lang/ssh's `Exec.wait`
+    closes the channel when output ends, which on a terminal is before the command exits, and the
+    hang-up kills it (tests ignored until fixed). Review with the user.
+63. **`fettle facts <host>`** takes an inventory host (from `--dir`, the current directory by
+    default) when the inventory holds one by that name, else `[user@]host[:port]`, `host` possibly an
+    SSH configuration alias. Facts are gathered as the login user. A host with no `become` runs as
+    the login user (10, decision 14). A connection's secrets are read by the engine's `reveal` (40),
+    one final line end dropped; `facts` and `trust` take no vault options yet, so a `secret.vault`
+    password is refused there. Review with the user.
+64. **libssh2 is linked statically** (`c-linking { static = ["sodium", "ssh/libssh2"] }`, one block,
+    since a second `c-linking` replaces the first's list), with OpenSSL's `libssl`/`libcrypto`
+    archives; `libz` and the system's libraries stay dynamic. Review with the user.
+65. **Integration tests skip, not fail, without targets**; `tests/integration/run.zsh` brings the
+    targets up and runs only them with `FETTLE_INTEGRATION=required`, under which a skip fails. Tests
+    that need special users or tools (requiretty users, doas) set them up themselves on the target.
+    Review with the user.

@@ -1,9 +1,10 @@
 module tests
 
 import avin.fs
+import avin.net.TcpListener
 import dev.avinlang.fettle.facts.{Facts, factsJson, factsScript, gather, parseFacts, readFacts, showFacts}
 import dev.avinlang.fettle.transport.{LocalTransport}
-import dev.avinlang.fettle.cli.{factsText}
+import dev.avinlang.fettle.cli.{factsText, remoteArgs}
 
 // The recorded output of the facts script `tests/fixtures/facts/<name>.txt`, parsed, as JSON.
 recorded(name: string) -> string = fs.readText(
@@ -225,13 +226,48 @@ factsCommand()
   assertEq(factsJson(f) + "\n", text)
   assertEq(factsText(["--local"]).getOrElse("").startsWith("os       Darwin\n"), true)
 
-@test("fettle facts refuses what it cannot do yet and arguments it does not know")
+@test("fettle facts refuses a missing host, two hosts, a host with --local and arguments it does not know")
 factsCommandErrors()
-  assertEq(failure([]), "2 fettle: facts of a remote host are not gathered yet; use --local")
-  assertEq(failure(["--json"]), "2 fettle: facts of a remote host are not gathered yet; use --local")
+  assertEq(failure([]), "2 fettle: facts needs a host, or --local")
+  assertEq(failure(["--json"]), "2 fettle: facts needs a host, or --local")
   assertEq(failure(["--local", "--bogus"]), "2 fettle: unknown argument `--bogus`")
-  assertEq(failure(["web1"]), "2 fettle: unknown argument `web1`")
+  assertEq(failure(["--yes", "web1"]), "2 fettle: unknown argument `--yes`")
+  assertEq(failure(["web1", "--local"]), "2 fettle: --local takes no host, and `web1` was given")
+  assertEq(failure(["web1", "web2"]), "2 fettle: one host at a time, not `web1` and `web2`")
+  assertEq(failure(["web1", "--dir"]), "2 fettle: `--dir` needs a value")
+  assertEq(failure(["web1", "--known-hosts"]), "2 fettle: `--known-hosts` needs a value")
   assertEq(failure(["--local"]), "succeeded")
+
+@test("fettle facts of a host that cannot be reached fails with status 1 and says why")
+factsCommandUnreachable()
+  val l = TcpListener.bind("127.0.0.1", 0).ok.get
+  val port = l.port()
+  _ = l.close()
+  assertEq(failure([s"nobody@127.0.0.1:$port", "--ssh-config", "/dev/null"]).startsWith(s"1 fettle: ssh nobody@127.0.0.1:$port: cannot connect"), true)
+  assertEq(failure(["nobody@h:0"]), "1 fettle: `nobody@h:0`: `0` is not a TCP port")
+  assertEq(failure(["web1", "--dir", "/nonexistent/fettle"]).startsWith("1 fettle: "), true)
+  assertEq(failure(["web1", "--ssh-config", "/nonexistent/fettle-config"]).startsWith("1 fettle: "), true)
+
+@test("the options of the commands that reach a host")
+remoteOptions()
+  val all = ["--json", "--local", "--yes", "--accept-new", "--dir", "--ssh-config", "--known-hosts"]
+  val r = remoteArgs(["--dir", "d", "h", "--ssh-config", "c", "--known-hosts", "k", "--accept-new", "--json", "--yes"], all).ok.get
+  assertEq(r.name, "h")
+  assertEq(r.dir, "d")
+  assertEq(r.dirGiven, true)
+  assertEq(r.sshConfig, Some("c"))
+  assertEq(r.knownHosts, Some("k"))
+  assertEq(r.acceptNew, true)
+  assertEq(r.json, true)
+  assertEq(r.yes, true)
+  assertEq(r.local, false)
+  val none = remoteArgs([], all).ok.get
+  assertEq(none.name, "")
+  assertEq(none.dir, ".")
+  assertEq(none.dirGiven, false)
+  assertEq(remoteArgs(["--dir", "--json"], all).map(x -> x.dir), Ok("--json"))
+  assertEq(remoteArgs(["-x"], all), Err("fettle: unknown argument `-x`"))
+  assertEq(remoteArgs(["日本@ホスト"], all).map(x -> x.name), Ok("日本@ホスト"))
 
 // How `fettle facts args` fails: its exit status and the first line of its message.
 failure(args: Vector[string]) -> string = factsText(args) match

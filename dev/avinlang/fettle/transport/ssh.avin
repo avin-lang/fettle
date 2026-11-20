@@ -1,0 +1,355 @@
+module dev.avinlang.fettle.transport
+
+// The SSH transport: one session per host, over avin-lang/ssh (libssh2), every script an exec on it.
+import avin.fs
+import avin.io
+import avin.process
+import avin.time.{Duration, seconds}
+import dev.avinlang.fettle.shell.{quote}
+import dev.avinlang.ssh
+
+// Where an SSH transport goes and how it logs in. What it leaves out, the SSH configuration
+// (`~/.ssh/config`) fills in, as `ssh` would: `HostName`, `Port`, `User`, `IdentityFile`,
+// `ProxyJump`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `ConnectTimeout` and
+// `ServerAliveInterval`.
+data SshTarget(
+  // The host as named: an alias of the SSH configuration, a host name or an address.
+  host: string,
+  port: Option[int] = None,
+  user: Option[string] = None,
+  // Private keys to log in with, tried after the agent and before the configuration's own.
+  keys: Vector[string] = [],
+  // A password to log in with where no key is taken.
+  password: Option[string] = None,
+  // The SHA-256 fingerprint the host's key must have (`SHA256:…`); no known-hosts file is read then.
+  hostKey: Option[string] = None,
+  // The known-hosts file; the configuration's `UserKnownHostsFile`, else `~/.ssh/known_hosts`.
+  knownHosts: Option[string] = None,
+  // Whether a host the known-hosts file does not list is trusted and added to it.
+  acceptNew: bool = false,
+  // How long reaching the host may take, connection, handshake and host key together; the
+  // configuration's `ConnectTimeout`, else ten seconds.
+  connectTimeout: Option[Duration] = None,
+  // How long one wait for the host may last once connected, while a script runs; none where `None`.
+  timeout: Option[Duration] = None,
+  // The passphrase of a private key that cannot be used without one, asked for by the key's path.
+  passphrase: (string) -> Option[string] = askPassphrase
+)
+
+// What a connection uses once the SSH configuration has filled in what the target leaves out.
+data SshPlan(
+  // The configuration's name for the host, as the target named it.
+  alias: string,
+  // The host connected to, and its port.
+  hostName: string,
+  port: int,
+  user: string,
+  // The private keys tried, in order: the target's, then the configuration's (or `ssh`'s defaults).
+  keys: Vector[string],
+  // The keys the target named itself, a missing one of which is an error rather than passed over.
+  named: Vector[string],
+  // Whether the SSH agent is asked first (not where `IdentitiesOnly yes`).
+  useAgent: bool,
+  proxyJump: Option[string],
+  hostKeys: ssh.HostKeys,
+  knownHosts: string,
+  connectTimeout: Duration,
+  keepalive: Option[Duration]
+)
+
+impl SshPlan
+  // `user@host:port`, as errors name the host.
+  where -> string = s"$user@$hostName:$port"
+
+// A key's passphrase: `FETTLE_SSH_PASSPHRASE` where it is set, else one typed at the terminal; `None`
+// where there is no terminal to ask at.
+askPassphrase(key: string) -> Option[string] = process.env("FETTLE_SSH_PASSPHRASE") match
+  Some(p) -> Some(p)
+  None -> io.readSecret(s"Passphrase for $key: ").ok
+
+// `~/` at the start of `p` read as the home directory.
+expandHome(p: string) -> string =
+  if p == "~" || p.startsWith("~/")
+    process.homeDir() match
+      Some(home) -> home + p.drop(1)
+      None -> p
+  else p
+
+// The plan for `target` under the SSH configuration `config`.
+planFor(target: SshTarget, config: ssh.SshConfig) -> Result[SshPlan, TransportError]
+  val h = config.host(target.host).mapErr(e -> TransportError(s"ssh ${target.host}: ${e.message}", Unreachable))?
+  val named = target.keys.map(k -> expandHome(k))
+  val fromConfig = if h.identityFiles.nonEmpty then h.identityFiles else defaultKeys()
+  val hostKeys: ssh.HostKeys = target.hostKey match
+    Some(fp) -> ssh.Pinned(fp)
+    None -> if target.acceptNew then ssh.AcceptNew else h.hostKeys.getOrElse(ssh.Strict)
+  Ok(
+    SshPlan(
+      alias = target.host,
+      hostName = h.hostName,
+      port = target.port.getOrElse(h.port),
+      user = target.user.getOrElse(h.user),
+      keys = named ++ fromConfig.filter(k -> !named.contains(k)),
+      named = named,
+      useAgent = !h.identitiesOnly,
+      proxyJump = h.proxyJump,
+      hostKeys = hostKeys,
+      knownHosts = target.knownHosts.map(k -> expandHome(k)).orElse(h.knownHosts).getOrElse(ssh.defaultKnownHosts()),
+      connectTimeout = target.connectTimeout.orElse(h.connectTimeout).getOrElse(10.seconds),
+      keepalive = h.keepalive.orElse(Some(30.seconds))
+    )
+  )
+
+// The private keys `ssh` tries where nothing names one.
+private defaultKeys() -> Vector[string] = process.homeDir() match
+  Some(home) -> [s"$home/.ssh/id_ed25519", s"$home/.ssh/id_ecdsa", s"$home/.ssh/id_rsa"]
+  None -> []
+
+// The session options of `plan`, a wait once connected bounded by `timeout`.
+private optionsOf(plan: SshPlan, timeout: Option[Duration]) -> ssh.Options =
+  ssh.Options(
+    connectTimeout = Some(plan.connectTimeout),
+    timeout = timeout,
+    hostKeys = plan.hostKeys,
+    knownHosts = Some(plan.knownHosts),
+    keepalive = plan.keepalive
+  )
+
+// `e`, from reaching or using the host `where`, as a transport error of the kind it is. Before the
+// login, anything but a host key or a login refused means the host could not be reached.
+sshFailure(e: ssh.SshError, where: string, connecting: bool) -> TransportError
+  val text = s"ssh $where: ${e.message}"
+  e match
+    ssh.UnknownHostKey(_, _, _) ->
+      TransportError(s"$text; if that is its key, record it with `fettle trust`", HostKeyRefused)
+    ssh.ChangedHostKey(_, _, _) | ssh.UnexpectedHostKey(_, _) | ssh.KnownHosts(_, _) -> TransportError(
+      text,
+      HostKeyRefused
+    )
+    ssh.AuthFailed(_, _) | ssh.KeyFile(_, _) | ssh.Agent(_) | ssh.NotAuthenticated -> TransportError(text, LoginRefused)
+    _ -> TransportError(text, if connecting then Unreachable else Broken)
+
+// A session with the host `plan` names, its key checked, and logged in where `login` says. Through a
+// `ProxyJump`, the session is made by the SSH configuration, which logs in with the agent and then
+// the key files that need no passphrase; directly, the login is `logIn`'s.
+private openSession(
+    plan: SshPlan,
+    config: ssh.SshConfig,
+    target: SshTarget,
+    login: bool
+) -> Result[ssh.Session, TransportError]
+  val options = optionsOf(plan, target.timeout)
+  plan.proxyJump match
+    Some(jump) ->
+      val through = jumpConfig(plan, jump, config).mapErr(e -> sshFailure(e, plan.where, true))?
+      through.connect(jumpAlias, options).mapErr(e -> sshFailure(e, plan.where, true))
+    None ->
+      val session = ssh.Session.connect(plan.hostName, plan.port, options).mapErr(e -> sshFailure(e, plan.where, true))?
+      if !login then return Ok(session)
+      logIn(session, plan, target) match
+        Ok(_) -> Ok(session)
+        Err(e) ->
+          _ = session.close()
+          Err(sshFailure(e, plan.where, true))
+
+// The alias the configuration made for a connection through jump hosts names its target by.
+private val jumpAlias = "fettle-target"
+
+// A configuration with a block of its own for the target of `plan` and, for every other host (the
+// jump hosts), the user's configuration `config`, so that what the target says wins over it.
+private jumpConfig(plan: SshPlan, jump: string, config: ssh.SshConfig) -> Result[ssh.SshConfig, ssh.SshError]
+  ssh.SshConfig.parse(jumpConfigText(plan, jump, config.path, fs.exists(config.path)), "(fettle)", ".")
+
+// The text of `jumpConfig`'s configuration, the user's configuration `userConfig` included where
+// `include` says.
+jumpConfigText(plan: SshPlan, jump: string, userConfig: string, include: bool) -> string
+  val text = StringWriter()
+  text.write(s"Host $jumpAlias\n")
+  text.write(s"  HostName ${configWord(plan.hostName)}\n")
+  text.write(s"  Port ${plan.port}\n")
+  text.write(s"  User ${configWord(plan.user)}\n")
+  for k in plan.keys
+    text.write(s"  IdentityFile ${configWord(k)}\n")
+  text.write(s"  IdentitiesOnly ${if plan.useAgent then "no" else "yes"}\n")
+  text.write(s"  ProxyJump ${configWord(jump)}\n")
+  if include
+    text.write(s"Host * !$jumpAlias\n")
+    text.write(s"  Include ${configWord(userConfig)}\n")
+  text.text
+
+// `w` as one word of an SSH configuration line: in double quotes where it holds a space.
+private configWord(w: string) -> string = if w.exists(c -> c == ' ' || c == '\t') then s"\"$w\"" else w
+
+// Logs in to `session` as `plan.user`: the SSH agent first (where `SSH_AUTH_SOCK` is set and the
+// configuration does not say `IdentitiesOnly`), then each key of the plan, one under a passphrase
+// tried again with the target's `passphrase`, then the target's password. The failure answered is
+// the last one met.
+private logIn(session: ssh.Session, plan: SshPlan, target: SshTarget) -> Result[unit, ssh.SshError]
+  var last: Option[ssh.SshError] = None
+  if plan.useAgent && process.env("SSH_AUTH_SOCK").isDefined
+    session.authAgent(plan.user) match
+      Ok(_) -> return Ok(())
+      Err(e) -> last = Some(e)
+  // A key the target names that is not there is the likeliest reason for a refusal, so it is the one
+  // reported, whatever failed after it.
+  var missing: Option[ssh.SshError] = None
+  for k in plan.keys
+    if !session.isOpen then break
+    if !fs.exists(k)
+      if plan.named.contains(k) && missing.isEmpty then missing = Some(ssh.KeyFile(k, "there is no such file"))
+      continue
+    session.authKey(plan.user, k) match
+      Ok(_) -> return Ok(())
+      Err(ssh.KeyFile(p, reason)) ->
+        last = Some(ssh.KeyFile(p, reason))
+        target.passphrase(k) match
+          Some(pp) ->
+            session.authKey(plan.user, k, Some(pp)) match
+              Ok(_) -> return Ok(())
+              Err(e) -> last = Some(e)
+          None -> ()
+      Err(e) -> last = Some(e)
+  target.password match
+    Some(pw) if session.isOpen ->
+      session.authPassword(plan.user, pw) match
+        Ok(_) -> return Ok(())
+        Err(e) -> last = Some(e)
+    _ -> ()
+  Err(missing.orElse(last).getOrElse(ssh.AuthFailed("publickey", [])))
+
+// A transport to the host `target` names: connected, its host key checked, logged in, `config`
+// filling in what the target leaves out.
+connectSsh(target: SshTarget, config: ssh.SshConfig) -> Result[SshTransport, TransportError]
+  val plan = planFor(target, config)?
+  val session = openSession(plan, config, target, true)?
+  Ok(SshTransport(session, plan.where))
+
+// A host over SSH, as a transport: one session, every `run` an exec on it of `/bin/sh -c` and the
+// script, quoted as one word and started with `exec` so that the shell running it is the session's own
+// process and a signal that kills it is reported as one. The input is written to the command's
+// standard input, which is then closed, and the output read to its end.
+//
+// Output the script prints while its input is still being written is held by the channel up to its
+// window, two megabytes; a script that prints more than that before reading all of its input stops
+// until it is read, so a script reads its input first.
+class SshTransport(private val session: ssh.Session, val where: string): Transport
+  private var closed = false
+
+  override run(script: string, input: Array[byte]) -> Result[Ran, TransportError] = runOn(script, input, None)
+
+  // `script` run as `run` runs it but on a pseudo-terminal, as `ssh -t` runs a command, with echo off:
+  // its standard error arrives merged into its standard output, and its input goes through the
+  // terminal, so it is a line of text, not bytes, and it is never ended: the script reads only the
+  // lines it is given. For what needs a terminal (sudo's `requiretty`).
+  runOnTerminal(script: string, input: Array[byte]) -> Result[Ran, TransportError] =
+    runOn(script, input, Some(ssh.Pty("dumb", 200, 50, [(ssh.TerminalMode.Echo, 0)])))
+
+  private runOn(script: string, input: Array[byte], pty: Option[ssh.Pty]) -> Result[Ran, TransportError]
+    if closed then return Err(TransportError(s"ssh $where: the transport is closed"))
+    val quoted = quote(script).mapErr(e -> TransportError(s"ssh $where: the script cannot be sent: $e"))?
+    val running = session.exec(s"exec /bin/sh -c $quoted", pty = pty).mapErr(e -> broke(e))?
+    defer _ = running.close()
+    if input.length > 0 then running.stdin(input).mapErr(e -> broke(e))?
+    // On a terminal, the end of the input hangs the terminal up, which kills the script with `HUP`; a
+    // script run on one reads only the lines it is given, so its input is left open.
+    if pty.isEmpty then running.closeStdin().mapErr(e -> broke(e))?
+    val out = Buffer[byte]()
+    val err = Buffer[byte]()
+    loop
+      running.next().mapErr(e -> broke(e))? match
+        Some(ssh.Stdout(bytes)) -> out.addAll(bytes)
+        Some(ssh.Stderr(bytes)) -> err.addAll(bytes)
+        None -> break
+    val ending = running.wait().mapErr(e -> broke(e))? match
+      ssh.Exited(code) -> ExitCode(code)
+      ssh.Signalled(name, _) -> KilledBy(signalNumber(name))
+    Ok(Ran(ending, out.toArray(), err.toArray()))
+
+  private broke(e: ssh.SshError) -> TransportError = sshFailure(e, where, false)
+
+  override close() -> Result[unit, TransportError]
+    if closed then return Ok(())
+    closed = true
+    session.close().mapErr(e -> TransportError(s"ssh $where: ${e.message}"))
+
+// The number of the signal SSH names `name` (`KILL`, `TERM`), as Linux numbers it; 0 for a name it
+// does not know.
+signalNumber(name: string) -> int = name.stripPrefix("SIG") match
+  "HUP" -> 1
+  "INT" -> 2
+  "QUIT" -> 3
+  "ILL" -> 4
+  "TRAP" -> 5
+  "ABRT" -> 6
+  "BUS" -> 7
+  "FPE" -> 8
+  "KILL" -> 9
+  "USR1" -> 10
+  "SEGV" -> 11
+  "USR2" -> 12
+  "PIPE" -> 13
+  "ALRM" -> 14
+  "TERM" -> 15
+  _ -> 0
+
+// The host key of the host `target` names, as the known-hosts file sees it.
+data HostKeyState
+  // The file lists the key; its fingerprint.
+  KnownKey(fingerprint: string)
+  // The file does not list the host; the key's fingerprint and the file.
+  UnknownKey(fingerprint: string, knownHosts: string)
+  // The file lists another key for the host; the key's fingerprint and the file.
+  ChangedKey(fingerprint: string, knownHosts: string)
+  // The target pins its key; the pinned fingerprint.
+  PinnedKey(fingerprint: string)
+
+// Where the host `target` names stands against its known-hosts file, found by connecting to it
+// without logging in (through a jump host, logging in).
+hostKeyOf(target: SshTarget, config: ssh.SshConfig) -> Result[HostKeyState, TransportError]
+  val plan = planFor(target with {acceptNew = false}, config)?
+  plan.hostKeys match
+    ssh.Pinned(fp) -> return Ok(PinnedKey(fp))
+    _ -> ()
+  val options = optionsOf(plan with {hostKeys = ssh.Strict}, target.timeout)
+  val reached = plan.proxyJump match
+    Some(jump) -> jumpConfig(plan, jump, config).flatMap(c -> c.connect(jumpAlias, options))
+    None -> ssh.Session.connect(plan.hostName, plan.port, options)
+  reached match
+    Ok(session) ->
+      val fp = session.hostKeyFingerprint().mapErr(e -> sshFailure(e, plan.where, true))
+      _ = session.close()
+      Ok(KnownKey(fp?))
+    // A jump host's own key is refused under its own name, and is not the target's to record.
+    Err(ssh.UnknownHostKey(h, p, fp)) if h == plan.hostName && p == plan.port -> Ok(UnknownKey(fp, plan.knownHosts))
+    Err(ssh.ChangedHostKey(h, p, fp)) if h == plan.hostName && p == plan.port -> Ok(ChangedKey(fp, plan.knownHosts))
+    Err(e) -> Err(sshFailure(e, plan.where, true))
+
+// Records the key of the host `target` names in its known-hosts file, where it is the key whose
+// fingerprint is `fingerprint`: the key is read by a connection that trusts any new key into a file of
+// its own, then the line written there is added to the known-hosts file, so that a key that changed
+// since `fingerprint` was shown is never recorded. A host the file already lists with another key is
+// refused; its old line must be removed first (`ssh-keygen -R`).
+trustHostKey(target: SshTarget, config: ssh.SshConfig, fingerprint: string) -> Result[unit, TransportError]
+  val plan = planFor(target with {acceptNew = false, hostKey = None}, config)?
+  val dir = fs.createTempDir("fettle-trust").mapErr(e -> TransportError(s"trust: ${e.message}"))?
+  defer _ = fs.removeDirAll(dir)
+  val scratch = dir + "/known_hosts"
+  val fresh = plan with {hostKeys = ssh.AcceptNew, knownHosts = scratch}
+  val session = openSession(fresh, config, target, false)?
+  val seen = session.hostKeyFingerprint().mapErr(e -> sshFailure(e, plan.where, true))
+  _ = session.close()
+  if seen? != fingerprint
+    return Err(
+      TransportError(s"ssh ${plan.where}: the host key is now ${seen?}, not the $fingerprint shown", HostKeyRefused)
+    )
+  val line = fs.readText(scratch).mapErr(e -> TransportError(s"trust: ${e.message}"))?
+  val file = plan.knownHosts
+  val slash = file.lastIndexOf('/')
+  if slash > 0 && !fs.exists(file.slice(0, slash))
+    fs.createDirAll(file.slice(0, slash)).mapErr(e -> TransportError(s"trust: ${e.message}"))?
+  val before =
+    if fs.exists(file)
+      val text = fs.readText(file).mapErr(e -> TransportError(s"trust: ${e.message}"))?
+      if text.nonEmpty && !text.endsWith("\n") then "\n" else ""
+    else ""
+  fs.appendText(file, before + line).mapErr(e -> TransportError(s"trust: ${e.message}"))
