@@ -1,0 +1,525 @@
+module tests
+
+import avin.c.{ByteBlock}
+import avin.encoding.{fromBase64, toBase64, toHex}
+import avin.fs
+import dev.avinlang.fettle.check.{Names, Unopened, Unreadable}
+import dev.avinlang.fettle.eval.{evaluate}
+import dev.avinlang.fettle.graph.{showGraph}
+import dev.avinlang.fettle.project.{checkProject, load}
+
+import dev.avinlang.fettle.vault.{
+  Editing, Limits, Malformed, Rejected, Sources, VaultError, Vaults, aeadOpen, aeadSeal, blockOf, create, decrypt,
+  deriveKey, edit, editorOf, encrypt, header, memMin, moderate, openVault, opsMin, passphrase, plainLine, readHeader,
+  readPlain, rekey, sealVault, view
+}
+
+// The vault: libsodium's answers against published vectors, the file format, the plaintext's reader,
+// the passphrase's sources, the commands, and `secret.vault` in the checker and the evaluator.
+
+// The cheapest limits Argon2id takes, so the tests do not spend 256 MiB a vault.
+fast() -> Limits = Limits(opsMin, memMin)
+
+// The passphrase `p` as a block.
+pass(p: string) -> ByteBlock = blockOf(p.utf8)
+
+// Sources that give `p` from the environment and ask no one.
+envSource(p: string) -> Sources = Sources(None, None, Some(p), _ -> Err("no terminal here"))
+
+// The text of a block.
+textOf(b: ByteBlock) -> string = string.fromUtf8(b.copy()).getOrElse("<not UTF-8>")
+
+// The bytes `hex` spells.
+bytesOf(hex: string) -> Array[byte]
+  val out = Array.fill(hex.byteLength / 2, byte(0))
+  for i in 0 ..< out.length
+    out(i) = byte(hex.slice(2 * i, 2 * i + 2).toInt(16))
+  out
+
+// A new scratch directory.
+scratch() -> string = fs.createTempDir("fettle-vault-test").getOrElse("")
+
+// `text` sealed under `p` with the fast limits.
+sealed(text: string, p: string) -> string = sealVault(text, pass(p), fast()).getOrElse("")
+
+// The vault text `text` opened with `p`: its plaintext, or its error shown.
+opened(text: string, p: string) -> string = openVault(text, pass(p)) match
+  Ok(t) -> t
+  Err(e) -> s"error: ${e.shown}"
+
+val katKey: string = "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+
+val katNonce: string = "404142434445464748494a4b4c4d4e4f5051525354555657"
+
+val katAd: string = "50515253c0c1c2c3c4c5c6c7"
+
+val katPlain: string = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+
+val katSealed: string = "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52ec0875924c1c7987947deafd8780acf49"
+
+@test("XChaCha20-Poly1305 IETF seals the draft-irtf-cfrg-xchacha test vector, and opens it")
+vaultXchachaVector()
+  val c = aeadSeal(blockOf(katPlain.utf8), bytesOf(katAd), blockOf(bytesOf(katNonce)), blockOf(bytesOf(katKey)))
+  assertEq(toHex(c.toVector), katSealed)
+  val m = aeadOpen(bytesOf(katSealed), bytesOf(katAd), blockOf(bytesOf(katNonce)), blockOf(bytesOf(katKey)))
+  assertEq(m.map(b -> textOf(b)), Some(katPlain))
+  // Other associated data, a changed tag, or a cut ciphertext does not open.
+  assertEq(
+    aeadOpen(bytesOf(katSealed), bytesOf("50"), blockOf(bytesOf(katNonce)), blockOf(bytesOf(katKey))).isDefined,
+    false
+  )
+  val changed = bytesOf(katSealed)
+  changed(changed.length - 1) = byte(int(changed(changed.length - 1)) ^ 1)
+  assertEq(aeadOpen(changed, bytesOf(katAd), blockOf(bytesOf(katNonce)), blockOf(bytesOf(katKey))).isDefined, false)
+  assertEq(
+    aeadOpen(bytesOf("0011"), bytesOf(katAd), blockOf(bytesOf(katNonce)), blockOf(bytesOf(katKey))).isDefined,
+    false
+  )
+
+@test("Argon2id derives the key the reference argon2 command derives")
+vaultArgon2idVector()
+  // `printf fettle | argon2 saltsaltsaltsalt -id -t 2 -k 8 -p 1 -l 32 -r`
+  val key = deriveKey(pass("fettle"), blockOf("saltsaltsaltsalt".utf8), 2, 8192)
+  assertEq(
+    key.map(k -> toHex(k.copy().toVector)),
+    Some("f09201f7644187d03e06137f0a6819a9d8076bfbcb6c82d824287e3dfd4f4adb")
+  )
+  val other = deriveKey(pass("fettle!"), blockOf("saltsaltsaltsalt".utf8), 2, 8192)
+  assert(other.map(k -> toHex(k.copy().toVector)) != key.map(k -> toHex(k.copy().toVector)))
+
+@test("a vault round-trips, its header names the limits, and its body is base64 lines of 76")
+vaultRoundTrip()
+  val text = sealed("db = \"hunter2\"\n", "pw")
+  val lines = text.split("\n")
+  assertEq(lines(0), "$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;1;8192")
+  assertEq(text.endsWith("\n"), true)
+  val body = lines.drop(1).filter(l -> !l.isEmpty)
+  for l in body.dropRight(1)
+    assertEq(l.byteLength, 76)
+  assert(body.last.byteLength <= 76)
+  assertEq(opened(text, "pw"), "db = \"hunter2\"\n")
+  // Salt and nonce are fresh: the same text sealed twice is two different files.
+  assert(sealed("db = \"hunter2\"\n", "pw") != text)
+  assertEq(header(moderate()), "$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;3;268435456")
+
+@test("a wrong passphrase, a changed header, a changed body byte and a cut file do not open")
+vaultRejects()
+  val text = sealed("db = \"hunter2\"\n", "pw")
+  val wrong = "error: cannot be opened: the passphrase is wrong, or the file was changed"
+  assertEq(opened(text, "pW"), wrong)
+  assertEq(opened(text, "pw "), wrong)
+  // A header changed to other valid limits is the associated data changed.
+  assertEq(opened(text.replace(";1;8192\n", ";1;16384\n"), "pw"), wrong)
+  assertEq(opened(text.replace(";1;8192\n", ";2;8192\n"), "pw"), wrong)
+  // One body byte changed, wherever it is: salt, nonce, ciphertext or tag.
+  val lines = text.split("\n")
+  val bytes = fromBase64(lines.drop(1).mkString("")).getOrElse(Vector.empty[byte]()).toArray()
+  for at in [0, 20, 45, bytes.length - 1]
+    val changed = bytes.map(b -> b)
+    changed(at) = byte(int(changed(at)) ^ 128)
+    assertEq(opened(s"${lines(0)}\n${toBase64(changed.toVector)}\n", "pw"), wrong)
+  // Cut short: past the salt and nonce it fails its tag; within them it is not a vault.
+  assertEq(opened(s"${lines(0)}\n${lines(1)}\n", "pw"), wrong)
+  assertEq(opened(s"${lines(0)}\n", "pw"), "error: is not a vault: it is cut short")
+  assertEq(opened(lines(0), "pw"), "error: is not a vault: it is cut short")
+  assertEq(opened("", "pw"), "error: is not a vault: it is empty")
+  assertEq(opened(s"${lines(0)}\n!!!!\n", "pw"), "error: is not a vault: its body is not base64")
+  // Line ends written as CRLF still open.
+  assertEq(opened(text.replace("\n", "\r\n"), "pw"), "db = \"hunter2\"\n")
+
+@test("a header outside what this version reads is refused before any key is derived")
+vaultHeaders()
+  val shown: (string) -> string = h -> readHeader(h) match
+    Ok(l) -> s"${l.ops} ${l.mem}"
+    Err(e) -> e.shown
+  assertEq(shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;3;268435456"), "3 268435456")
+  assertEq(shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;16;4294967296"), "16 4294967296")
+  assertEq(shown("$ANSIBLE_VAULT;1.1;AES256"), "is not a vault: its first line is not `$FETTLE_VAULT;…`")
+  assertEq(
+    shown("$FETTLE_VAULT;2;XCHACHA20-POLY1305;ARGON2ID;3;268435456"),
+    "is not a vault: its format is version `2`, and this fettle reads version 1"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;AES256;ARGON2ID;3;268435456"),
+    "is not a vault: its cipher is `AES256`, not `XCHACHA20-POLY1305`"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;SCRYPT;3;268435456"),
+    "is not a vault: its key derivation is `SCRYPT`, not `ARGON2ID`"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;3"),
+    "is not a vault: its header has other than six fields"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;3;268435456;x"),
+    "is not a vault: its header has other than six fields"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;0;268435456"),
+    "is not a vault: its Argon2id passes `0` are not a number from 1 to 16"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;17;268435456"),
+    "is not a vault: its Argon2id passes `17` are not a number from 1 to 16"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;03;268435456"),
+    "is not a vault: its Argon2id passes `03` are not a number from 1 to 16"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;-3;268435456"),
+    "is not a vault: its Argon2id passes `-3` are not a number from 1 to 16"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;3;8191"),
+    "is not a vault: its Argon2id memory `8191` is not a number of bytes from 8192 to 4294967296"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;3;4294967297"),
+    "is not a vault: its Argon2id memory `4294967297` is not a number of bytes from 8192 to 4294967296"
+  )
+  assertEq(
+    shown("$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;3;99999999999999999999"),
+    "is not a vault: its Argon2id memory `99999999999999999999` is not a number of bytes from 8192 to 4294967296"
+  )
+
+// The entries of reading `text`, `name=value` each, then its diagnostics.
+plainOf(text: string) -> string
+  val p = readPlain("s.vault", text)
+  val es = p.entries.map(e -> s"${e.name}=${e.value}").mkString("|")
+  val ds = p.diagnostics.map(d -> shown(d)).mkString("\n")
+  if ds.isEmpty then es else s"$es\n$ds"
+
+@test("a vault's plaintext reads one secret a line, in Fettle's string syntax")
+vaultPlaintext()
+  assertEq(plainOf(""), "")
+  assertEq(plainOf("\n\n// only a comment\n"), "")
+  assertEq(plainOf("a = \"1\""), "a=1")
+  assertEq(plainOf("a = \"1\"\n\nb = \"two words\" // the second\n"), "a=1|b=two words")
+  assertEq(plainOf("pw = \"pässwörd ✓ 鍵 🔑\"\n"), "pw=pässwörd ✓ 鍵 🔑")
+  assertEq(plainOf("e = \"tab\\tquote\\\" back\\\\ dollar\\$ nul\\u{0}\"\n"), "e=tab\tquote\" back\\ dollar$ nul\u{0}")
+  assertEq(plainOf("lone = \"$5 and $x\"\n"), "lone=$5 and $x")
+  assertEq(
+    plainOf("key = \"\"\"\n  -----BEGIN KEY-----\n  abc\n  -----END KEY-----\n  \"\"\"\nafter = \"x\"\n"),
+    "key=-----BEGIN KEY-----\nabc\n-----END KEY-----|after=x"
+  )
+  assertEq(plainOf("q = \"a\\\"\\\"\\\"b\"\n"), "q=a\"\"\"b")
+  assertEq(plainOf("q = \"\"\"\n  say \\\"\"\" here\n  \"\"\"\n"), "q=say \"\"\" here")
+  assertEq(plainOf("empty = \"\"\n"), "empty=")
+  // `plainLine` writes a line that reads back as the same text, whatever the text holds.
+  for v in ["", "plain", "multi\nline\n", "\"\"\"", "${not a hole}", "tab\there", "ü✓🔑"]
+    assertEq(readPlain("s.vault", plainLine("v", v)).get("v"), Some(v))
+
+@test("a duplicate name, a line that is no secret and an interpolation are errors at their place")
+vaultPlaintextErrors()
+  assertEq(plainOf("a = \"1\"\nb = \"2\"\na = \"3\"\n"), "a=1|b=2\ns.vault:3:1 E0502 the secret `a` is given twice")
+  val dup = readPlain("s.vault", "a = \"1\"\na = \"1\"\n").diagnostics(0)
+  assertEq(dup.secondary.map((s, l) -> s"${s.start.line}:${s.start.column} $l").mkString("|"), "1:1 first given here")
+  assertEq(
+    plainOf("a = 1\nb = \"2\"\n"),
+    "b=2\ns.vault:1:1 E0501 a vault's line is `name = \"text\"` or `name = \"\"\"…\"\"\"`"
+  )
+  assertEq(plainOf("a \"1\"\n"), "\ns.vault:1:1 E0501 a vault's line is `name = \"text\"` or `name = \"\"\"…\"\"\"`")
+  assertEq(
+    plainOf("a = \"1\" \"2\"\n"),
+    "\ns.vault:1:1 E0501 a vault's line is `name = \"text\"` or `name = \"\"\"…\"\"\"`"
+  )
+  assertEq(plainOf("= \"1\"\n"), "\ns.vault:1:1 E0501 a vault's line is `name = \"text\"` or `name = \"\"\"…\"\"\"`")
+  assertEq(plainOf("a = \"x${b}\"\n"), "\ns.vault:1:5 E0503 a vault's secret is text, with no `${…}` in it")
+  assertEq(plainOf("a = \"1\"\n  b = \"2\"\n"), "a=1|b=2\ns.vault:2:1 E0501 a vault's line is not indented")
+  assertEq(plainOf("a = \"unterminated\n").contains("E01"), true)
+
+// Each thing `src` gives as a passphrase: its text, or its error.
+given(src: Sources, confirm: bool = false) -> string = passphrase(src, confirm) match
+  Ok(b) -> textOf(b)
+  Err(e) -> s"error: $e"
+
+@test("the passphrase comes from the file, then the command, then the environment, then the prompt")
+vaultPassphraseSources()
+  val dir = scratch()
+  fs.writeText(s"$dir/pw", "from-file\n").getOrElse(())
+  val typed: (string) -> Result[string, string] = _ -> Ok("typed")
+  assertEq(given(Sources(Some(s"$dir/pw"), Some("printf from-command"), Some("from-env"), typed)), "from-file")
+  assertEq(given(Sources(None, Some("printf from-command"), Some("from-env"), typed)), "from-command")
+  assertEq(given(Sources(None, None, Some("from-env"), typed)), "from-env")
+  assertEq(given(Sources(None, None, None, typed)), "typed")
+  // One line end is taken off a file's or a command's text, LF or CRLF; the rest stays.
+  fs.writeText(s"$dir/crlf", "a b \r\n").getOrElse(())
+  assertEq(given(Sources(Some(s"$dir/crlf"), None, None, typed)), "a b ")
+  fs.writeText(s"$dir/two", "x\n\n").getOrElse(())
+  assertEq(given(Sources(Some(s"$dir/two"), None, None, typed)), "x\n")
+  assertEq(given(Sources(None, Some("echo from-echo"), None, typed)), "from-echo")
+  // Missing, empty and failing sources are errors, not a fall to the next source.
+  assertEq(
+    given(Sources(Some(s"$dir/none"), None, Some("from-env"), typed)).startsWith("error: the vault passphrase file: "),
+    true
+  )
+  fs.writeText(s"$dir/empty", "\n").getOrElse(())
+  assertEq(given(Sources(Some(s"$dir/empty"), None, Some("from-env"), typed)), "error: the vault passphrase is empty")
+  assertEq(
+    given(
+      Sources(None, Some("exit 3"), Some("from-env"), typed)
+    ).startsWith("error: the vault passphrase command `exit 3` failed"),
+    true
+  )
+  assertEq(given(Sources(None, None, Some(""), typed)), "error: the vault passphrase is empty")
+  // Typed twice where it is confirmed; the two must agree. Other sources are not asked twice.
+  val differ: (string) -> Result[string, string] = q -> Ok(if q == "Vault passphrase: " then "one" else "two")
+  assertEq(given(Sources(None, None, None, differ), true), "error: the two passphrases differ")
+  assertEq(given(Sources(None, None, None, differ)), "one")
+  assertEq(given(Sources(None, None, None, typed), true), "typed")
+  assertEq(given(Sources(None, None, Some("from-env"), differ), true), "from-env")
+  assertEq(given(Sources(None, None, None, _ -> Err("no terminal"))), "error: no terminal")
+  fs.removeDirAll(dir).getOrElse(())
+
+@test("the editor is $VISUAL, else $EDITOR, else vi")
+vaultEditorChoice()
+  assertEq(editorOf(n -> if n == "VISUAL" then Some("code --wait") else Some("nano")), "code --wait")
+  assertEq(editorOf(n -> if n == "EDITOR" then Some("nano") else None), "nano")
+  assertEq(editorOf(n -> if n == "VISUAL" then Some("") else if n == "EDITOR" then Some("nano") else None), "nano")
+  assertEq(editorOf(_ -> None), "vi")
+
+// An editor script in `dir` that records its directory's permissions and the file it was given, then
+// runs `body` on the file `$1`.
+editor(dir: string, body: string) -> Editing
+  val script = s"$dir/editor.sh"
+  fs.writeText(
+    script,
+    s"ls -ld \"$$(dirname \"$$1\")\" | cut -c1-10 >> $dir/modes\necho \"$$1\" >> $dir/files\n$body\n"
+  ).getOrElse(())
+  Editing(s"sh $script", _ -> false)
+
+// Each line of the file `file`.
+linesOf(file: string) -> Vector[string] = fs.readText(file).getOrElse("").split("\n").filter(l -> !l.isEmpty)
+
+@test("edit opens the plaintext in a private directory, seals the result afresh and leaves no plaintext")
+vaultEdit()
+  val dir = scratch()
+  val file = s"$dir/s.vault"
+  fs.writeText(file, sealed("db = \"old\"\n", "pw")).getOrElse(())
+  val before = fs.readText(file).getOrElse("")
+  val ed = editor(dir, "printf 'db = \"new\"\\napi = \"k\"\\n' > \"$1\"")
+  assertEq(edit(file, envSource("pw"), ed, fast()), Ok(()))
+  val after = fs.readText(file).getOrElse("")
+  assertEq(opened(after, "pw"), "db = \"new\"\napi = \"k\"\n")
+  assertEq(linesOf(s"$dir/modes"), ["drwx------"])
+  val edited = linesOf(s"$dir/files")
+  assertEq(edited.length, 1)
+  assertEq(edited(0).endsWith("/s.txt"), true)
+  assertEq(fs.exists(edited(0)), false)
+  assertEq(fs.exists(edited(0).slice(0, edited(0).lastIndexOf("/"))), false)
+  assertEq(fs.exists(s"$file.fettle-new"), false)
+  // A new salt and nonce: the header is the same, the body is not.
+  assertEq(after.split("\n")(0), before.split("\n")(0))
+  assert(after.split("\n")(1) != before.split("\n")(1))
+  // Left as it was, the file is left as it was.
+  assertEq(edit(file, envSource("pw"), editor(dir, "true"), fast()), Ok(()))
+  assertEq(fs.readText(file).getOrElse(""), after)
+  // The wrong passphrase edits nothing and runs no editor.
+  assertEq(
+    edit(file, envSource("nope"), editor(dir, "echo x > \"$1\""), fast()),
+    Err(s"$file cannot be opened: the passphrase is wrong, or the file was changed")
+  )
+  assertEq(linesOf(s"$dir/files").length, 2)
+  fs.removeDirAll(dir).getOrElse(())
+
+@test("an edit that does not read is offered again, and declined it saves nothing")
+vaultEditAgain()
+  val dir = scratch()
+  val file = s"$dir/s.vault"
+  fs.writeText(file, sealed("db = \"old\"\n", "pw")).getOrElse(())
+  val before = fs.readText(file).getOrElse("")
+  // The first run writes a bad line; the second, asked again, fixes it.
+  val script = "if [ -f \"$(dirname \"$0\")/ran\" ]; then printf 'db = \"fixed\"\\n' > \"$1\"; else touch \"$(dirname \"$0\")/ran\"; printf 'db = fixed\\n' > \"$1\"; fi"
+  val ed = editor(dir, script)
+  val again = Editing(ed.editor, q -> q == "The secrets do not read. Edit them again? [Y/n] ")
+  assertEq(edit(file, envSource("pw"), again, fast()), Ok(()))
+  assertEq(linesOf(s"$dir/files").length, 2)
+  assertEq(opened(fs.readText(file).getOrElse(""), "pw"), "db = \"fixed\"\n")
+  // Declined, the vault stays as it was and the plaintext is gone.
+  fs.writeText(file, before).getOrElse(())
+  assertEq(
+    edit(file, envSource("pw"), editor(dir, "printf 'a = \"1\"\\na = \"2\"\\n' > \"$1\""), fast()),
+    Err(s"`$file` was left as it was")
+  )
+  assertEq(fs.readText(file).getOrElse(""), before)
+  for f in linesOf(s"$dir/files")
+    assertEq(fs.exists(f), false)
+  // An editor that fails saves nothing either.
+  assertEq(
+    edit(file, envSource("pw"), editor(dir, "exit 1"), fast()),
+    Err(s"the editor `sh $dir/editor.sh` failed, so nothing was saved")
+  )
+  assertEq(fs.readText(file).getOrElse(""), before)
+  fs.removeDirAll(dir).getOrElse(())
+
+@test("create, view, encrypt, decrypt and rekey")
+vaultCommands()
+  val dir = scratch()
+  val file = s"$dir/new.vault"
+  assertEq(create(file, envSource("pw"), editor(dir, "printf 'token = \"t0k\"\\n' > \"$1\""), fast()), Ok(()))
+  assertEq(view(file, envSource("pw")), Ok("token = \"t0k\"\n"))
+  assertEq(linesOf(s"$dir/files")(0).endsWith("/new.txt"), true)
+  assertEq(create(file, envSource("pw"), editor(dir, "true"), fast()), Err(s"`$file` already exists"))
+  // An empty vault is a vault.
+  val empty = s"$dir/empty.vault"
+  assertEq(create(empty, envSource("pw"), editor(dir, "true"), fast()), Ok(()))
+  assertEq(view(empty, envSource("pw")), Ok(""))
+  // encrypt seals a plaintext file in place; decrypt puts it back.
+  val plain = s"$dir/plain.vault"
+  fs.writeText(plain, "a = \"1\"\nb = \"\"\"\n  two\n  lines\n  \"\"\"\n").getOrElse(())
+  assertEq(encrypt(plain, envSource("pw"), fast()), Ok(()))
+  assertEq(fs.readText(plain).getOrElse("").startsWith("$FETTLE_VAULT;1;"), true)
+  assertEq(encrypt(plain, envSource("pw"), fast()), Err(s"`$plain` is already a vault"))
+  assertEq(decrypt(plain, envSource("pw")), Ok(()))
+  assertEq(fs.readText(plain).getOrElse(""), "a = \"1\"\nb = \"\"\"\n  two\n  lines\n  \"\"\"\n")
+  fs.writeText(plain, "a = \"1\"\na = \"2\"\n").getOrElse(())
+  assertEq(encrypt(plain, envSource("pw"), fast()).isErr, true)
+  assertEq(fs.readText(plain).getOrElse(""), "a = \"1\"\na = \"2\"\n")
+  // rekey: the old passphrase no longer opens it, the new one does.
+  assertEq(rekey(file, envSource("pw"), envSource("new pw"), fast()), Ok(()))
+  assertEq(view(file, envSource("pw")).isErr, true)
+  assertEq(view(file, envSource("new pw")), Ok("token = \"t0k\"\n"))
+  assertEq(rekey(file, envSource("pw"), envSource("x"), fast()).isErr, true)
+  assertEq(view(s"$dir/none.vault", envSource("pw")).isErr, true)
+  fs.removeDirAll(dir).getOrElse(())
+
+// A project in a new directory holding `main.fettle`, whose role `r` stores the secret `name` of
+// `secrets.vault`, a vault sealed under `pw` holding `db` and `api`, and the inventory applying `r`.
+vaultProject(name: string, extra: string = "") -> string
+  val dir = scratch()
+  val main = [
+    "role r()",
+    "  file \"/etc/app/secret\"",
+    s"    content = secret.vault(\"secrets.vault\", \"$name\")",
+    "    mode = 0o600",
+    extra,
+    "group web",
+    "  host web1 at \"10.0.0.1\"",
+    "",
+    "apply web -> r()"
+  ]
+  fs.writeText(s"$dir/main.fettle", src(main)).getOrElse(())
+  fs.writeText(s"$dir/secrets.vault", sealed("db = \"hunter2\"\napi = \"k\"\n", "pw")).getOrElse(())
+  dir
+
+// The errors of checking the project at `dir` with the vault passphrase `src` gives, unattended.
+vaultErrors(dir: string, src: Sources) -> string
+  val p = load(dir).ok.get
+  val vaults = Vaults(dir, src, false)
+  checkProject(p, f -> vaults.names(f)).filter(d -> !d.warning).map(d -> shown(d)).mkString("\n")
+
+@test("secret.vault: names are checked when a passphrase is at hand, and wait otherwise")
+vaultChecked()
+  val good = vaultProject("db")
+  assertEq(vaultErrors(good, envSource("pw")), "")
+  val missing = vaultProject("dbPassword")
+  assertEq(
+    vaultErrors(missing, envSource("pw")),
+    "main.fettle:3:15 E0251 the vault `secrets.vault` holds no secret `dbPassword`"
+  )
+  // No passphrase at hand: nothing to say yet, and no one is asked.
+  assertEq(vaultErrors(missing, Sources(None, None, None, _ -> Err("asked"))), "")
+  // The wrong passphrase is an error at the vault's name.
+  assertEq(
+    vaultErrors(good, envSource("wrong")),
+    "main.fettle:3:28 E0252 the vault `secrets.vault` cannot be opened: the passphrase is wrong, or the file was changed"
+  )
+  fs.removeDirAll(good).getOrElse(())
+  fs.removeDirAll(missing).getOrElse(())
+
+@test("secret.vault's file is relative to the declaring file, and its arguments are two strings")
+vaultCheckedShapes()
+  assertEq(
+    projectDiags(
+      [("roles/web.fettle", src(["role web()", "  file \"/a\"", "    content = secret.vault(\"x.vault\", \"db\")"]))]
+    ),
+    "roles/web.fettle:3:28 E0250 `secret.vault` reads `roles/x.vault`, which does not exist"
+  )
+  assertEq(
+    errorsIn(["role r()", "  file \"/a\"", "    content = secret.vault(\"x.vault\")"]),
+    "main.fettle:3:15 E0253 `secret.vault` takes a vault's file and a secret's name, and this gives 1 arguments"
+  )
+  assertEq(
+    errorsIn(["role r()", "  file \"/a\"", "    content = secret.vault(\"x.vault\", 3)"]),
+    "main.fettle:3:39 E0203 `secret.vault`'s name is a `string`, but this is a `int`"
+  )
+  assertEq(errorsIn(["role r(n: string)", "  file \"/a\"", "    content = secret.vault(\"x.vault\", n)"]), "")
+  assertEq(
+    errorsIn(["role r()", "  file \"/a\"", "    content = secret.vaul(\"x.vault\", \"db\")"]),
+    "main.fettle:3:15 E0202 `secret` has no function `vaul`"
+  )
+  // A secret from a vault is a secret: it cannot be interpolated or reach a command's arguments.
+  assertEq(errorsIn(["role r()", "  package \"${secret.vault(\"x.vault\", \"db\")}\""]).contains("E0210"), true)
+
+@test("secret.vault evaluates to an opaque secret, and a name the vault lacks is an error at the call")
+vaultEvaluated()
+  val dir = vaultProject("api")
+  val p = load(dir).ok.get
+  val vaults = Vaults(dir, envSource("pw"), true)
+  val e = evaluate(p.files, "web1", facts("debian12"), x -> p.read(x), p.templates, x -> vaults.names(x))
+  assertEq(e.diagnostics.length, 0)
+  val graph = showGraph(e.graph)
+  assertEq(graph, "1. file \"/etc/app/secret\"\n     content = (secret)\n     mode = 0o600\n")
+  assertEq(graph.contains("k"), false)
+  val lacking = evaluate(p.files, "web1", facts("debian12"), x -> p.read(x), p.templates, _ -> Names(["db"]))
+  assertEq(
+    lacking.diagnostics.map(d -> shown(d)),
+    ["main.fettle:3:15 E0320 the vault `secrets.vault` holds no secret `api`"]
+  )
+  val unreadable = evaluate(
+    p.files,
+    "web1",
+    facts("debian12"),
+    x -> p.read(x),
+    p.templates,
+    _ -> Unreadable("cannot be opened: no terminal")
+  )
+  assertEq(
+    unreadable.diagnostics.map(d -> shown(d)),
+    ["main.fettle:3:15 E0321 the vault `secrets.vault` cannot be opened: no terminal"]
+  )
+  val unopened = evaluate(p.files, "web1", facts("debian12"), x -> p.read(x), p.templates, _ -> Unopened)
+  assertEq(unopened.diagnostics.length, 0)
+  fs.removeDirAll(dir).getOrElse(())
+
+@test("a project's vaults are opened once each, and unattended without a passphrase they stay unopened")
+vaultCache()
+  val dir = vaultProject("db")
+  val prompt = CountingPrompt("pw")
+  val counting = Sources(None, None, None, q -> prompt.ask(q))
+  val vaults = Vaults(dir, counting, true)
+  assertEq(vaults.names("secrets.vault"), Names(["db", "api"]))
+  assertEq(vaults.names("secrets.vault"), Names(["db", "api"]))
+  assertEq(prompt.count, 1)
+  assertEq(Vaults(dir, counting, false).names("secrets.vault"), Unopened)
+  assertEq(prompt.count, 1)
+  fs.writeText(s"$dir/bad.vault", sealed("a = 1\n", "pw")).getOrElse(())
+  assertEq(
+    vaults.names("bad.vault"),
+    Unreadable("holds secrets that do not read; `fettle vault edit bad.vault` shows where")
+  )
+  assertEq(prompt.count, 1)
+  val none = vaults.names("none.vault") match
+    Unreadable(why) -> why.startsWith("cannot be read: ")
+    _ -> false
+  assertEq(none, true)
+  fs.removeDirAll(dir).getOrElse(())
+
+// A prompt that answers `answer` and counts how often it was asked.
+class CountingPrompt(val answer: string)
+  var count = 0
+
+  ask(question: string) -> Result[string, string]
+    count += 1
+    Ok(answer)
+
+@test("a passphrase that cannot be had makes every vault of the run unreadable, asked once")
+vaultNoPassphrase()
+  val dir = vaultProject("db")
+  val vaults = Vaults(dir, Sources(None, None, None, _ -> Err("no terminal")), true)
+  assertEq(vaults.names("secrets.vault"), Unreadable("cannot be opened: no terminal"))
+  assertEq(vaults.names("other.vault"), Unreadable("cannot be opened: no terminal"))
+  fs.removeDirAll(dir).getOrElse(())
+  fs.removeDirAll(dir).getOrElse(())

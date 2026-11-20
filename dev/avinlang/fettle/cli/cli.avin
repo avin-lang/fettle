@@ -1,6 +1,10 @@
 module dev.avinlang.fettle.cli
 
 import avin.fs
+import avin.io
+import avin.process
+import dev.avinlang.fettle.vault
+import dev.avinlang.fettle.vault.{Editing, Sources, Vaults, editorOf}
 import dev.avinlang.fettle.syntax.{Diagnostic, parseSource}
 import dev.avinlang.fettle.report.{render}
 import dev.avinlang.fettle.project.{Project, checkProject, filesUnder, load}
@@ -10,7 +14,7 @@ import dev.avinlang.fettle.facts.{factsJson, gather, readFacts, showFacts}
 import dev.avinlang.fettle.graph.{showGraph}
 import dev.avinlang.fettle.transport.{LocalTransport}
 
-val usage: string = "usage: fettle check [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [dir]\n       fettle facts --local [--json]\n       fettle plan --local [--host <name>] [dir]\n       fettle apply --local [--host <name>] [--yes] [dir]"
+val usage: string = "usage: fettle check [<vault options>] [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [<vault options>] [dir]\n       fettle facts --local [--json]\n       fettle plan --local [--host <name>] [<vault options>] [dir]\n       fettle apply --local [--host <name>] [--yes] [<vault options>] [dir]\n       fettle vault create|edit|view|encrypt|decrypt|rekey [<vault options>] <file>\n<vault options> are --vault-password-file <file> and --vault-password-command <command>; rekey also\ntakes --new-vault-password-file <file>"
 
 // Runs the command `args` names, answering the exit status.
 main(args: Vector[string]) -> int
@@ -19,12 +23,13 @@ main(args: Vector[string]) -> int
     return 2
   val rest = args.drop(1)
   args(0) match
-    "check" -> check(if rest.isEmpty then "." else rest(0))
+    "check" -> check(rest)
     "fmt" -> fmt(rest)
     "graph" -> graph(rest)
     "facts" -> facts(rest)
     "plan" -> plan(rest)
     "apply" -> apply(rest)
+    "vault" -> vaultCommand(rest)
     _ ->
       eprintln(s"fettle: unknown command `${args(0)}`\n$usage")
       2
@@ -43,13 +48,52 @@ private loaded(dir: string) -> Option[Project] = load(dir) match
     eprintln(s"fettle: $e")
     None
 
-// `fettle check [dir]`: every file of the project in `dir` checked, its diagnostics rendered with
-// excerpts. Fails when any is an error.
-check(dir: string) -> int
+// The vault options of `args` read out of them: the passphrase's sources and the arguments left.
+// `None` where an option has no value.
+private vaultOptions(args: Vector[string]) -> Option[(VaultOptions, Vector[string])]
+  var file: Option[string] = None
+  var command: Option[string] = None
+  var next: Option[string] = None
+  val rest = Buffer[string]()
+  var i = 0
+  while i < args.length
+    val a = args(i)
+    if a == "--vault-password-file" || a == "--vault-password-command" || a == "--new-vault-password-file"
+      if i + 1 >= args.length
+        eprintln(s"fettle: `$a` needs a value\n$usage")
+        return None
+      val v = Some(args(i + 1))
+      a match
+        "--vault-password-file" -> file = v
+        "--vault-password-command" -> command = v
+        _ -> next = v
+      i += 2
+    else
+      rest += a
+      i += 1
+  val sources = Sources(file, command, process.env("FETTLE_VAULT_PASSWORD"), prompt)
+  val nextSources = Sources(next, None, None, prompt)
+  Some((VaultOptions(sources, nextSources), rest.toVector))
+
+// The passphrase sources of a run: the one a vault is opened with, and for `rekey` the new one.
+data VaultOptions(sources: Sources, next: Sources)
+
+// Asks at the terminal without echo.
+private prompt(question: string) -> Result[string, string] = io.readSecret(question).mapErr(e -> s"$e")
+
+// `fettle check [<vault options>] [dir]`: every file of the project in `dir` checked, its diagnostics
+// rendered with excerpts. Fails when any is an error. A vault's names are checked when a passphrase is
+// at hand without asking; otherwise they wait for the run that opens it.
+check(args: Vector[string]) -> int
+  val (opts, rest) = vaultOptions(args) match
+    Some(x) -> x
+    None -> return 2
+  val dir = if rest.isEmpty then "." else rest(0)
   val p = loaded(dir) match
     Some(x) -> x
     None -> return 1
-  if report(p, checkProject(p)) > 0 then 1 else 0
+  val vaults = Vaults(dir, opts.sources, false)
+  if report(p, checkProject(p, f -> vaults.names(f))) > 0 then 1 else 0
 
 // `fettle fmt [--check] [files…]`: each file written in its canonical form, or with `--check` only
 // named when it is not in it. With no files, every `.fettle` file under the current directory.
@@ -87,7 +131,10 @@ fmt(args: Vector[string]) -> int
 
 // `fettle graph --facts <fixture.json> --host <name> [dir]`: the project checked, then evaluated
 // for one host against the facts in a fixture, and its graph printed.
-graph(args: Vector[string]) -> int
+graph(given: Vector[string]) -> int
+  val (opts, args) = vaultOptions(given) match
+    Some(x) -> x
+    None -> return 2
   var facts = ""
   var host = ""
   var dir = "."
@@ -109,16 +156,52 @@ graph(args: Vector[string]) -> int
   val p = loaded(dir) match
     Some(x) -> x
     None -> return 1
-  if report(p, checkProject(p)) > 0 then return 1
+  val vaults = Vaults(dir, opts.sources, true)
+  if report(p, checkProject(p, x -> vaults.names(x))) > 0 then return 1
   val f = fs.readText(facts).mapErr(e -> s"$e").flatMap(t -> readFacts(t)) match
     Ok(x) -> x
     Err(e) ->
       eprintln(s"fettle: $facts: $e")
       return 1
-  val e = evaluate(p.files, host, f, x -> p.read(x), p.templates)
+  val e = evaluate(p.files, host, f, x -> p.read(x), p.templates, x -> vaults.names(x))
   if report(p, e.diagnostics) > 0 then return 1
   print(showGraph(e.graph))
   0
+
+// `fettle vault <command> [<vault options>] <file>`.
+vaultCommand(given: Vector[string]) -> int
+  val (opts, args) = vaultOptions(given) match
+    Some(x) -> x
+    None -> return 2
+  if args.length != 2
+    eprintln(usage)
+    return 2
+  val file = args(1)
+  val editing = Editing(editorOf(n -> process.env(n)), question -> askAgain(question))
+  val done: Result[unit, string] = args(0) match
+    "create" -> vault.create(file, opts.sources, editing)
+    "edit" -> vault.edit(file, opts.sources, editing)
+    "view" -> vault.view(file, opts.sources).map(t -> print(t))
+    "encrypt" -> vault.encrypt(file, opts.sources)
+    "decrypt" -> vault.decrypt(file, opts.sources)
+    "rekey" -> vault.rekey(file, opts.sources, opts.next)
+    other ->
+      eprintln(s"fettle: `vault` has no command `$other`\n$usage")
+      return 2
+  done match
+    Ok(_) -> 0
+    Err(e) ->
+      eprintln(s"fettle: $e")
+      1
+
+// Asks `question` at the terminal and answers whether the reply is yes, which an empty reply is.
+private askAgain(question: string) -> bool
+  eprint(question)
+  io.readLine() match
+    Some(line) ->
+      val reply = line.trim.toLower
+      reply.isEmpty || reply == "y" || reply == "yes"
+    None -> false
 
 // `fettle facts --local [--json]`: this machine's facts, gathered by running the facts script under
 // `/bin/sh`, printed one a line or, with `--json`, as the JSON a fact fixture holds.
@@ -134,7 +217,12 @@ facts(args: Vector[string]) -> int = factsText(args) match
 factsText(args: Vector[string]) -> Result[string, (int, string)]
   val unknown = args.filter(a -> a != "--local" && a != "--json")
   if !unknown.isEmpty || !args.contains("--local")
-    return Err((2, if unknown.isEmpty then s"fettle: facts of a remote host are not gathered yet; use --local\n$usage" else s"fettle: unknown argument `${unknown(0)}`\n$usage"))
+    return Err(
+      (
+        2,
+        if unknown.isEmpty then s"fettle: facts of a remote host are not gathered yet; use --local\n$usage" else s"fettle: unknown argument `${unknown(0)}`\n$usage"
+      )
+    )
   val t = LocalTransport()
   val gathered = gather(t)
   _ = t.close()

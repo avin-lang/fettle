@@ -896,6 +896,37 @@ the user.
     hardens sshd (no passwords, no root login, validated with `sshd -t` and reloaded), enables the
     firewall with `ufw` through guarded `command`s, turns on unattended upgrades, and runs Caddy
     serving a site. It ships in `examples/vps` and is run end to end against the test containers.
+19. **The vault's details**, settling what 16 leaves open:
+    - **The body** is base64 of the 16-byte salt, the 24-byte nonce, then the ciphertext and its
+      16-byte tag. The associated data is the header line without its line end. A header's limits
+      must lie within 1–16 passes and 8 KiB–4 GiB, checked before any key is derived, so a changed
+      header cannot make opening take minutes or exhaust memory; new vaults use libsodium's moderate
+      limits (3 passes, 256 MiB). Reading accepts CRLF line ends.
+    - **The plaintext** allows `//` comments and blank lines, kept as written since the text is sealed
+      as it is; a line is not indented, and a string holds no `${…}` (`\$` writes a dollar). Its errors
+      are `E05xx` (`E0501` a line that is no secret, `E0502` a name given twice, `E0503` an
+      interpolation); `secret.vault`'s are `E0250`–`E0253` in the checker and `E0320`–`E0321` in
+      evaluation.
+    - **Passphrase sources:** a file's or a command's text loses one line end; the command runs under
+      `/bin/sh -c`; a source that fails or gives an empty passphrase is an error, never a fall to the
+      next source. `rekey` takes the new passphrase from `--new-vault-password-file`, otherwise
+      prompts twice; `encrypt` confirms a typed passphrase as `create` does.
+    - **`check` never prompts**: it checks a vault's names only with a file, a command or
+      `FETTLE_VAULT_PASSWORD`, and otherwise leaves them to the run that opens the vault. `graph` (and
+      later `plan`) asks, once a run, and only when the program names a vault; each vault is opened
+      once.
+    - **Commands:** `encrypt` and `decrypt` work in place; `encrypt` refuses a file that is already a
+      vault or whose secrets do not read. Every write goes to `<file>.fettle-new` and is renamed over
+      the file. The editor is run as `/bin/sh -c '<editor> "$1"'`, so `$EDITOR` may carry arguments
+      (`code --wait`), on `<name>.txt`; an editor that fails saves nothing, and text left unchanged
+      leaves the file unchanged rather than resealing it. `create` refuses an existing file; an empty
+      vault is a vault.
+    - **A secret's bytes never enter the graph:** `secret.vault` evaluates to a secret recording its
+      vault and name, and the bytes are read where a host needs them. Keys and passphrases live in
+      `ByteBlock`s outside the collected heap and are wiped with `sodium_memzero`; plaintext that
+      passes through Avin strings cannot be wiped.
+
+    Review with the user.
 
 ### Decided during phase 1a
 
@@ -996,9 +1027,14 @@ user.
     any other word, the empty one included, goes in single quotes with each `'` written `'\''`.
     `=` and `~` are not plain, so a quoted first word is never an assignment or a home directory.
     A NUL is refused: by `render` for a command, and as `E0320` for an `sh"…"` interpolation, each
-    of which is quoted as one word as 3.2 says (it had been pasted in unquoted). An interpolation
-    inside the text's own double quotes is quoted too, so `"${x}"` keeps the single quotes; write
-    `${x}` bare. Review with the user.
+    of which is quoted as one word as 3.2 says (it had been pasted in unquoted). The quoting of an
+    `sh"…"` interpolation follows the shell quoting of the literal text before it (outside quotes,
+    inside `'…'`, inside `"…"`, a backslash escaping outside single quotes): outside quotes it is one
+    word as above; inside `"…"` the value gets a backslash before each `"`, `\`, `$` and backtick and
+    lands verbatim, so `sh"echo \"hello ${name}\""` is right; inside `'…'`, or straight after a
+    backslash, no quoting can land it exactly, and the checker refuses it as `E0244`, at the
+    interpolation. Command substitutions and comments in the literal text are not tracked. Review
+    with the user.
 28. **One probe script, many commands**: each command runs in a subshell with standard input from
     `/dev/null` (shell text through `/bin/sh -c`, so a syntax error fails only that command), its
     output and error output go to files in a `mktemp -d` scratch directory, and the script prints a
@@ -1022,3 +1058,51 @@ user.
 32. **`Facts` and `readFacts` live in the `facts` module**, beside the script and its parser, and the
     evaluator imports them. `fettle facts` without `--local` is refused until the ssh transport
     exists. Review with the user.
+33. **A provider** is a trait per kind: `probes` (commands, run in the batch), `delta` (what the
+    probe found against what is declared: `InSync`, `Create`, `Modify` with field changes, `Remove`,
+    the plan line's text, and the current and declared text where a diff is shown), `steps` (scripts
+    with their standard input) and `action`. Verify is the probe and the delta again. The engine
+    takes a lookup from kind to provider, so later kinds slot in, and a kind with no provider is a
+    resource that cannot be planned, not a failed run. Review with the user.
+34. **One round trip plans a host**: the pending record is read as the first command of the batch
+    probe. Apply re-probes a resource just before changing it only once something on the host has
+    changed in this run, so an apply with nothing to do costs no more round trips. Review with the
+    user.
+35. **Files**: the probe reads type, mode, owner and group with GNU `stat -c` falling back to BSD
+    `stat -f`, and the hash with whichever of `sha256sum`, `shasum -a 256` and `openssl dgst` the
+    host has, chosen by the probe itself rather than from facts; a symlink's target travels in
+    hexadecimal. A write is `mktemp` beside the target, content on standard input, `chown`, `chmod`,
+    `validate`, `mv -f`. A mode not declared keeps the replaced file's, else 0644 (directories 0755);
+    an owner not declared keeps the replaced file's when the login is root. A change of only mode or
+    owner is made in place. A file with neither `content` nor `source` manages its attributes only
+    and is created empty. A file replaces a symlink at its path; a directory or special file there
+    is an error. Review with the user.
+36. **`validate` names the staged file as `%s`** (anywhere in a word, or in shell text, where it is
+    passed as `"$1"`), and one without `%s` cannot be planned, as with Ansible; it takes no standard
+    input. Review with the user.
+37. **A symlink is set with `ln -sfn`**, which is not atomic but is the portable way to replace a
+    link to a directory; it replaces a regular file, refuses a directory. Removal (`present = false`)
+    is `rm -f` for a file or symlink and `rmdir` for a directory, so a directory that is not empty
+    fails rather than being emptied; `directory.purge` cannot be planned yet. Review with the user.
+38. **The plan's lines**: a resource's text starts at column 48 past its mark (two spaces after a
+    longer name); a title that is empty or holds a control character is shown quoted. A new file shows
+    `N lines` for text under 256 KiB, its size otherwise, `(secret)` for a secret; a changed one a
+    line diff with no context lines (as 2.7 prints it), or `content changed (a -> b)` past 256 KiB or
+    for binary content, or `content: (secret) changed`. A resource that cannot be planned is an `x`
+    line, and makes `plan` exit 1. Review with the user.
+39. **Pending actions run where their resource stands in the order**, after its sources and before
+    what depends on it, together with any trigger of this run so the action runs once; a run with
+    pending actions still begins with them in the plan. The record is JSON lines of kind, title and
+    action; one whose resource is no longer declared is shown, dropped and cleared. A change whose
+    steps fail leaves its actions pending, since it may have changed part of the file. A failed
+    action fails its resource, so its dependents are skipped. Review with the user.
+40. **Secrets are read when a run needs them**, not at evaluation: a `SecretV` keeps its source
+    (`env NAME`, `file PATH`, `command TEXT`, `vault FILE NAME`), or for `literal` and `concat` the
+    values it is made of. `secret.command` drops one final line end; `secret.file` expands `~/`.
+    A step that carries a secret never shows its error output, and no secret's hash is put in a
+    probe. Review with the user.
+41. **`plan --local` and `apply --local`** apply to this machine the program of the inventory host
+    `--host` names, or of the inventory's only host. `apply` away from a terminal without `--yes`
+    refuses rather than proceeding; `apply` exits 0 when everything applied and 1 when anything
+    failed. Each changed, failed or skipped resource and each action prints a progress line
+    `host  changed  kind title` as it ends. Review with the user.

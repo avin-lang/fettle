@@ -10,6 +10,7 @@ import dev.avinlang.fettle.project.{Project, checkProject}
 import dev.avinlang.fettle.report.{applyStatus, planStatus, progressLine, showApplied, showPlan}
 import dev.avinlang.fettle.syntax.{GroupD}
 import dev.avinlang.fettle.transport.{LocalTransport, Transport}
+import dev.avinlang.fettle.vault.{Sources, Vaults}
 
 // `fettle plan` and `fettle apply`: the project checked, each target host's facts gathered and the
 // program evaluated for it, its plan printed, and for `apply` the plan applied after a confirmation.
@@ -68,11 +69,21 @@ targets(a: RunArgs, p: Project) -> Result[Vector[(string, Transport)], string]
 
 // A host's engine and plan: its facts gathered, the program evaluated for it, and the plan made.
 // `progress` hears each resource's outcome when the plan is applied.
-private planned(p: Project, name: string, t: Transport, progress: bool) -> Result[(Engine, Plan), string]
+private planned(
+    p: Project,
+    vaults: Vaults,
+    name: string,
+    t: Transport,
+    progress: bool
+) -> Result[(Engine, Plan), string]
   val facts = gather(t).mapErr(e -> s"fettle: $name: $e")?
-  val e = evaluate(p.files, name, facts, x -> p.read(x), p.templates)
+  val e = evaluate(p.files, name, facts, x -> p.read(x), p.templates, x -> vaults.names(x))
   if report(p, e.diagnostics) > 0 then return Err("")
-  val ctx = Context(facts.root, file -> fs.readBytes(file).mapErr(x -> x.message), v -> reveal(v))
+  val ctx = Context(
+    facts.root,
+    file -> fs.readBytes(file).mapErr(x -> x.message),
+    v -> reveal(v, (file, secret) -> vaults.secret(file, secret))
+  )
   val engine = Engine(
     t,
     ctx,
@@ -83,46 +94,57 @@ private planned(p: Project, name: string, t: Transport, progress: bool) -> Resul
   Ok((engine, plan))
 
 // The engines and plans of every target, or the exit status and message of the first that fails.
-private plans(a: RunArgs, progress: bool) -> Result[Vector[(Engine, Plan)], string]
+// Vaults are opened with the passphrase from `sources`, asked for at the terminal when needed.
+private plans(a: RunArgs, sources: Sources, progress: bool) -> Result[Vector[(Engine, Plan)], string]
   val p = loaded(a.dir) match
     Some(x) -> x
     None -> return Err("")
-  if report(p, checkProject(p)) > 0 then return Err("")
+  val vaults = Vaults(a.dir, sources, true)
+  if report(p, checkProject(p, x -> vaults.names(x))) > 0 then return Err("")
   val out = Buffer[(Engine, Plan)]()
   for (name, t) in targets(a, p)?
-    out += planned(p, name, t, progress)?
+    out += planned(p, vaults, name, t, progress)?
   Ok(out.toVector)
+
+// The vault options of `args` and the arguments of `plan` or `apply` after them, or the exit status
+// of refusing them, the message printed.
+private parsed(args: Vector[string], apply: bool) -> Result[(Sources, RunArgs), int]
+  val (opts, rest) = vaultOptions(args) match
+    Some(x) -> x
+    None -> return Err(2)
+  runArgs(rest, apply) match
+    Ok(a) -> Ok((opts.sources, a))
+    Err(e) ->
+      eprintln(e)
+      Err(2)
 
 // Prints `message` on standard error unless it is empty (the error was reported already).
 private failed(message: string) -> int
   if message.nonEmpty then eprintln(message)
   1
 
-// `fettle plan --local [--host <name>] [dir]`: the plan of the program for this machine. Exit
-// status 0 when nothing would change, 2 when something would, 1 on an error.
+// `fettle plan --local [--host <name>] [<vault options>] [dir]`: the plan of the program for this
+// machine. Exit status 0 when nothing would change, 2 when something would, 1 on an error.
 plan(args: Vector[string]) -> int
-  val a = runArgs(args, false) match
+  val (sources, a) = parsed(args, false) match
     Ok(x) -> x
-    Err(e) ->
-      eprintln(e)
-      return 2
-  val made = plans(a, false) match
+    Err(code) -> return code
+  val made = plans(a, sources, false) match
     Ok(x) -> x
     Err(e) -> return failed(e)
   val ps = made.map((_, p) -> p)
   print(showPlan(ps))
   planStatus(ps)
 
-// `fettle apply --local [--host <name>] [--yes] [dir]`: the plan printed and, once confirmed at a
-// terminal (or with `--yes`), applied, each changed or failed resource printed as it ends, then the
-// summary. Exit status 0 when everything applied, 1 when anything failed or on an error.
+// `fettle apply --local [--host <name>] [--yes] [<vault options>] [dir]`: the plan printed and, once
+// confirmed at a terminal (or with `--yes`), applied, each changed or failed resource printed as it
+// ends, then the summary. Exit status 0 when everything applied, 1 when anything failed or on an
+// error.
 apply(args: Vector[string]) -> int
-  val a = runArgs(args, true) match
+  val (sources, a) = parsed(args, true) match
     Ok(x) -> x
-    Err(e) ->
-      eprintln(e)
-      return 2
-  val made = plans(a, true) match
+    Err(code) -> return code
+  val made = plans(a, sources, true) match
     Ok(x) -> x
     Err(e) -> return failed(e)
   val ps = made.map((_, p) -> p)

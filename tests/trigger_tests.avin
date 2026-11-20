@@ -212,9 +212,10 @@ revealing()
   assertEq(reveal(SecretV("command exit 3", [])).isErr, true)
   assertEq(reveal(SecretV("concat", [StrV("pw="), SecretV("literal", [StrV("x")]), StrV("!")])), Ok("pw=x!"))
   assertEq(reveal(SecretV("literal", [StrV("")])), Ok(""))
+  assertEq(reveal(SecretV("vault s.vault db", [])), Err("the vault `s.vault` is not open"))
   assertEq(
-    reveal(SecretV("vault s.vault db", [])),
-    Err("the secret from `vault s.vault db` cannot be read by this version of fettle")
+    reveal(SecretV("ssh-agent x", [])),
+    Err("the secret from `ssh-agent x` cannot be read by this version of fettle")
   )
   val g = graphOf([node("file", s"$dir/k", 1, [("content", SecretV("env FETTLE_NO_SUCH_VARIABLE", []))])])
   assertEq(

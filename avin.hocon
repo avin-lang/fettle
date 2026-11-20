@@ -4,3 +4,16 @@ dependencies {
   json { git = "github.com/avin-lang/json", version = "0.0.3" }
   parsing { git = "github.com/avin-lang/parsing", version = "0.6.0" }
 }
+
+c-libraries {
+  sodium {
+    pkg-config = "libsodium"
+    headers    = ["<sodium.h>"]
+    install    = "libsodium 1.0.18 or later: `brew install libsodium`; Debian's libsodium-dev"
+  }
+  libc { headers = ["<sys/stat.h>"] }
+}
+
+c-linking {
+  static = ["sodium"]
+}

@@ -2,7 +2,7 @@ module dev.avinlang.fettle.project
 
 import avin.fs
 import dev.avinlang.fettle.syntax.{AsS, BindP, CallE, CallS, Decl, Diagnostic, ForS, IfS, MatchS, NameE, Parsed, Pos, ResourceDecl, ResourceS, RoleD, RoleDecl, SourceFile, Span, Stmt, StmtArm, Template, ValS, parseSource, parseTemplate}
-import dev.avinlang.fettle.check.{check}
+import dev.avinlang.fettle.check.{Unopened, VaultNames, check}
 
 // A project: a directory of `.fettle` files and `.tmpl` templates, its subdirectories its modules.
 
@@ -79,11 +79,12 @@ fromTexts(root: string, texts: List[(string, string)]) -> Project
     templates += p.template
   Project(root, resolveRoleCalls(files.toList), templates.toList, texts, diagnostics.toVector)
 
-// Checks a loaded project: its lexical and syntax errors, then the checker's diagnostics.
-checkProject(p: Project) -> Vector[Diagnostic]
+// Checks a loaded project: its lexical and syntax errors, then the checker's diagnostics. `vaults`
+// says what a vault holds, by its path relative to the root.
+checkProject(p: Project, vaults: (string) -> VaultNames = _ -> Unopened) -> Vector[Diagnostic]
   val out = Buffer[Diagnostic]()
   out ++= p.diagnostics
-  out ++= check(p.files, f -> p.has(f), p.templates)
+  out ++= check(p.files, f -> p.has(f), p.templates, vaults)
   out.toVector
 
 // `val x = r(…)` in a block, where `r` is a role of the project, binds the group of resources the call

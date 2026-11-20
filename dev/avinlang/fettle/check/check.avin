@@ -3,6 +3,7 @@ module dev.avinlang.fettle.check
 import avin.collections.mutable.{Map as Table}
 import dev.avinlang.fettle.kinds.{KindSpec, builtinKinds, kindNamed}
 import dev.avinlang.fettle.fmt.{showExpr}
+import dev.avinlang.fettle.shell.{Bare, EscapedBare, EscapedDouble, InDouble, InSingle, contextAfter}
 import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, FnDecl, GroupDecl, HostDecl, RoleDecl, ValDecl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldS, FnD, ForE, ForS, GroupD, IfE, IfS, Import, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NamedT, NoneE, OnS, OptionalT, Param, Pattern, ResourceDecl, ResourceS, RoleD, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, Template, TextP, TupleE, TupleP, TypeExpr, UnaryE, ValD, ValS, Variant, VariantP, WildP, WithE}
 
 // The checker: every file of a project checked together, every mistake reported with its span, and
@@ -15,10 +16,23 @@ import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, AsS, BinaryE, Bind
 // ranges over a collection, that a secret reaches no string and no command's arguments, and the
 // rest of what section 3.5 of the design refuses.
 
+// What a program can learn of the names in a vault, `secret.vault`'s file: nothing without a
+// passphrase at hand, its names, or why it could not be opened.
+data VaultNames
+  Unopened
+  Names(names: Vector[string])
+  // `why` ends the sentence that begins with the vault's name: "cannot be opened: …".
+  Unreadable(why: string)
+
+// The path `secret.vault(file, …)` names from the file `from`, relative to the project: `file` is
+// read relative to the file's directory, as a template is.
+vaultPath(from: string, file: string) -> string = templatePath(from, file)
+
 // Checks `files` and `templates`, answering every diagnostic in the order found. `exists` says
-// whether a file next to the program exists, for `local(…)`.
-check(files: List[SourceFile], exists: (string) -> bool = _ -> true, templates: List[Template] = []) -> Vector[Diagnostic]
-  val c = Checker(files, exists, templates)
+// whether a file next to the program exists, for `local(…)` and `secret.vault(…)`; `vaults` what a
+// vault holds, by its path relative to the project.
+check(files: List[SourceFile], exists: (string) -> bool = _ -> true, templates: List[Template] = [], vaults: (string) -> VaultNames = _ -> Unopened) -> Vector[Diagnostic]
+  val c = Checker(files, exists, templates, vaults)
   c.run()
   c.diagnostics.toVector
 
@@ -48,7 +62,7 @@ class Module(val name: string)
 // What a statement may hold where it stands.
 data Where(role: string, inKind: string)
 
-class Checker(val files: List[SourceFile], val exists: (string) -> bool, val templates: List[Template])
+class Checker(val files: List[SourceFile], val exists: (string) -> bool, val templates: List[Template], val vaults: (string) -> VaultNames)
   val diagnostics = Buffer[Diagnostic]()
   // The path of the file being checked, for `render`.
   private var currentFile = ""
@@ -83,6 +97,27 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool, val tem
   private didYouMean(name: string, candidates: Iterable[string]) -> string = nearest(name, candidates) match
     Some(n) -> s"did you mean `$n`?"
     None -> ""
+
+  // `secret.vault(file, name)`: two strings. Written as literals, the file must exist beside the
+  // declaring file, and where the vault can be opened it must hold `name`.
+  private checkVault(args: List[Arg], env: List[Local], s: Span)
+    args match
+      [Arg("", StrE([TextP(file)], _, fs), _), Arg("", StrE([TextP(name)], _, _), _)] ->
+        val path = vaultPath(currentFile, file)
+        if !exists(path)
+          error("E0250", s"`secret.vault` reads `$path`, which does not exist", fs, "no such vault", "a vault is read relative to the file that names it; `fettle vault create` makes one")
+          return
+        vaults(path) match
+          Names(ns) if !ns.contains(name) ->
+            error("E0251", s"the vault `$path` holds no secret `$name`", s, "no such secret", didYouMean(name, ns))
+          Unreadable(why) ->
+            error("E0252", s"the vault `$path` $why", fs, "unreadable vault")
+          _ -> ()
+      [a, b] ->
+        mismatch(expr(a.value, env, Some(StrTy)), StrTy, a.value, "`secret.vault`'s file")
+        mismatch(expr(b.value, env, Some(StrTy)), StrTy, b.value, "`secret.vault`'s name")
+      _ ->
+        error("E0253", s"`secret.vault` takes a vault's file and a secret's name, and this gives ${args.length} arguments", s, "secret.vault", "write `secret.vault(\"secrets.vault\", \"name\")`")
 
   // --- Declarations -------------------------------------------------------------------------
 
@@ -687,6 +722,7 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool, val tem
     ShE(parts, _) ->
       // Each interpolation of shell text is a word of the command's arguments.
       interpolations(parts, env, true)
+      shellQuoting(parts)
       CommandTy
     NameE(n, s) -> name(n, s, env)
     FieldE(target, field, s) -> fieldOf(target, field, s, env)
@@ -778,6 +814,20 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool, val tem
       d = s"${n % 8}$d"
       n = n / 8
     d
+
+  // Refuses an interpolation of shell text that stands where no quoting can make its value land
+  // exactly: inside single quotes, or straight after a backslash.
+  private shellQuoting(parts: List[StrPart])
+    var context = Bare
+    for p in parts
+      p match
+        TextP(t) -> context = contextAfter(context, t)
+        ExprP(x) ->
+          if context == InSingle
+            error("E0244", "an interpolation cannot stand inside single quotes in shell text, where no escaping is possible", x.extent, "inside '…'", "close the single quotes before it and open them after, or interpolate it outside any quotes or inside double quotes")
+          else if context == EscapedBare || context == EscapedDouble
+            error("E0244", "an interpolation cannot follow a backslash in shell text, where the backslash would escape its quoting", x.extent, "after `\\`", "remove the backslash, or put the interpolation inside double quotes")
+          context = if context == EscapedDouble then InDouble else if context == EscapedBare then Bare else context
 
   // The text of a string with no interpolation in it.
   private literalText(parts: List[StrPart]) -> Option[string] = parts match
@@ -965,8 +1015,11 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool, val tem
             if !(t == StrTy || t == SecretTy || t == ErrTy)
               error("E0203", s"`secret.concat` joins strings and secrets, not a `${t.shown}`", a.value.extent, s"a ${t.shown}")
           SecretTy
+        "vault" ->
+          checkVault(args, env, s)
+          SecretTy
         _ ->
-          error("E0202", s"`secret` has no function `$fn`", fs, "unknown function", didYouMean(fn, ["env", "file", "command", "literal", "concat"]))
+          error("E0202", s"`secret` has no function `$fn`", fs, "unknown function", didYouMean(fn, ["env", "file", "command", "literal", "concat", "vault"]))
           ErrTy
     FieldE(target, method, ms) -> methodCall(target, method, args, ms, env)
     NameE(n, ns) ->

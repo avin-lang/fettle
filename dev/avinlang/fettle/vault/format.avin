@@ -1,0 +1,130 @@
+module dev.avinlang.fettle.vault
+
+import avin.c.{ByteBlock}
+import avin.encoding.{fromBase64, toBase64}
+
+// A vault file is text, so git sees a text file: a header line, then base64 lines of 76 characters.
+//
+//     $FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;<ops>;<mem>
+//     <base64 of salt, nonce, ciphertext and tag>
+//
+// `<ops>` and `<mem>` are Argon2id's passes and memory in bytes, so a vault written with stronger
+// limits still opens. The body is the 16-byte salt, the 24-byte nonce, then the sealed plaintext and
+// its 16-byte tag. The header line, without its line end, is the associated data, so a header changed
+// after sealing fails to open as surely as a changed body byte.
+
+// How hard Argon2id works: its passes over memory, and the memory in bytes.
+data Limits(ops: long, mem: long)
+
+// libsodium's moderate limits, which every new vault is written with.
+moderate() -> Limits = Limits(opsModerate, memModerate)
+
+// The most a header may ask of Argon2id, so a changed header cannot make opening a vault take
+// minutes or exhaust memory before its tag is checked: 16 passes and 4 GiB.
+val opsMax: long = 16
+
+val memMax: long = 4294967296
+
+// What opening a vault found wrong.
+data VaultError
+  // The text is not a vault this version reads: its header, its base64, or its length.
+  Malformed(why: string)
+  // The tag did not verify: the passphrase is wrong, or the file was changed after it was written.
+  Rejected
+
+impl VaultError
+  // The error as a sentence's end, after the vault's name.
+  shown -> string = self match
+    Malformed(why) -> s"is not a vault: $why"
+    Rejected -> "cannot be opened: the passphrase is wrong, or the file was changed"
+
+val headerPrefix: string = "$FETTLE_VAULT;1;XCHACHA20-POLY1305;ARGON2ID;"
+
+// The header line for `limits`.
+header(limits: Limits) -> string = s"$headerPrefix${limits.ops};${limits.mem}"
+
+// `text` as base64 lines of at most 76 characters, each ended by a line end.
+private wrapped(text: string) -> string
+  val out = Buffer[string]()
+  var at = 0
+  while at < text.byteLength
+    val end = if at + 76 < text.byteLength then at + 76 else text.byteLength
+    out += s"${text.slice(at, end)}\n"
+    at = end
+  out.toVector.mkString("")
+
+// `plain` sealed under a key Argon2id derives from `passphrase` with `limits` and a fresh salt, with a
+// fresh nonce: a vault file's text. `Err` where libsodium cannot derive the key.
+sealVault(plain: string, passphrase: ByteBlock, limits: Limits = moderate()) -> Result[string, string]
+  val head = header(limits)
+  val salt = randomBlock(saltBytes)
+  val nonce = randomBlock(nonceBytes)
+  val key = deriveKey(passphrase, salt, limits.ops, limits.mem) match
+    Some(k) -> k
+    None -> return Err("Argon2id could not derive a key: too little memory")
+  val bytes = plain.utf8
+  val m = blockOf(bytes)
+  bytes.fillInPlace(byte(0))
+  val sealed = aeadSeal(m, head.utf8, nonce, key)
+  wipe(m)
+  wipe(key)
+  val body = salt.copy() ++ nonce.copy() ++ sealed
+  Ok(s"$head\n${wrapped(toBase64(body.toVector))}")
+
+// A decimal number of at most 18 digits with no sign and no leading zero.
+private number(text: string) -> Option[long]
+  if text.isEmpty || text.byteLength > 18 || (text.byteLength > 1 && text.startsWith("0")) then return None
+  for c in text.chars
+    if !('0' <= c <= '9') then return None
+  Some(text.toLong())
+
+// The header's limits, where `line` is a header this version reads and its limits are within what
+// libsodium and `opsMax`/`memMax` allow.
+readHeader(line: string) -> Result[Limits, VaultError]
+  if !line.startsWith("$FETTLE_VAULT;") then return Err(Malformed("its first line is not `$FETTLE_VAULT;…`"))
+  val fields = line.split(";")
+  if fields.length != 6 then return Err(Malformed("its header has other than six fields"))
+  if fields(1) != "1" then return Err(
+    Malformed(s"its format is version `${fields(1)}`, and this fettle reads version 1")
+  )
+  if fields(2) != "XCHACHA20-POLY1305" then return Err(
+    Malformed(s"its cipher is `${fields(2)}`, not `XCHACHA20-POLY1305`")
+  )
+  if fields(3) != "ARGON2ID" then return Err(Malformed(s"its key derivation is `${fields(3)}`, not `ARGON2ID`"))
+  val ops = number(fields(4)) match
+    Some(n) if opsMin <= n <= opsMax -> n
+    _ -> return Err(Malformed(s"its Argon2id passes `${fields(4)}` are not a number from $opsMin to $opsMax"))
+  val mem = number(fields(5)) match
+    Some(n) if memMin <= n <= memMax -> n
+    _ -> return Err(Malformed(s"its Argon2id memory `${fields(5)}` is not a number of bytes from $memMin to $memMax"))
+  Ok(Limits(ops, mem))
+
+// The plaintext of the vault file `text`, opened with `passphrase`.
+openVault(text: string, passphrase: ByteBlock) -> Result[string, VaultError]
+  val lines = text.split("\n").map(l -> l.stripSuffix("\r"))
+  if lines.isEmpty || text.isEmpty then return Err(Malformed("it is empty"))
+  val head = lines(0)
+  val limits = readHeader(head)?
+  val body = lines.drop(1).mkString("")
+  val bytes = fromBase64(body) match
+    Ok(b) -> b.toArray()
+    Err(_) -> return Err(Malformed("its body is not base64"))
+  if bytes.length < saltBytes + nonceBytes + tagBytes then return Err(Malformed("it is cut short"))
+  val salt = blockOf(bytes.slice(0, saltBytes))
+  val nonce = blockOf(bytes.slice(saltBytes, saltBytes + nonceBytes))
+  val sealed = bytes.slice(saltBytes + nonceBytes, bytes.length)
+  val key = deriveKey(passphrase, salt, limits.ops, limits.mem) match
+    Some(k) -> k
+    None -> return Err(Malformed("Argon2id could not derive its key: too little memory"))
+  val opened = aeadOpen(sealed, head.utf8, nonce, key)
+  wipe(key)
+  val m = opened match
+    Some(x) -> x
+    None -> return Err(Rejected)
+  val plain = m.copy()
+  wipe(m)
+  val decoded = string.fromUtf8(plain)
+  plain.fillInPlace(byte(0))
+  decoded match
+    Ok(t) -> Ok(t)
+    Err(_) -> Err(Malformed("its plaintext is not UTF-8"))

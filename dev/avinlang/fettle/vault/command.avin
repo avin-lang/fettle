@@ -1,0 +1,226 @@
+module dev.avinlang.fettle.vault
+
+import avin.c.{ByteBlock}
+import avin.collections.mutable.{Map as Table}
+import avin.fs
+import avin.process.{Command}
+import dev.avinlang.fettle.check.{Names, Unopened, Unreadable, VaultNames}
+import dev.avinlang.fettle.report.{render}
+
+// `fettle vault create | edit | view | encrypt | decrypt | rekey <file>`, the passphrase each takes,
+// and the vaults a program reads secrets from.
+
+@c("int chmod(const char *path, mode_t mode)")
+private chmodRaw(file: string, mode: int) -> int
+
+// Where a run's passphrase comes from, in this order: a file, a command's output, the environment's
+// `FETTLE_VAULT_PASSWORD`, and otherwise `prompt`, which asks at the terminal without echo.
+data Sources(
+    file: Option[string],
+    command: Option[string],
+    env: Option[string],
+    prompt: (string) -> Result[string, string]
+)
+
+impl Sources
+  // Whether a passphrase is at hand without asking anyone.
+  unattended -> bool = file.isDefined || command.isDefined || env.isDefined
+
+// `text` without one line end at its end, `\n` or `\r\n`.
+private chomp(
+    text: string
+) -> string = if text.endsWith("\r\n") then text.stripSuffix("\r\n") else text.stripSuffix("\n")
+
+// The passphrase `src` gives, as bytes in a block. A typed one is asked twice where `confirm`, and the
+// two must agree. An empty passphrase is refused.
+passphrase(src: Sources, confirm: bool = false) -> Result[ByteBlock, string]
+  val text = src.file match
+    Some(f) -> fs.readText(f) match
+      Ok(t) -> chomp(t)
+      Err(e) -> return Err(s"the vault passphrase file: $e")
+    None -> src.command match
+      Some(c) -> Command("/bin/sh", "-c", c).output() match
+        Ok(t) -> chomp(t)
+        Err(e) -> return Err(s"the vault passphrase command `$c` failed: $e")
+      None -> src.env match
+        Some(v) -> v
+        None ->
+          val first = src.prompt("Vault passphrase: ")?
+          if confirm
+            val again = src.prompt("Vault passphrase again: ")?
+            if again != first then return Err("the two passphrases differ")
+          first
+  if text.isEmpty then return Err("the vault passphrase is empty")
+  val bytes = text.utf8
+  val block = blockOf(bytes)
+  bytes.fillInPlace(byte(0))
+  Ok(block)
+
+// The file name a vault's plaintext is edited under: the vault's own name with `.vault` taken off.
+private plainName(file: string) -> string
+  val base = file.slice(file.lastIndexOf("/") + 1, file.byteLength)
+  val stem = base.stripSuffix(".vault")
+  s"${if stem.isEmpty then "secrets" else stem}.txt"
+
+// The errors of the plaintext `text` of `file`, rendered with their excerpts; empty where it reads.
+plainErrors(
+    file: string,
+    text: string
+) -> string = readPlain(file, text).diagnostics.filter(d -> !d.warning).map(d -> render(d, text)).mkString("")
+
+// Writes `text` to `file` through a file beside it renamed over it, so `file` is never half written.
+private replace(file: string, text: string) -> Result[unit, string]
+  val tmp = s"$file.fettle-new"
+  fs.writeText(tmp, text).mapErr(e -> s"$e")?
+  fs.rename(tmp, file).mapErr(e -> s"$e")
+
+// The vault `file` sealed afresh with `pass`: a new salt and nonce.
+private store(file: string, plain: string, pass: ByteBlock, limits: Limits) -> Result[unit, string]
+  val text = sealVault(plain, pass, limits)?
+  replace(file, text)
+
+// The plaintext of the vault `file`, opened with `pass`.
+private opened(file: string, pass: ByteBlock) -> Result[string, string]
+  val text = fs.readText(file).mapErr(e -> s"$e")?
+  openVault(text, pass).mapErr(e -> s"$file ${e.shown}")
+
+// How an edit is made: the editor's command line, run by `/bin/sh` with the plaintext's path as its
+// argument, and the question asked when the edited text does not read.
+data Editing(editor: string, again: (string) -> bool)
+
+// The editor `$VISUAL` names, else `$EDITOR`, else `vi`.
+editorOf(env: (string) -> Option[string]) -> string = env("VISUAL").filter(v -> !v.isEmpty).orElse(
+  env("EDITOR").filter(v -> !v.isEmpty)
+).getOrElse("vi")
+
+// Runs the editor on `plain`'s text in a fresh `0700` directory until it reads, and answers the edited
+// text; `None` where the text does not read and the user does not edit it again. The directory and
+// the plaintext in it are removed whichever way it ends.
+private editText(name: string, plain: string, editing: Editing) -> Result[Option[string], string]
+  val dir = fs.tempDir("fettle-vault").mapErr(e -> s"$e")?
+  val result = editIn(dir.path, name, plain, editing)
+  dir.close() match
+    Ok(_) -> result
+    Err(e) -> Err(s"the plaintext could not be removed: $e")
+
+private editIn(dir: string, name: string, plain: string, editing: Editing) -> Result[Option[string], string]
+  if chmodRaw(dir, 448) != 0 then return Err(s"`$dir` could not be made private")
+  val file = s"$dir/$name"
+  fs.writeText(file, plain).mapErr(e -> s"$e")?
+  while true
+    val ran = Command(
+      "/bin/sh",
+      "-c",
+      s"${editing.editor} \"$$1\"",
+      "sh",
+      file
+    ).run().mapErr(e -> s"the editor `${editing.editor}`: $e")?
+    if !ran.isSuccess then return Err(s"the editor `${editing.editor}` failed, so nothing was saved")
+    val text = fs.readText(file).mapErr(e -> s"$e")?
+    val errors = plainErrors(name, text)
+    if errors.isEmpty then return Ok(Some(text))
+    eprint(errors)
+    if !editing.again("The secrets do not read. Edit them again? [Y/n] ") then return Ok(None)
+  Ok(None)
+
+// `fettle vault create <file>`: a new vault, its secrets written in the editor, sealed under a
+// passphrase asked twice where it is typed. An existing file is refused.
+create(file: string, src: Sources, editing: Editing, limits: Limits = moderate()) -> Result[unit, string]
+  if fs.exists(file) then return Err(s"`$file` already exists")
+  val pass = passphrase(src, true)?
+  val text = editText(plainName(file), "", editing)
+  val result = text.flatMap(t -> t match
+    Some(plain) -> store(file, plain, pass, limits)
+    None -> Err(s"`$file` was not created"))
+  wipe(pass)
+  result
+
+// `fettle vault edit <file>`: the secrets opened in the editor and sealed again with a new salt and
+// nonce. Text that does not read is offered for editing again, never saved; text left as it was
+// leaves the file as it was.
+edit(file: string, src: Sources, editing: Editing, limits: Limits = moderate()) -> Result[unit, string]
+  val pass = passphrase(src)?
+  val result = opened(file, pass).flatMap(plain -> editText(plainName(file), plain, editing).flatMap(t -> t match
+    Some(edited) if edited == plain -> Ok(())
+    Some(edited) -> store(file, edited, pass, limits)
+    None -> Err(s"`$file` was left as it was")))
+  wipe(pass)
+  result
+
+// `fettle vault view <file>`: the plaintext.
+view(file: string, src: Sources) -> Result[string, string]
+  val pass = passphrase(src)?
+  val result = opened(file, pass)
+  wipe(pass)
+  result
+
+// `fettle vault encrypt <file>`: the plaintext file sealed in place. Text that does not read, and a
+// file that is already a vault, are refused.
+encrypt(file: string, src: Sources, limits: Limits = moderate()) -> Result[unit, string]
+  val plain = fs.readText(file).mapErr(e -> s"$e")?
+  if plain.startsWith("$FETTLE_VAULT;") then return Err(s"`$file` is already a vault")
+  val errors = plainErrors(file, plain)
+  if !errors.isEmpty then return Err(s"`$file` was not sealed, since its secrets do not read:\n$errors")
+  val pass = passphrase(src, true)?
+  val result = store(file, plain, pass, limits)
+  wipe(pass)
+  result
+
+// `fettle vault decrypt <file>`: the vault replaced by its plaintext.
+decrypt(file: string, src: Sources) -> Result[unit, string]
+  val plain = view(file, src)?
+  replace(file, plain)
+
+// `fettle vault rekey <file>`: the vault opened with the passphrase `src` gives and sealed again under
+// the one `next` gives, asked twice where it is typed.
+rekey(file: string, src: Sources, next: Sources, limits: Limits = moderate()) -> Result[unit, string]
+  val plain = view(file, src)?
+  val pass = passphrase(next, true)?
+  val result = store(file, plain, pass, limits)
+  wipe(pass)
+  result
+
+// The vaults of the project at `root`, opened once each with one passphrase, for `secret.vault`. With
+// `interactive` false no one is asked, and a vault with no passphrase at hand stays unopened.
+class Vaults(val root: string, val src: Sources, val interactive: bool)
+  private val seen = Table[string, VaultNames]()
+  private val opened = Table[string, Plain]()
+  private var pass: Option[Result[ByteBlock, string]] = None
+
+  // What the vault at `file`, relative to the root, holds.
+  names(file: string) -> VaultNames
+    seen.get(file) match
+      Some(n) -> return n
+      None -> ()
+    val found = read(file)
+    seen(file) = found
+    found
+
+  // The text of the secret `name` in the vault at `file`, relative to the root, for a run that
+  // needs it. An error says why it cannot be had, never what it holds.
+  secret(file: string, name: string) -> Result[string, string] = names(file) match
+    Unopened -> Err(s"the vault `$file` needs a passphrase")
+    Unreadable(why) -> Err(s"the vault `$file` $why")
+    Names(_) -> opened.get(file).flatMap(p -> p.entries.find(e -> e.name == name)) match
+      Some(e) -> Ok(e.value)
+      None -> Err(s"the vault `$file` holds no secret `$name`")
+
+  private read(file: string) -> VaultNames
+    if !interactive && !src.unattended then return Unopened
+    if pass.isEmpty then pass = Some(passphrase(src))
+    val p = pass.get match
+      Ok(b) -> b
+      Err(e) -> return Unreadable(s"cannot be opened: $e")
+    val path = if root == "." || root.isEmpty then file else s"$root/$file"
+    val text = fs.readText(path) match
+      Ok(t) -> t
+      Err(e) -> return Unreadable(s"cannot be read: $e")
+    openVault(text, p) match
+      Ok(plain) ->
+        val parsed = readPlain(file, plain)
+        if parsed.diagnostics.exists(d -> !d.warning) then return Unreadable(
+          s"holds secrets that do not read; `fettle vault edit $file` shows where"
+        )
+        opened(file) = parsed
+        Names(parsed.names)
+      Err(e) -> Unreadable(e.shown)

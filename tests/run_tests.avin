@@ -1,9 +1,56 @@
 module tests
 
 import avin.fs
+import dev.avinlang.fettle.engine.{reveal}
+import dev.avinlang.fettle.graph.{SecretV, StrV}
+import dev.avinlang.fettle.vault.{Sources, Vaults}
 import dev.avinlang.fettle.cli.{RunArgs, apply as applyCommand, inventoryHosts, plan as planCommand, runArgs, targets}
 
 // `fettle plan` and `fettle apply` against this machine.
+
+@test("a vault's secret reaches a file through apply, opened with the passphrase file given")
+vaultApply()
+  val dir = scratchDir("cli-vault")
+  _ = fs.writeText(s"$dir/pw", "correct horse\n")
+  _ = fs.writeText(s"$dir/s.vault", sealed("db = \"vault-SECRET\"\n", "correct horse"))
+  val program = [
+    "role r()",
+    s"  file \"$dir/key\"",
+    "    content = secret.vault(\"s.vault\", \"db\")",
+    "",
+    "group here",
+    "  host me at \"localhost\"",
+    "",
+    "apply here -> r()"
+  ]
+  _ = fs.writeText(s"$dir/main.fettle", src(program))
+  assertEq(applyCommand(["--local", "--yes", "--vault-password-file", s"$dir/pw", dir]), 0)
+  assertEq(textAt(s"$dir/key"), "vault-SECRET")
+  assertEq(planCommand(["--local", "--vault-password-file", s"$dir/pw", dir]), 0)
+  _ = fs.removeDirAll(dir)
+
+@test("a vault's secret by name, and why one cannot be had")
+vaultSecrets()
+  val dir = scratchDir("vault-secret")
+  _ = fs.writeText(s"$dir/s.vault", sealed("db = \"x y\"\nother = \"\"\n", "pw"))
+  val vaults = Vaults(dir, envSource("pw"), false)
+  assertEq(vaults.secret("s.vault", "db"), Ok("x y"))
+  assertEq(vaults.secret("s.vault", "other"), Ok(""))
+  assertEq(vaults.secret("s.vault", "none"), Err("the vault `s.vault` holds no secret `none`"))
+  assertEq(vaults.secret("missing.vault", "db").isErr, true)
+  assertEq(Vaults(dir, envSource("wrong"), false).secret("s.vault", "db").isErr, true)
+  assertEq(
+    Vaults(dir, Sources(None, None, None, _ -> Err("no")), false).secret("s.vault", "db"),
+    Err("the vault `s.vault` needs a passphrase")
+  )
+  val fromVault = (f: string, n: string) -> vaults.secret(f, n)
+  assertEq(reveal(SecretV("vault s.vault db", []), fromVault), Ok("x y"))
+  assertEq(reveal(SecretV("concat", [StrV("pw="), SecretV("vault s.vault db", [])]), fromVault), Ok("pw=x y"))
+  assertEq(
+    reveal(SecretV("vault dir with space/s.vault db", []), (f, n) -> Ok(s"$f|$n")),
+    Ok("dir with space/s.vault|db")
+  )
+  _ = fs.removeDirAll(dir)
 
 @test("the arguments of plan and apply")
 runArguments()
