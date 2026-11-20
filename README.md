@@ -7,8 +7,9 @@ a plan, and changes only that.
 
 The design is [`docs/design.md`](docs/design.md). The front end exists: the lexer, the parser, the
 checker, the evaluator into the resource graph, templates and the formatter, the facts of this
-machine through a local transport, and the SSH transport with `become`, which gathers a remote
-host's facts. Nothing is changed on a host yet.
+machine through a local transport, the engine that plans and applies `file`, `directory` and
+`symlink` resources on this machine, and the SSH transport with `become`, which gathers a remote
+host's facts. Plans are not yet made over SSH.
 
 ```
 fettle check [<vault options>] [dir]
@@ -17,6 +18,8 @@ fettle graph --facts <fixture.json> --host <name> [<vault options>] [dir]
 fettle facts --local [--json]
 fettle facts <host> [--json] [--dir d] [--ssh-config f] [--known-hosts f] [--accept-new]
 fettle trust <host> [--yes] [--dir d] [--ssh-config f] [--known-hosts f]
+fettle plan --local [--host <name>] [<vault options>] [dir]
+fettle apply --local [--host <name>] [--yes] [<vault options>] [dir]
 fettle vault create|edit|view|encrypt|decrypt|rekey [<vault options>] <file>
 ```
 
@@ -72,6 +75,43 @@ The modules under the front end:
   `LocalTransport`, which runs `/bin/sh` here, `SshTransport`, and `BecomeTransport`, which runs every
   script of the transport under it as another user.
 - `hosts`: how a host named on the command line is reached, from the inventory or ad hoc.
+- `engine`: the plan, apply and verify loop over any `Transport`, the `Provider` trait each kind
+  implements, the `file`, `directory` and `symlink` providers, and the pending-trigger record.
+
+## Plan and apply
+
+`fettle plan --local` evaluates the program for one host of the inventory (`--host`, or the only
+one) against this machine's facts, probes every resource in one round trip, and prints what would
+change:
+
+```
+me (macos 15.1, arm64)
+  + directory /srv/site                             mode 0750
+  ~ file /srv/site/index.html
+      @@ -2 +2 @@
+      -<h1>Old</h1>
+      +<h1>New</h1>
+
+Plan: 1 host; 1 to create, 1 to change, 0 to remove, 0 actions.
+```
+
+Only `file`, `directory` and `symlink` have providers so far; the kinds with actions (`service`,
+`command`) come next, and until then a resource of another kind is an `x` line.
+
+`+` creates, `~` changes (a line diff for text under 256 KiB), `-` removes (`present = false`), `>`
+runs an action a trigger asked for, `x` is a resource that cannot be planned. A secret is shown as
+`(secret)`, never its content. `plan` exits 0 when nothing would change, 2 when something would, 1 on
+an error.
+
+`fettle apply --local` prints the plan, asks at a terminal (`--yes` skips the question; away from a
+terminal it is required), then applies each resource in order: probed again, changed, and probed once
+more to verify it. A resource that fails skips only what depends on it. A file's content travels on
+standard input to a temporary file beside the target, is checked by `validate` (`%s` names the staged
+file) and moved into place, so a file that does not validate never replaces a working one. Before a
+change that triggers an action, the action is written to the host's pending record
+(`/var/lib/fettle/pending`, or `~/.local/state/fettle/pending` for a non-root login), and it is
+cleared once the action has run, so an action a failed run left behind runs on the next one. `apply`
+exits 0 when everything applied and 1 when anything failed.
 
 ## Secrets in a vault
 

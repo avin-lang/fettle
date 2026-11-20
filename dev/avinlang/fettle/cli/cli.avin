@@ -16,7 +16,7 @@ import dev.avinlang.fettle.hosts.{Reach, adHoc, inInventory, reachOf as hostReac
 import dev.avinlang.fettle.transport.{ChangedKey, KnownKey, LocalTransport, NoBecome, PinnedKey, UnknownKey, connectSsh, hostKeyOf, trustHostKey}
 import dev.avinlang.ssh
 
-val usage: string = "usage: fettle check [<vault options>] [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [<vault options>] [dir]\n       fettle facts --local [--json]\n       fettle facts <host> [--json] [--dir d] [--ssh-config f] [--known-hosts f] [--accept-new]\n       fettle trust <host> [--yes] [--dir d] [--ssh-config f] [--known-hosts f]\n       fettle vault create|edit|view|encrypt|decrypt|rekey [<vault options>] <file>\n<vault options> are --vault-password-file <file> and --vault-password-command <command>; rekey also\ntakes --new-vault-password-file <file>"
+val usage: string = "usage: fettle check [<vault options>] [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [<vault options>] [dir]\n       fettle facts --local [--json]\n       fettle facts <host> [--json] [--dir d] [--ssh-config f] [--known-hosts f] [--accept-new]\n       fettle trust <host> [--yes] [--dir d] [--ssh-config f] [--known-hosts f]\n       fettle plan --local [--host <name>] [<vault options>] [dir]\n       fettle apply --local [--host <name>] [--yes] [<vault options>] [dir]\n       fettle vault create|edit|view|encrypt|decrypt|rekey [<vault options>] <file>\n<vault options> are --vault-password-file <file> and --vault-password-command <command>; rekey also\ntakes --new-vault-password-file <file>"
 
 // Runs the command `args` names, answering the exit status.
 main(args: Vector[string]) -> int
@@ -30,6 +30,8 @@ main(args: Vector[string]) -> int
     "graph" -> graph(rest)
     "facts" -> facts(rest)
     "trust" -> trust(rest)
+    "plan" -> plan(rest)
+    "apply" -> apply(rest)
     "vault" -> vaultCommand(rest)
     _ ->
       eprintln(s"fettle: unknown command `${args(0)}`\n$usage")

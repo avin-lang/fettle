@@ -184,6 +184,7 @@ rekey(file: string, src: Sources, next: Sources, limits: Limits = moderate()) ->
 // `interactive` false no one is asked, and a vault with no passphrase at hand stays unopened.
 class Vaults(val root: string, val src: Sources, val interactive: bool)
   private val seen = Table[string, VaultNames]()
+  private val opened = Table[string, Plain]()
   private var pass: Option[Result[ByteBlock, string]] = None
 
   // What the vault at `file`, relative to the root, holds.
@@ -194,6 +195,15 @@ class Vaults(val root: string, val src: Sources, val interactive: bool)
     val found = read(file)
     seen(file) = found
     found
+
+  // The text of the secret `name` in the vault at `file`, relative to the root, for a run that
+  // needs it. An error says why it cannot be had, never what it holds.
+  secret(file: string, name: string) -> Result[string, string] = names(file) match
+    Unopened -> Err(s"the vault `$file` needs a passphrase")
+    Unreadable(why) -> Err(s"the vault `$file` $why")
+    Names(_) -> opened.get(file).flatMap(p -> p.entries.find(e -> e.name == name)) match
+      Some(e) -> Ok(e.value)
+      None -> Err(s"the vault `$file` holds no secret `$name`")
 
   private read(file: string) -> VaultNames
     if !interactive && !src.unattended then return Unopened
@@ -208,7 +218,9 @@ class Vaults(val root: string, val src: Sources, val interactive: bool)
     openVault(text, p) match
       Ok(plain) ->
         val parsed = readPlain(file, plain)
-        if parsed.diagnostics.exists(d -> !d.warning) then Unreadable(
+        if parsed.diagnostics.exists(d -> !d.warning) then return Unreadable(
           s"holds secrets that do not read; `fettle vault edit $file` shows where"
-        ) else Names(parsed.names)
+        )
+        opened(file) = parsed
+        Names(parsed.names)
       Err(e) -> Unreadable(e.shown)

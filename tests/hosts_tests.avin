@@ -1,12 +1,14 @@
 module tests
 
 import avin.fs
-import dev.avinlang.fettle.hosts.{Reach, adHoc, inInventory, reachOf, secretText}
+import dev.avinlang.fettle.hosts.{Reach, adHoc, inInventory, reachOf}
 import dev.avinlang.fettle.project.{fromTexts, load}
 import dev.avinlang.fettle.transport.{Doas, NoBecome, SshTarget, Sudo, SudoPassword}
 
 // The inventory `text` as a project's files.
-inventory(text: string) -> List[dev.avinlang.fettle.syntax.SourceFile] = fromTexts(".", [("inventory.fettle", text)]).files
+inventory(text: string) -> List[
+  dev.avinlang.fettle.syntax.SourceFile
+] = fromTexts(".", [("inventory.fettle", text)]).files
 
 // How the inventory `text` reaches `host`, or its error.
 reached(text: string, host: string) -> Result[Reach, string] = reachOf(inventory(text), host)
@@ -28,23 +30,14 @@ exampleInventory()
   assertEq(db1.target.hostKey, Some("SHA256:Xo4kJtq1…"))
   assertEq(unitOf(reachOf(p.files, "nowhere")), Err("no group of the inventory holds a host `nowhere`"))
 
-@test("settings: connect all, then the group's connect, the host's connect, the group, the host, each over the one before")
+@test(
+  "settings: connect all, then the group's connect, the host's connect, the group, the host, each over the one before"
+)
 settingOrder()
   val text = [
-    "connect all",
-    "  user = \"a\"",
-    "  port = 1",
-    "connect g",
-    "  user = \"b\"",
-    "  port = 2",
-    "connect h1",
-    "  port = 3",
-    "group g",
-    "  key = \"/g\"",
-    "  host h1 at \"10.0.0.1\"",
-    "    key = \"/h1\"",
-    "  host h2 at \"10.0.0.2\"",
-    ""
+    "connect all", "  user = \"a\"", "  port = 1", "connect g", "  user = \"b\"", "  port = 2", "connect h1",
+    "  port = 3", "group g", "  key = \"/g\"", "  host h1 at \"10.0.0.1\"", "    key = \"/h1\"",
+    "  host h2 at \"10.0.0.2\"", ""
   ].mkString("\n")
   val h1 = reached(text, "h1").ok.get
   assertEq(targetText(h1.target), targetText(SshTarget("10.0.0.1", port = Some(3), user = Some("b"), keys = ["/h1"])))
@@ -62,23 +55,38 @@ becomeSettings()
   assertEq(reached("group g\n  host h at \"h.example\"\n", "h").map(r -> r.become), Ok(NoBecome))
   val home = fs.createTempDir("fettle-secret").getOrElse("")
   _ = fs.writeText(home + "/pw", "s3cret\n")
-  assertEq(reached(base + s"SudoPassword(secret.file(\"$home/pw\"))\n", "h").map(r -> r.become), Ok(SudoPassword("s3cret")))
-  assertEq(unitOf(reached(base + "SudoPassword(secret.env(\"FETTLE_TEST_UNSET_VARIABLE\"))\n", "h")).mapErr(e -> e.contains("not set")), Err(true))
-  assertEq(unitOf(reached(base + "SudoPassword(secret.literal(\"x\"))\n", "h")).mapErr(e -> e.contains("cannot be read for a connection yet")), Err(true))
+  assertEq(
+    reached(base + s"SudoPassword(secret.file(\"$home/pw\"))\n", "h").map(r -> r.become),
+    Ok(SudoPassword("s3cret"))
+  )
+  assertEq(
+    unitOf(
+      reached(base + "SudoPassword(secret.env(\"FETTLE_TEST_UNSET_VARIABLE\"))\n", "h")
+    ).mapErr(e -> e.contains("not set")),
+    Err(true)
+  )
+  assertEq(reached(base + "SudoPassword(secret.literal(\"x\"))\n", "h").map(r -> r.become), Ok(SudoPassword("x")))
   _ = fs.removeDirAll(home)
 
-@test("secrets for a connection: the environment and files; the others refused")
+@test("a connection's secrets are read as a run reads them, a vault's through the vault given")
 connectionSecrets()
-  assertEq(secretText("env HOME", "h").isOk, true)
-  assertEq(secretText("env FETTLE_TEST_UNSET_VARIABLE", "h"), Err("host `h`: the secret `secret.env(\"FETTLE_TEST_UNSET_VARIABLE\")` is not set in the environment"))
-  assertEq(secretText("file /nonexistent/fettle", "h").isErr, true)
-  assertEq(secretText("command pass show x", "h").isErr, true)
-  assertEq(secretText("concat", "h").isErr, true)
+  val base = "group g\n  host h at \"h.example\"\n    password = "
+  val pw = (text: string) -> reached(base + text + "\n", "h").map(r -> r.target.password)
+  assertEq(pw("secret.literal(\"pässwörd\")"), Ok(Some("pässwörd")))
+  assertEq(pw("secret.command(\"printf 'a b\\\\n'\")"), Ok(Some("a b")))
+  assertEq(pw("secret.env(\"FETTLE_TEST_UNSET_VARIABLE\")").mapErr(e -> e.startsWith("host `h`: ")), Err(true))
+  assertEq(pw("secret.file(\"/nonexistent/fettle\")").isErr, true)
+  assertEq(pw("secret.vault(\"s.vault\", \"pw\")").mapErr(e -> e.contains("is not open")), Err(true))
+  val opened = reachOf(inventory(base + "secret.vault(\"s.vault\", \"pw\")\n"), "h", (f, n) -> Ok(s"$n from $f"))
+  assertEq(opened.map(r -> r.target.password.map(p -> p.endsWith("pw from s.vault"))), Ok(Some(true)))
 
 @test("a port outside 1 to 65535 and an empty address are refused")
 badSettings()
   assertEq(unitOf(reached("group g\n  host h at \"x\"\n    port = 0\n", "h")), Err("host `h`: there is no TCP port 0"))
-  assertEq(unitOf(reached("group g\n  host h at \"x\"\n    port = 65536\n", "h")), Err("host `h`: there is no TCP port 65536"))
+  assertEq(
+    unitOf(reached("group g\n  host h at \"x\"\n    port = 65536\n", "h")),
+    Err("host `h`: there is no TCP port 65536")
+  )
   assertEq(reached("group g\n  host h at \"x\"\n    port = 65535\n", "h").map(r -> r.target.port), Ok(Some(65535)))
   assertEq(unitOf(reached("group g\n  host h at \"\"\n", "h")), Err("the address of host `h` is not a host name"))
 
@@ -86,7 +94,10 @@ badSettings()
 adHocTargets()
   assertEq(shownTarget(adHoc("web1")), Ok(targetText(SshTarget("web1"))))
   assertEq(shownTarget(adHoc("root@web1")), Ok(targetText(SshTarget("web1", user = Some("root")))))
-  assertEq(shownTarget(adHoc("root@web1:2222")), Ok(targetText(SshTarget("web1", port = Some(2222), user = Some("root")))))
+  assertEq(
+    shownTarget(adHoc("root@web1:2222")),
+    Ok(targetText(SshTarget("web1", port = Some(2222), user = Some("root"))))
+  )
   assertEq(shownTarget(adHoc("10.0.0.1:22")), Ok(targetText(SshTarget("10.0.0.1", port = Some(22)))))
   assertEq(shownTarget(adHoc("[::1]:2200")), Ok(targetText(SshTarget("::1", port = Some(2200)))))
   assertEq(shownTarget(adHoc("me@[fe80::1]")), Ok(targetText(SshTarget("fe80::1", user = Some("me")))))

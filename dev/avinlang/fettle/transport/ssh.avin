@@ -83,20 +83,22 @@ planFor(target: SshTarget, config: ssh.SshConfig) -> Result[SshPlan, TransportEr
   val hostKeys: ssh.HostKeys = target.hostKey match
     Some(fp) -> ssh.Pinned(fp)
     None -> if target.acceptNew then ssh.AcceptNew else h.hostKeys.getOrElse(ssh.Strict)
-  Ok(SshPlan(
-    alias = target.host,
-    hostName = h.hostName,
-    port = target.port.getOrElse(h.port),
-    user = target.user.getOrElse(h.user),
-    keys = named ++ fromConfig.filter(k -> !named.contains(k)),
-    named = named,
-    useAgent = !h.identitiesOnly,
-    proxyJump = h.proxyJump,
-    hostKeys = hostKeys,
-    knownHosts = target.knownHosts.map(k -> expandHome(k)).orElse(h.knownHosts).getOrElse(ssh.defaultKnownHosts()),
-    connectTimeout = target.connectTimeout.orElse(h.connectTimeout).getOrElse(10.seconds),
-    keepalive = h.keepalive.orElse(Some(30.seconds))
-  ))
+  Ok(
+    SshPlan(
+      alias = target.host,
+      hostName = h.hostName,
+      port = target.port.getOrElse(h.port),
+      user = target.user.getOrElse(h.user),
+      keys = named ++ fromConfig.filter(k -> !named.contains(k)),
+      named = named,
+      useAgent = !h.identitiesOnly,
+      proxyJump = h.proxyJump,
+      hostKeys = hostKeys,
+      knownHosts = target.knownHosts.map(k -> expandHome(k)).orElse(h.knownHosts).getOrElse(ssh.defaultKnownHosts()),
+      connectTimeout = target.connectTimeout.orElse(h.connectTimeout).getOrElse(10.seconds),
+      keepalive = h.keepalive.orElse(Some(30.seconds))
+    )
+  )
 
 // The private keys `ssh` tries where nothing names one.
 private defaultKeys() -> Vector[string] = process.homeDir() match
@@ -120,7 +122,10 @@ sshFailure(e: ssh.SshError, where: string, connecting: bool) -> TransportError
   e match
     ssh.UnknownHostKey(_, _, _) ->
       TransportError(s"$text; if that is its key, record it with `fettle trust`", HostKeyRefused)
-    ssh.ChangedHostKey(_, _, _) | ssh.UnexpectedHostKey(_, _) | ssh.KnownHosts(_, _) -> TransportError(text, HostKeyRefused)
+    ssh.ChangedHostKey(_, _, _) | ssh.UnexpectedHostKey(_, _) | ssh.KnownHosts(_, _) -> TransportError(
+      text,
+      HostKeyRefused
+    )
     ssh.AuthFailed(_, _) | ssh.KeyFile(_, _) | ssh.Agent(_) | ssh.NotAuthenticated -> TransportError(text, LoginRefused)
     _ -> TransportError(text, if connecting then Unreachable else Broken)
 
@@ -301,11 +306,11 @@ data HostKeyState
 // Where the host `target` names stands against its known-hosts file, found by connecting to it
 // without logging in (through a jump host, logging in).
 hostKeyOf(target: SshTarget, config: ssh.SshConfig) -> Result[HostKeyState, TransportError]
-  val plan = planFor(target with { acceptNew = false }, config)?
+  val plan = planFor(target with {acceptNew = false}, config)?
   plan.hostKeys match
     ssh.Pinned(fp) -> return Ok(PinnedKey(fp))
     _ -> ()
-  val options = optionsOf(plan with { hostKeys = ssh.Strict }, target.timeout)
+  val options = optionsOf(plan with {hostKeys = ssh.Strict}, target.timeout)
   val reached = plan.proxyJump match
     Some(jump) -> jumpConfig(plan, jump, config).flatMap(c -> c.connect(jumpAlias, options))
     None -> ssh.Session.connect(plan.hostName, plan.port, options)
@@ -325,16 +330,18 @@ hostKeyOf(target: SshTarget, config: ssh.SshConfig) -> Result[HostKeyState, Tran
 // since `fingerprint` was shown is never recorded. A host the file already lists with another key is
 // refused; its old line must be removed first (`ssh-keygen -R`).
 trustHostKey(target: SshTarget, config: ssh.SshConfig, fingerprint: string) -> Result[unit, TransportError]
-  val plan = planFor(target with { acceptNew = false, hostKey = None }, config)?
+  val plan = planFor(target with {acceptNew = false, hostKey = None}, config)?
   val dir = fs.createTempDir("fettle-trust").mapErr(e -> TransportError(s"trust: ${e.message}"))?
   defer _ = fs.removeDirAll(dir)
   val scratch = dir + "/known_hosts"
-  val fresh = plan with { hostKeys = ssh.AcceptNew, knownHosts = scratch }
+  val fresh = plan with {hostKeys = ssh.AcceptNew, knownHosts = scratch}
   val session = openSession(fresh, config, target, false)?
   val seen = session.hostKeyFingerprint().mapErr(e -> sshFailure(e, plan.where, true))
   _ = session.close()
   if seen? != fingerprint
-    return Err(TransportError(s"ssh ${plan.where}: the host key is now ${seen?}, not the $fingerprint shown", HostKeyRefused))
+    return Err(
+      TransportError(s"ssh ${plan.where}: the host key is now ${seen?}, not the $fingerprint shown", HostKeyRefused)
+    )
   val line = fs.readText(scratch).mapErr(e -> TransportError(s"trust: ${e.message}"))?
   val file = plan.knownHosts
   val slash = file.lastIndexOf('/')

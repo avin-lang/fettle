@@ -577,11 +577,12 @@ class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[s
           Unreadable(why) ->
             error("E0321", s"the vault `$file` $why", s, "unreadable vault")
           _ -> ()
-        SecretV(s"vault $file $name")
+        SecretV(s"vault $file $name", [])
       _ -> NoneV
     FieldE(NameE("secret", _), fn, _) ->
-      val what = args.map(a -> text(expr(a.value, env))).mkString(" ")
-      SecretV(if fn == "literal" || fn == "concat" then fn else s"$fn $what")
+      val given = args.map(a -> expr(a.value, env))
+      if fn == "literal" || fn == "concat" then SecretV(fn, given)
+      else SecretV(s"$fn ${given.map(v -> text(v)).mkString(" ")}", [])
     FieldE(target, method, ms) -> methodCall(expr(target, env), method, args, ms, env)
     NameE(n, ns) ->
       fns.get(n) match

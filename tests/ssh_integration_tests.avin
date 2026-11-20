@@ -10,7 +10,13 @@ import avin.process
 import avin.time.{Duration, seconds}
 import dev.avinlang.fettle.cli.{factsText, trust}
 import dev.avinlang.fettle.facts.{factsScript, gather, parseFacts}
-import dev.avinlang.fettle.transport.{BecomeRefused, BecomeTransport, Broken, ChangedKey, Doas, ExitCode, HostKeyRefused, KilledBy, KnownKey, LocalTransport, LoginRefused, PinnedKey, TransportError, Sudo, SudoPassword, SshTarget, SshTransport, Transport, UnknownKey, Unreachable, connectSsh, hostKeyOf, trustHostKey}
+
+import dev.avinlang.fettle.transport.{
+  BecomeRefused, BecomeTransport, Broken, ChangedKey, Doas, ExitCode, HostKeyRefused, KilledBy, KnownKey,
+  LocalTransport, LoginRefused, PinnedKey, TransportError, Sudo, SudoPassword, SshTarget, SshTransport, Transport,
+  UnknownKey, Unreachable, connectSsh, hostKeyOf, trustHostKey
+}
+
 import dev.avinlang.ssh
 
 private val targetsConfig = "tests/integration/.state/ssh_config"
@@ -51,7 +57,16 @@ direct(alias: string, knownHosts: string) -> Option[SshTarget]
   val h = targetConfig().flatMap(c -> c.host(alias).ok) match
     Some(x) -> x
     None -> return None
-  Some(SshTarget(h.hostName, port = Some(h.port), user = Some(h.user), keys = h.identityFiles, knownHosts = Some(knownHosts), connectTimeout = Some(5.seconds)))
+  Some(
+    SshTarget(
+      h.hostName,
+      port = Some(h.port),
+      user = Some(h.user),
+      keys = h.identityFiles,
+      knownHosts = Some(knownHosts),
+      connectTimeout = Some(5.seconds)
+    )
+  )
 
 // An empty configuration, so that a `direct` target takes nothing from `~/.ssh/config`.
 emptyConfig() -> ssh.SshConfig = ssh.SshConfig.parse("").ok.get
@@ -69,7 +84,9 @@ outOf(t: Transport, script: string, input: Array[byte] = Array.empty[byte]()) ->
   Err(e) -> s"error: ${e.reason}"
 
 // The keys of `key=value` lines, in order.
-factKeys(text: string) -> Vector[string] = text.split('\n').filter(l -> l.contains("=")).map(l -> l.slice(0, l.indexOf('=')))
+factKeys(text: string) -> Vector[string] = text.split('\n').filter(l -> l.contains("=")).map(
+  l -> l.slice(0, l.indexOf('='))
+)
 
 // The facts of `alias` gathered over SSH, checked against what the image is, and the keys of the
 // script's raw output against the hand-written fixture `fixture`.
@@ -107,7 +124,10 @@ factsCommandOverSsh()
   if targetConfig().isEmpty then return
   factsText(["fettle-debian12", "--ssh-config", targetsConfig, "--json"]) match
     Ok(text) -> assertEq(text.contains("\"distro\": \"Debian\"") || text.contains("\"distro\":\"Debian\""), true)
-    Err((_, message)) -> skippedFor("fettle-debian12", TransportError(message, if message.contains("cannot connect") then Unreachable else Broken))
+    Err((_, message)) -> skippedFor(
+      "fettle-debian12",
+      TransportError(message, if message.contains("cannot connect") then Unreachable else Broken)
+    )
 
 @test("ssh target: fettle facts of an inventory host, its connection settings from the inventory")
 factsOfInventoryHost()
@@ -129,7 +149,10 @@ factsOfInventoryHost()
     Ok(text) -> assertEq(text.contains("Alpine"), true)
     Err((_, message)) ->
       _ = fs.removeDirAll(dir)
-      skippedFor("fettle-alpine3", TransportError(message, if message.contains("cannot connect") then Unreachable else Broken))
+      skippedFor(
+        "fettle-alpine3",
+        TransportError(message, if message.contains("cannot connect") then Unreachable else Broken)
+      )
       return
   // The key was recorded by --accept-new, so a strict run now passes.
   assertEq(factsText(["box", "--dir", dir, "--ssh-config", "/dev/null", "--known-hosts", kh]).isOk, true)
@@ -199,8 +222,14 @@ becomeSudo()
   val r = root.run("echo out; echo err >&2; exit 5", Array.empty[byte]()).ok.get
   assertEq((r.out, r.err, r.ending), ("out\n", "err\n", ExitCode(5)))
   assertEq(root.run("kill -9 $$", Array.empty[byte]()).map(x -> x.ending), Ok(KilledBy(9)))
-  assertEq(outOf(root, "cat >/root/fettle-upload && cat /root/fettle-upload && rm /root/fettle-upload", "root-owned\n".utf8), "root-owned\n")
-  assertEq(BecomeTransport(t, Sudo, "no-such-user").run("true", Array.empty[byte]()).map(x -> x.out).mapErr(e -> e.failure), Err(BecomeRefused))
+  assertEq(
+    outOf(root, "cat >/root/fettle-upload && cat /root/fettle-upload && rm /root/fettle-upload", "root-owned\n".utf8),
+    "root-owned\n"
+  )
+  assertEq(
+    BecomeTransport(t, Sudo, "no-such-user").run("true", Array.empty[byte]()).map(x -> x.out).mapErr(e -> e.failure),
+    Err(BecomeRefused)
+  )
   _ = t.close()
 
 @test("ssh target: become Sudo where sudo wants a password is refused, saying so")
@@ -258,7 +287,10 @@ private makeUser(t: Transport, name: string, sudoers: string, password: string) 
     s"printf '%s\\n' \"$$1\" >/etc/sudoers.d/$name",
     s"chmod 0440 /etc/sudoers.d/$name"
   ].mkString("\n")
-  root.run(s"set -e\nset -- '${sudoers.replace("'", "'\\''")}'\n$script", Array.empty[byte]()).map(r -> r.succeeded).getOrElse(false)
+  root.run(
+    s"set -e\nset -- '${sudoers.replace("'", "'\\''")}'\n$script",
+    Array.empty[byte]()
+  ).map(r -> r.succeeded).getOrElse(false)
 
 @test("ssh target: a script that closes its output early still reports how it ended")
 closesOutputEarly()
@@ -266,7 +298,10 @@ closesOutputEarly()
     Some(x) -> x
     None -> return
   assertEq(t.run("exec >/dev/null 2>&1\nsleep 1\nexit 3", Array.empty[byte]()).map(x -> x.ending), Ok(ExitCode(3)))
-  assertEq(t.run("echo before\nexec >/dev/null 2>&1\nsleep 1\nkill -9 $$", Array.empty[byte]()).map(x -> (x.out, x.ending)), Ok(("before\n", KilledBy(9))))
+  assertEq(
+    t.run("echo before\nexec >/dev/null 2>&1\nsleep 1\nkill -9 $$", Array.empty[byte]()).map(x -> (x.out, x.ending)),
+    Ok(("before\n", KilledBy(9)))
+  )
   _ = t.close()
 
 @test("ssh target: a script on a terminal: a tty, its error output merged, a line of input, its exit code")
@@ -275,9 +310,15 @@ onTerminal()
     Some(x) -> x
     None -> return
   val r = t.runOnTerminal("tty; echo err >&2; IFS= read -r line; printf '<%s>' \"$line\"; exit 6", "a line\n".utf8)
-  assertEq(r.map(x -> (x.ending, x.out.startsWith("/dev/pts/"), x.out.contains("err"), x.out.contains("<a line>"))), Ok((ExitCode(6), true, true, true)))
+  assertEq(
+    r.map(x -> (x.ending, x.out.startsWith("/dev/pts/"), x.out.contains("err"), x.out.contains("<a line>"))),
+    Ok((ExitCode(6), true, true, true))
+  )
   assertEq(r.map(x -> x.stderr.length), Ok(0))
-  assertEq(t.runOnTerminal("echo plain", Array.empty[byte]()).map(x -> (x.ending, x.out.trim)), Ok((ExitCode(0), "plain")))
+  assertEq(
+    t.runOnTerminal("echo plain", Array.empty[byte]()).map(x -> (x.ending, x.out.trim)),
+    Ok((ExitCode(0), "plain"))
+  )
   // The session goes on running plain scripts after one on a terminal.
   assertEq(outOf(t, "echo after"), "after\n")
   _ = t.close()
@@ -288,8 +329,14 @@ private requirettyUsers() -> Option[ssh.SshConfig]
   val admin = onTarget("fettle-ubuntu2404") match
     Some(x) -> x
     None -> return None
-  assertEq(makeUser(admin, "fettletty", "Defaults:fettletty requiretty\nfettletty ALL=(ALL) NOPASSWD:ALL", "fettletty"), true)
-  assertEq(makeUser(admin, "fettlettypw", "Defaults:fettlettypw requiretty\nfettlettypw ALL=(ALL) ALL", "fettlettypw"), true)
+  assertEq(
+    makeUser(admin, "fettletty", "Defaults:fettletty requiretty\nfettletty ALL=(ALL) NOPASSWD:ALL", "fettletty"),
+    true
+  )
+  assertEq(
+    makeUser(admin, "fettlettypw", "Defaults:fettlettypw requiretty\nfettlettypw ALL=(ALL) ALL", "fettlettypw"),
+    true
+  )
   _ = admin.close()
   targetConfig()
 
@@ -310,17 +357,26 @@ requirettyRefused()
 // TODO: un-ignore when avin-lang/ssh's `Exec.wait` waits for the server's exit status and close
 // before sending its own close: on a terminal, output ends as soon as nothing holds the terminal open,
 // and the early close hangs the terminal up, killing the command with `HUP`.
-@test("ssh target: a script on a terminal that closes its output early still reports how it ended", ignore: "avin-lang/ssh Exec.wait closes the channel at the end of output, before the exit status")
+@test(
+    "ssh target: a script on a terminal that closes its output early still reports how it ended",
+    ignore: "avin-lang/ssh Exec.wait closes the channel at the end of output, before the exit status"
+)
 terminalClosesOutputEarly()
   val t = onTarget("fettle-debian12") match
     Some(x) -> x
     None -> return
-  assertEq(t.runOnTerminal("exec >/dev/null 2>&1 </dev/null\nsleep 1\nexit 3", Array.empty[byte]()).map(x -> x.ending), Ok(ExitCode(3)))
+  assertEq(
+    t.runOnTerminal("exec >/dev/null 2>&1 </dev/null\nsleep 1\nexit 3", Array.empty[byte]()).map(x -> x.ending),
+    Ok(ExitCode(3))
+  )
   _ = t.close()
 
 // TODO: un-ignore when avin-lang/ssh's `Exec.wait` waits for the server's exit status and close
 // before sending its own close (see `terminalClosesOutputEarly`): sudo's command is killed by `HUP`.
-@test("ssh target: sudo with requiretty runs through a terminal, input and output through files", ignore: "avin-lang/ssh Exec.wait closes the channel at the end of output, before the exit status")
+@test(
+    "ssh target: sudo with requiretty runs through a terminal, input and output through files",
+    ignore: "avin-lang/ssh Exec.wait closes the channel at the end of output, before the exit status"
+)
 requirettyOverSsh()
   val config = requirettyUsers() match
     Some(c) -> c
@@ -397,15 +453,18 @@ unknownAndTrusted()
   _ = t.close()
   // Pinned: the right fingerprint connects with no known-hosts file at all, a wrong one is refused.
   val (dir2, empty) = scratchKnownHosts()
-  val pinned = target with { knownHosts = Some(empty), hostKey = Some(fp) }
+  val pinned = target with {knownHosts = Some(empty), hostKey = Some(fp)}
   assertEq(hostKeyOf(pinned, config).mapErr(e -> e.reason), Ok(PinnedKey(fp)))
   val p = connectSsh(pinned, config).ok.get
   _ = p.close()
-  assertEq(connectSsh(target with { hostKey = Some("SHA256:AAAA") }, config).map(_ -> ()).mapErr(e -> e.failure), Err(HostKeyRefused))
+  assertEq(
+    connectSsh(target with {hostKey = Some("SHA256:AAAA")}, config).map(_ -> ()).mapErr(e -> e.failure),
+    Err(HostKeyRefused)
+  )
   // --accept-new records it during a run.
-  val t2 = connectSsh(target with { knownHosts = Some(empty), acceptNew = true }, config).ok.get
+  val t2 = connectSsh(target with {knownHosts = Some(empty), acceptNew = true}, config).ok.get
   _ = t2.close()
-  assertEq(hostKeyOf(target with { knownHosts = Some(empty) }, config).mapErr(e -> e.reason), Ok(KnownKey(fp)))
+  assertEq(hostKeyOf(target with {knownHosts = Some(empty)}, config).mapErr(e -> e.reason), Ok(KnownKey(fp)))
   _ = fs.removeDirAll(dir)
   _ = fs.removeDirAll(dir2)
 
@@ -420,7 +479,10 @@ trustCommand()
   if trust(args) == 1 && fs.readText(kh) == Ok("")
     skipping("alpine3 does not answer")
     return
-  assertEq(fs.readText(kh).map(t -> t.contains("ssh-ed25519") || t.contains("ecdsa") || t.contains("ssh-rsa")), Ok(true))
+  assertEq(
+    fs.readText(kh).map(t -> t.contains("ssh-ed25519") || t.contains("ecdsa") || t.contains("ssh-rsa")),
+    Ok(true)
+  )
   assertEq(trust(args), 0)
   assertEq(trust([name, "--bogus"]), 2)
   assertEq(trust([]), 2)
@@ -435,7 +497,7 @@ changedKey()
   val alpine = direct("fettle-alpine3", kh).get
   val config = emptyConfig()
   // alpine3's key, recorded under debian12's address and port.
-  val t = connectSsh(alpine with { acceptNew = true }, config) match
+  val t = connectSsh(alpine with {acceptNew = true}, config) match
     Ok(x) -> x
     Err(e) ->
       skippedFor("fettle-alpine3", e)
@@ -450,11 +512,23 @@ changedKey()
       assertEq(e.reason.contains("is not the one known"), true)
     Ok(_) -> assertEq("connected", "refused")
   // --accept-new never takes a changed key.
-  assertEq(connectSsh(debian with { acceptNew = true }, config).map(_ -> ()).mapErr(e -> e.failure), Err(HostKeyRefused))
+  assertEq(connectSsh(debian with {acceptNew = true}, config).map(_ -> ()).mapErr(e -> e.failure), Err(HostKeyRefused))
   hostKeyOf(debian, config) match
     Ok(ChangedKey(_, file)) -> assertEq(file, kh)
     _ -> assertEq("another state", "changed")
-  assertEq(trust([s"${debian.user.get}@${debian.host}:${debian.port.get}", "--yes", "--ssh-config", "/dev/null", "--known-hosts", kh]), 1)
+  assertEq(
+    trust(
+      [
+        s"${debian.user.get}@${debian.host}:${debian.port.get}",
+        "--yes",
+        "--ssh-config",
+        "/dev/null",
+        "--known-hosts",
+        kh
+      ]
+    ),
+    1
+  )
   assertEq(fs.readText(kh), Ok(swapped))
   _ = fs.removeDirAll(dir)
 
@@ -465,8 +539,8 @@ authFailures()
     Some(x) -> x
     None -> return
   val config = emptyConfig()
-  val known = target with { acceptNew = true }
-  connectSsh(known with { user = Some("no-such-user") }, config) match
+  val known = target with {acceptNew = true}
+  connectSsh(known with {user = Some("no-such-user")}, config) match
     Err(e) ->
       if e.failure == Unreachable
         skippedFor("fettle-debian12", e)
@@ -477,8 +551,11 @@ authFailures()
     Ok(_) -> assertEq("logged in", "refused")
   val keygen = LocalTransport().run(s"ssh-keygen -q -t ed25519 -N '' -f '$dir/other'", Array.empty[byte]())
   assertEq(keygen.map(r -> r.succeeded), Ok(true))
-  assertEq(connectSsh(known with { keys = [dir + "/other"] }, config).map(_ -> ()).mapErr(e -> e.failure), Err(LoginRefused))
-  connectSsh(known with { keys = [dir + "/missing"] }, config) match
+  assertEq(
+    connectSsh(known with {keys = [dir + "/other"]}, config).map(_ -> ()).mapErr(e -> e.failure),
+    Err(LoginRefused)
+  )
+  connectSsh(known with {keys = [dir + "/missing"]}, config) match
     Err(e) ->
       assertEq(e.failure, LoginRefused)
       assertEq(e.reason.contains("no such file"), true)
@@ -493,24 +570,42 @@ passphraseKeys()
     None -> return
   val config = emptyConfig()
   val local = LocalTransport()
-  assertEq(local.run(s"ssh-keygen -q -t ed25519 -N 'pass phrase' -C fettle-passphrase -f '$dir/locked'", Array.empty[byte]()).map(r -> r.succeeded), Ok(true))
-  val admin = connectSsh(target with { acceptNew = true }, config) match
+  assertEq(
+    local.run(
+      s"ssh-keygen -q -t ed25519 -N 'pass phrase' -C fettle-passphrase -f '$dir/locked'",
+      Array.empty[byte]()
+    ).map(r -> r.succeeded),
+    Ok(true)
+  )
+  val admin = connectSsh(target with {acceptNew = true}, config) match
     Ok(x) -> x
     Err(e) ->
       skippedFor("fettle-alpine3", e)
       return
   val pub = fs.readBytes(dir + "/locked.pub").getOrElse(Array.empty[byte]())
-  assertEq(admin.run("grep -q fettle-passphrase ~/.ssh/authorized_keys || cat >>~/.ssh/authorized_keys", pub).map(r -> r.succeeded), Ok(true))
+  assertEq(
+    admin.run(
+      "grep -q fettle-passphrase ~/.ssh/authorized_keys || cat >>~/.ssh/authorized_keys",
+      pub
+    ).map(r -> r.succeeded),
+    Ok(true)
+  )
   _ = admin.close()
-  val locked = target with { keys = [dir + "/locked"] }
+  val locked = target with {keys = [dir + "/locked"]}
   val asked = Buffer[string]()
   val ask: (string) -> Option[string] = k ->
     asked += k
     Some("pass phrase")
-  connectSsh(locked with { passphrase = ask }, config) match
+  connectSsh(locked with {passphrase = ask}, config) match
     Ok(t) -> _ = t.close()
     Err(e) -> assertEq(e.reason, "logged in")
   assertEq(asked.toVector, [dir + "/locked"])
-  assertEq(connectSsh(locked with { passphrase = _ -> Some("wrong") }, config).map(_ -> ()).mapErr(e -> e.failure), Err(LoginRefused))
-  assertEq(connectSsh(locked with { passphrase = _ -> None }, config).map(_ -> ()).mapErr(e -> e.failure), Err(LoginRefused))
+  assertEq(
+    connectSsh(locked with {passphrase = _ -> Some("wrong")}, config).map(_ -> ()).mapErr(e -> e.failure),
+    Err(LoginRefused)
+  )
+  assertEq(
+    connectSsh(locked with {passphrase = _ -> None}, config).map(_ -> ()).mapErr(e -> e.failure),
+    Err(LoginRefused)
+  )
   _ = fs.removeDirAll(dir)

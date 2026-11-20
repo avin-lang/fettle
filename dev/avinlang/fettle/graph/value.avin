@@ -19,8 +19,10 @@ data Value
   RecordV(typeName: string, fields: List[(string, Value)])
   // A variant of an algebraic type, with its fields in declaration order.
   VariantV(typeName: string, variant: string, fields: List[(string, Value)])
-  // A secret: where its bytes come from (`env HOME`, `file ~/k`, `literal`), never the bytes.
-  SecretV(source: string)
+  // A secret: where its bytes come from (`env HOME`, `file ~/k`, `command pass show x`), read only
+  // when a run needs them; or, for `literal` and `concat`, the values it is made of (strings and
+  // other secrets) in `parts`. It is never printed.
+  SecretV(source: string, parts: List[Value])
   // A command: the program, its arguments, and its standard input if any.
   CommandV(program: string, args: List[Value], stdin: Option[Value], shell: bool)
   // A reference to a resource of the graph.
@@ -50,7 +52,7 @@ impl Value
     NoneV -> "none"
     RecordV(t, fs) -> s"$t(${fs.map((k, v) -> s"$k = ${v.shown}").mkString(", ")})"
     VariantV(_, v, fs) -> if fs.isEmpty then v else s"$v(${fs.map((_, x) -> x.shown).mkString(", ")})"
-    SecretV(_) -> "(secret)"
+    SecretV(_, _) -> "(secret)"
     CommandV(p, args, stdin, sh) ->
       val head = if sh then "sh" else "cmd"
       val input = stdin match
@@ -62,7 +64,7 @@ impl Value
 
   // Whether the value holds a secret anywhere in it.
   holdsSecret -> bool = self match
-    SecretV(_) -> true
+    SecretV(_, _) -> true
     ListV(items) -> items.exists(v -> v.holdsSecret)
     SetV(items) -> items.exists(v -> v.holdsSecret)
     MapV(es) -> es.exists((k, v) -> k.holdsSecret || v.holdsSecret)

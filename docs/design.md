@@ -1058,48 +1058,97 @@ user.
 32. **`Facts` and `readFacts` live in the `facts` module**, beside the script and its parser, and the
     evaluator imports them. `fettle facts` without `--local` is refused until the ssh transport
     exists. Review with the user.
-33. **A `TransportError` has a kind** (`failure`, defaulting to `Broken`): `Unreachable`,
+33. **A provider** is a trait per kind: `probes` (commands, run in the batch), `delta` (what the
+    probe found against what is declared: `InSync`, `Create`, `Modify` with field changes, `Remove`,
+    the plan line's text, and the current and declared text where a diff is shown), `steps` (scripts
+    with their standard input) and `action`. Verify is the probe and the delta again. The engine
+    takes a lookup from kind to provider, so later kinds slot in, and a kind with no provider is a
+    resource that cannot be planned, not a failed run. Review with the user.
+34. **One round trip plans a host**: the pending record is read as the first command of the batch
+    probe. Apply re-probes a resource just before changing it only once something on the host has
+    changed in this run, so an apply with nothing to do costs no more round trips. Review with the
+    user.
+35. **Files**: the probe reads type, mode, owner and group with GNU `stat -c` falling back to BSD
+    `stat -f`, and the hash with whichever of `sha256sum`, `shasum -a 256` and `openssl dgst` the
+    host has, chosen by the probe itself rather than from facts; a symlink's target travels in
+    hexadecimal. A write is `mktemp` beside the target, content on standard input, `chown`, `chmod`,
+    `validate`, `mv -f`. A mode not declared keeps the replaced file's, else 0644 (directories 0755);
+    an owner not declared keeps the replaced file's when the login is root. A change of only mode or
+    owner is made in place. A file with neither `content` nor `source` manages its attributes only
+    and is created empty. A file replaces a symlink at its path; a directory or special file there
+    is an error. Review with the user.
+36. **`validate` names the staged file as `%s`** (anywhere in a word, or in shell text, where it is
+    passed as `"$1"`), and one without `%s` cannot be planned, as with Ansible; it takes no standard
+    input. Review with the user.
+37. **A symlink is set with `ln -sfn`**, which is not atomic but is the portable way to replace a
+    link to a directory; it replaces a regular file, refuses a directory. Removal (`present = false`)
+    is `rm -f` for a file or symlink and `rmdir` for a directory, so a directory that is not empty
+    fails rather than being emptied; `directory.purge` cannot be planned yet. Review with the user.
+38. **The plan's lines**: a resource's text starts at column 48 past its mark (two spaces after a
+    longer name); a title that is empty or holds a control character is shown quoted. A new file shows
+    `N lines` for text under 256 KiB, its size otherwise, `(secret)` for a secret; a changed one a
+    line diff with no context lines (as 2.7 prints it), or `content changed (a -> b)` past 256 KiB or
+    for binary content, or `content: (secret) changed`. A resource that cannot be planned is an `x`
+    line, and makes `plan` exit 1. Review with the user.
+39. **Pending actions run where their resource stands in the order**, after its sources and before
+    what depends on it, together with any trigger of this run so the action runs once; a run with
+    pending actions still begins with them in the plan. The record is JSON lines of kind, title and
+    action; one whose resource is no longer declared is shown, dropped and cleared. A change whose
+    steps fail leaves its actions pending, since it may have changed part of the file. A failed
+    action fails its resource, so its dependents are skipped. Review with the user.
+40. **Secrets are read when a run needs them**, not at evaluation: a `SecretV` keeps its source
+    (`env NAME`, `file PATH`, `command TEXT`, `vault FILE NAME`), or for `literal` and `concat` the
+    values it is made of. `secret.command` drops one final line end; `secret.file` expands `~/`.
+    A step that carries a secret never shows its error output, and no secret's hash is put in a
+    probe. Review with the user.
+41. **`plan --local` and `apply --local`** apply to this machine the program of the inventory host
+    `--host` names, or of the inventory's only host. `apply` away from a terminal without `--yes`
+    refuses rather than proceeding; `apply` exits 0 when everything applied and 1 when anything
+    failed. Each changed, failed or skipped resource and each action prints a progress line
+    `host  changed  kind title` as it ends. Review with the user.
+42. **A `TransportError` has a kind** (`failure`, defaulting to `Broken`): `Unreachable`,
     `HostKeyRefused`, `LoginRefused`, `BecomeRefused`, `Broken`, so a report can tell "the network is
     wrong" (5.5) from the rest. The trait is unchanged. Review with the user.
-34. **The SSH transport runs `exec /bin/sh -c '<script>'`**: `exec` makes the shell the session's own
+43. **The SSH transport runs `exec /bin/sh -c '<script>'`**: `exec` makes the shell the session's own
     process, so a signal that kills the script is reported as one (`KilledBy`), Linux's numbering
     for SSH's signal names. The script travels as one argument, so a single script is bounded by the
     host's argument length (128 KiB on Linux); files go over standard input. A script reads its input
     before printing more than the channel window (2 MiB). Review with the user.
-35. **Host keys**: strict by default; `hostKey` pins and reads no file; `--accept-new` and the SSH
+44. **Host keys**: strict by default; `hostKey` pins and reads no file; `--accept-new` and the SSH
     configuration's `StrictHostKeyChecking accept-new` record a new key and never take a changed
     one. `fettle trust` records a key by connecting again with accept-new into a scratch file and
     copying that line only when its fingerprint is the one shown, so a key that changed in between is
     never recorded; a changed key is refused, its old line to be removed with `ssh-keygen -R`. Review
     with the user.
-36. **Logging in**: agent, then the inventory's `key`, then the configuration's identity files (or
+45. **Logging in**: agent, then the inventory's `key`, then the configuration's identity files (or
     ssh's defaults), a key under a passphrase retried with `FETTLE_SSH_PASSPHRASE` or one typed at the
     terminal, then `password`. A named key that is missing is the error reported. Through a
     `ProxyJump` the session is made by `SshConfig.connect` over a generated configuration (the
     target's block, then the user's configuration for every other host), whose login is the agent and
     key files without a passphrase. Review with the user.
-37. **`become` wraps the script**: `sudo -n` / `sudo -k -S -p ''` / `doas -n`, `-u <user> -- /bin/sh -c`
+46. **`become` wraps the script**: `sudo -n` / `sudo -k -S -p ''` / `doas -n`, `-u <user> -- /bin/sh -c`
     an inner script that prints a random marker line on standard error and then `exec`s the script,
     passed as `$1`. No marker means the script never ran: that is a `BecomeRefused` error naming why
     (password wanted, password refused, terminal wanted, not permitted, not installed), never a
     `Ran`. `-k` makes sudo read the password every time, so the password line can never reach the
     script. `SudoPassword` checks the password once, alone, before the first script, so a wrong one
     never has the script's input read as further attempts. Review with the user.
-38. **`requiretty`**: once sudo says it wants a terminal, every later run of that `BecomeTransport`
+47. **`requiretty`**: once sudo says it wants a terminal, every later run of that `BecomeTransport`
     goes through a pseudo-terminal for sudo alone, the script's input, output and error output through
     files in a private `mktemp -d` directory made and removed by plain runs, the password over the
     terminal (echo off), never a file. It does not work yet over SSH: avin-lang/ssh's `Exec.wait`
     closes the channel when output ends, which on a terminal is before the command exits, and the
     hang-up kills it (tests ignored until fixed). Review with the user.
-39. **`fettle facts <host>`** takes an inventory host (from `--dir`, the current directory by
+48. **`fettle facts <host>`** takes an inventory host (from `--dir`, the current directory by
     default) when the inventory holds one by that name, else `[user@]host[:port]`, `host` possibly an
     SSH configuration alias. Facts are gathered as the login user. A host with no `become` runs as
-    the login user (10, decision 14). Connection secrets are read from `secret.env` and `secret.file`
-    only; `secret.vault` for a connection waits for the run that opens the vault. Review with the user.
-40. **libssh2 is linked statically** (`c-linking { static = ["ssh/libssh2"] }`), with OpenSSL's
-    `libssl`/`libcrypto` archives; `libz` and the system's libraries stay dynamic. Review with the
-    user.
-41. **Integration tests skip, not fail, without targets**; `tests/integration/run.zsh` brings the
+    the login user (10, decision 14). A connection's secrets are read by the engine's `reveal` (40),
+    one final line end dropped; `facts` and `trust` take no vault options yet, so a `secret.vault`
+    password is refused there. Review with the user.
+49. **libssh2 is linked statically** (`c-linking { static = ["sodium", "ssh/libssh2"] }`, one block,
+    since a second `c-linking` replaces the first's list), with OpenSSL's `libssl`/`libcrypto`
+    archives; `libz` and the system's libraries stay dynamic. Review with the user.
+50. **Integration tests skip, not fail, without targets**; `tests/integration/run.zsh` brings the
     targets up and runs only them with `FETTLE_INTEGRATION=required`, under which a skip fails. Tests
     that need special users or tools (requiretty users, doas) set them up themselves on the target.
     Review with the user.

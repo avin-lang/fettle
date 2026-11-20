@@ -1,0 +1,107 @@
+module tests
+
+import avin.fs
+
+import dev.avinlang.fettle.engine.{
+  Applied, Context, Delta, Engine, InSync, Outcome, Plan, Probed, Provider, Step, builtinProvider, reveal
+}
+
+import dev.avinlang.fettle.graph.{Graph, GraphBuilder, Node}
+import dev.avinlang.fettle.report.{showPlan}
+import dev.avinlang.fettle.shell.{Command, Output, quote}
+import dev.avinlang.fettle.transport.{LocalTransport, Ran, Transport, TransportError}
+
+// What the engine's tests share: a scratch directory per test, an engine that runs on this machine
+// as the unprivileged user with its pending record inside that directory, and graphs built directly.
+
+// A fresh scratch directory for one test.
+scratchDir(name: string) -> string = fs.createTempDir(s"fettle-$name").getOrElse("/nonexistent")
+
+// `word` as one shell word.
+sq(word: string) -> string = quote(word).getOrElse("''")
+
+// A context that reads local files and secrets as `fettle apply` does.
+testContext() -> Context = Context(false, f -> fs.readBytes(f).mapErr(e -> e.message), v -> reveal(v))
+
+// The pending record of an engine made by `engineIn(dir)`.
+pendingIn(dir: string) -> string = s"$dir/state/pending"
+
+// An engine on this machine through `t`, its pending record in `dir`.
+engineIn(
+    dir: string,
+    t: Transport = LocalTransport(),
+    providers: (string) -> Option[Provider] = k -> builtinProvider(k),
+    listener: (Node, string, Outcome) -> unit = (_, _, _) -> ()
+) -> Engine = Engine(t, testContext(), pendingIn(dir), providers, listener)
+
+// A graph of `nodes`, declared in that order.
+graphOf(nodes: Vector[Node]) -> Graph
+  val b = GraphBuilder()
+  for n in nodes
+    b.add(n)
+  b.finish()
+
+// The plan of `g` through `e`; a host that cannot be probed fails the test.
+planWith(e: Engine, g: Graph) -> Plan = e.plan("web1", facts("debian12"), g) match
+  Ok(p) -> p
+  Err(m) -> fail(s"the plan failed: $m")
+
+// `g` planned and applied through `e`.
+applyWith(e: Engine, g: Graph) -> Applied = e.apply(planWith(e, g))
+
+// `text` with each run of spaces written as one.
+squeeze(text: string) -> string
+  var t = text
+  while t.contains("  ")
+    t = t.replace("  ", " ")
+  t
+
+// The plan text of `p`, `dir` written `/T` and runs of spaces squeezed, so it does not depend on
+// where the scratch directory is.
+planText(p: Plan, dir: string) -> string = squeeze(showPlan([p]).replace(dir, "/T"))
+
+// What `script` prints when `/bin/sh` runs it here.
+shOut(script: string) -> string = local(script).out
+
+// The permission bits of `file`, in octal as `stat` prints them (`640`).
+modeOf(file: string) -> string = shOut(s"stat -c %a ${sq(file)} 2>/dev/null || stat -f %Lp ${sq(file)}").trim
+
+// Where the symlink `link` points.
+linkOf(file: string) -> string = shOut(s"readlink ${sq(file)}").trim
+
+// The text of `file`, or `(missing)`.
+textAt(file: string) -> string = fs.readText(file).getOrElse("(missing)")
+
+// The entries of `dir`, hidden ones included, sorted, one a line.
+entriesOf(dir: string) -> string = shOut(s"ls -A ${sq(dir)} | sort")
+
+// A transport that runs here and keeps every script and input it was given.
+class Recording(): Transport
+  val scripts = Buffer[string]()
+  val inputs = Buffer[Array[byte]]()
+  private val inner = LocalTransport()
+
+  override run(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+    scripts += script
+    inputs += input
+    inner.run(script, input)
+
+  override close() -> Result[unit, TransportError] = inner.close()
+
+// A kind whose resources are always as declared, and whose actions each append `<title> <action>`
+// to `log`, failing (status 3) while the file `flag` exists.
+class LoggingProvider(val log: string, val flag: string): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string] = Ok([])
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string] =
+    Ok(Delta(InSync, "", [], None, Probed([], None)))
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string] = Ok([])
+
+  override action(node: Node, action: string, ctx: Context) -> Result[Vector[Step], string]
+    val script = s"if [ -e ${sq(flag)} ]; then echo flagged >&2; exit 3; fi\nprintf '%s\\n' ${sq(s"${node.id.title} $action")} >>${sq(log)}\n"
+    Ok([Step(script, Array.empty[byte](), s"log ${node.id.title} $action")])
+
+// The built-in providers, and `LoggingProvider(log, flag)` for the kind `command`.
+withLogging(log: string, flag: string) -> (string) -> Option[Provider] =
+  k -> if k == "command" then Some(LoggingProvider(log, flag)) else builtinProvider(k)

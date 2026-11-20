@@ -1,0 +1,172 @@
+module tests
+
+import dev.avinlang.fettle.engine.{
+  ActionRun, Applied, Changed, Delta, DirectoryProvider, Entry, Failed, Failure, FieldChange, FileProvider, InSync,
+  Modify, Plan, PlannedAction, Probed, Unchanged, modeText, sizeShown
+}
+
+import dev.avinlang.fettle.facts.{Facts}
+import dev.avinlang.fettle.graph.{GraphBuilder, ModeV, Node, ResourceId, SecretV, StrV}
+import dev.avinlang.fettle.report.{diffHunks, hostHeading, planStatus, progressLine, showApplied, showPlan}
+import dev.avinlang.fettle.shell.{Output}
+
+// The plan and apply text, checked whole against the design's section 2.7.
+
+// What a provider gives for a resource whose path does not exist.
+absentDelta(n: Node) -> Delta
+  val absent = [Output(0, "type=absent\n", "")]
+  val r = if n.id.kind == "directory" then DirectoryProvider().delta(
+    n,
+    absent,
+    testContext()
+  ) else FileProvider().delta(n, absent, testContext())
+  r match
+    Ok(d) -> d
+    Err(e) -> fail(e)
+
+// Web1 of section 2.7: a directory and two files to create.
+web1Plan() -> Plan
+  val nodes = [
+    node("directory", "/etc/nginx/tls", 1, [("mode", ModeV(0o750)), ("owner", StrV("root")), ("group", StrV("root"))]),
+    node(
+      "file",
+      "/etc/nginx/tls/a.example.com.key",
+      2,
+      [("content", SecretV("literal", [StrV("KEY")])), ("mode", ModeV(0o600))]
+    ),
+    node("file", "/etc/nginx/conf.d/a.example.com.conf", 3, [("content", StrV("1\n2\n3\n4\n5\n6\n7\n8\n9\n"))])
+  ]
+  val g = graphOf(nodes)
+  Plan("web1", facts("debian12"), g, g.nodes.map(n -> Entry(n, Ok(absentDelta(n)))), [], [], [])
+
+// Web2 of section 2.7: a changed configuration and the reload it triggers.
+web2Plan() -> Plan
+  val b = GraphBuilder()
+  val conf = b.add(node("file", "/etc/nginx/conf.d/b.example.com.conf", 1))
+  val nginx = b.add(node("service", "nginx", 2))
+  b.trigger([conf], nginx, "reload", at(2))
+  val g = b.finish()
+  val before = "server {\n  listen 80 ssl;\n  server_name b.example.com;\n}\n"
+  val after = "server {\n  listen 443 ssl;\n  server_name b.example.com;\n}\n"
+  val none = Probed([], None)
+  val entries = [
+    Entry(g.nodes(0), Ok(Delta(Modify, "", [FieldChange("content", "", "")], Some((before, after)), none))),
+    Entry(g.nodes(1), Ok(Delta(InSync, "", [], None, none)))
+  ]
+  Plan("web2", facts("debian12"), g, entries, [PlannedAction(1, "reload", [0], false)], [], [])
+
+@test("the plan text of section 2.7, column for column")
+sectionTwoSevenPlan()
+  assertEq(
+    showPlan([web1Plan(), web2Plan()]),
+    src(
+      [
+        "web1 (debian 12, amd64)",
+        "  + directory /etc/nginx/tls                        mode 0750, owner root:root",
+        "  + file /etc/nginx/tls/a.example.com.key           (secret)",
+        "  + file /etc/nginx/conf.d/a.example.com.conf       9 lines",
+        "web2 (debian 12, amd64)",
+        "  ~ file /etc/nginx/conf.d/b.example.com.conf",
+        "      @@ -2 +2 @@",
+        "      -  listen 80 ssl;",
+        "      +  listen 443 ssl;",
+        "  > service nginx                                   reload (file /etc/nginx/conf.d/b.example.com.conf)",
+        "",
+        "Plan: 2 hosts; 3 to create, 1 to change, 0 to remove, 1 action."
+      ]
+    )
+  )
+  assertEq(planStatus([web1Plan(), web2Plan()]), 2)
+
+@test("the apply text of section 2.7")
+sectionTwoSevenApply()
+  val one = web1Plan()
+  val two = web2Plan()
+  val results = [
+    Applied(one, [Changed, Changed, Changed], []),
+    Applied(two, [Changed, Unchanged], [ActionRun(1, "reload", Changed)])
+  ]
+  assertEq(
+    showApplied(results, 41),
+    src(
+      [
+        "web1  [3/3]  changed 3",
+        "web2  [2/2]  changed 2",
+        "web1, web2: done in 41 s. 5 changed, 0 failed, 0 unreachable."
+      ]
+    )
+  )
+
+@test("a failure in the apply text: where it is declared, the command, how it ended, its last error lines")
+applyFailureText()
+  val one = web1Plan()
+  val f = Failure(
+    "a command failed",
+    "write '/etc/nginx/conf.d/a.example.com.conf'",
+    "exited with status 1",
+    ["first", "second"]
+  )
+  val results = [Applied(one, [Changed, Changed, Failed(f)], [])]
+  assertEq(
+    showApplied(results, 2),
+    src(
+      [
+        "web1  [3/3]  changed 2, failed 1",
+        "web1: done in 2 s. 2 changed, 1 failed, 0 unreachable.",
+        "",
+        "failed: web1 file /etc/nginx/conf.d/a.example.com.conf (g.fettle:3:1): a command failed",
+        "  command: write '/etc/nginx/conf.d/a.example.com.conf'",
+        "  exited with status 1",
+        "  | first",
+        "  | second"
+      ]
+    )
+  )
+
+@test("a plan with nothing to do, its status, and a long title")
+quietPlans()
+  val g = graphOf([node("file", "/a", 1)])
+  val calm = Plan(
+    "db1",
+    facts("alpine320"),
+    g,
+    [Entry(g.nodes(0), Ok(Delta(InSync, "", [], None, Probed([], None))))],
+    [],
+    [],
+    []
+  )
+  assertEq(
+    showPlan([calm]),
+    "db1 (alpine 3.20, arm64)\n  no changes\n\nPlan: 1 host; 0 to create, 0 to change, 0 to remove, 0 actions.\n"
+  )
+  assertEq(planStatus([calm]), 0)
+  val longTitle = "/srv/www/a-very-long-directory-name/with/a/longer/file-name.conf"
+  val lg = graphOf([node("file", longTitle, 1, [("content", StrV("x\n"))])])
+  val p = Plan("db1", facts("alpine320"), lg, [Entry(lg.nodes(0), Ok(absentDelta(lg.nodes(0))))], [], [], [])
+  assertEq(showPlan([p]).lines(1), s"  + file $longTitle  1 line")
+  val broken = Plan("db1", facts("alpine320"), lg, [Entry(lg.nodes(0), Err("why"))], [], [], [])
+  assertEq(planStatus([calm, broken]), 1)
+
+@test("sizes, modes, host headings, diff hunks and progress lines")
+textPieces()
+  assertEq(
+    [0, 1, 1023, 1024, 1843, 1048575, 1048576].map(n -> sizeShown(long(n))),
+    ["0 B", "1 B", "1023 B", "1.0 KiB", "1.8 KiB", "1024.0 KiB", "1.0 MiB"]
+  )
+  assertEq(sizeShown(long(5) * 1073741824), "5.0 GiB")
+  assertEq(sizeShown(long(3) * 1073741824 * 1048576), "3072.0 TiB")
+  assertEq([0o0, 0o644, 0o4755, 0o7777].map(m -> modeText(long(m))), ["0000", "0644", "4755", "7777"])
+  assertEq(hostHeading("h", Facts("Linux", "Arch", "", "Arm64", "Systemd", 1, 1, "h", "u", false)), "h (arch, arm64)")
+  assertEq(diffHunks("a\n", "a\n"), [])
+  assertEq(diffHunks("", "x\n"), ["@@ -0,0 +1 @@", "+x"])
+  assertEq(
+    diffHunks("a\nb", "a\nc"),
+    ["@@ -2 +2 @@", "-b", "\\ No newline at end of file", "+c", "\\ No newline at end of file"]
+  )
+  assertEq(progressLine("web1", node("file", "/x", 1), "", Changed), "web1  changed file /x\n")
+  assertEq(progressLine("web1", node("file", "/x", 1), "", Unchanged), "")
+  assertEq(progressLine("web1", node("file", "/x", 1), "", Failed(Failure("r", "", "", []))), "web1  failed  file /x\n")
+  assertEq(
+    progressLine("web1", node("service", "nginx", 1), "reload", Changed),
+    "web1  changed service nginx: reload\n"
+  )

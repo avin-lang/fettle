@@ -83,7 +83,9 @@ refusalOf(ran: Ran) -> Refusal
   if says(["incorrect password", "sorry, try again", "no password was provided"]) then return WrongPassword
   if says(["password is required", "terminal is required", "authentication required", "authorization required"])
     return NeedsPassword
-  if says(["not in the sudoers", "not allowed to", "may not run sudo", "operation not permitted"]) then return NotPermitted
+  if says(
+    ["not in the sudoers", "not allowed to", "may not run sudo", "operation not permitted"]
+  ) then return NotPermitted
   if ran.ending == ExitCode(127) then NotInstalled else OtherRefusal
 
 // The message for a refusal of `how`, `ran` being what the host printed.
