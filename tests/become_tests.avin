@@ -1,0 +1,251 @@
+module tests
+
+import avin.fs
+import dev.avinlang.fettle.transport.{BecomeRefused, BecomeTransport, Broken, Doas, ExitCode, KilledBy, LocalTransport, NeedsPassword, NeedsTerminal, NoBecome, NotInstalled, NotPermitted, OtherRefusal, Ran, Sudo, SudoPassword, Transport, TransportError, WrongPassword, afterMarker, becomeScript, indexOfBytes, passwordLine, refusalOf, refusalText}
+
+// A transport that records what it was asked to run and answers `answer` for it.
+class Recording(val answer: (string, Array[byte]) -> Ran): Transport
+  val scripts = Buffer[string]()
+  val inputs = Buffer[Array[byte]]()
+
+  override run(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+    scripts += script
+    inputs += input
+    Ok(answer(script, input))
+
+  override close() -> Result[unit, TransportError] = Ok(())
+
+// This machine, with a fake `sudo` and `doas` first on the path: each takes the options fettle gives
+// it, reads a password line where `-S` says (byte by byte, as sudo does) and refuses any but `right`,
+// says it wants a tty where `FETTLE_FAKE_REQUIRETTY` is set and `FETTLE_FAKE_TTY` is not, then runs
+// the command.
+fakeSudo(requiretty: bool = false) -> FakeSudo
+  val dir = fs.createTempDir("fettle-fake-sudo").getOrElse("")
+  val fake = [
+    "#!/bin/sh",
+    "s=0",
+    "while [ $# -gt 0 ]; do",
+    "  case $1 in",
+    "    -S) s=1 ;;",
+    "    -p|-u) shift ;;",
+    "    --) shift; break ;;",
+    "  esac",
+    "  shift",
+    "done",
+    "if [ -n \"${FETTLE_FAKE_REQUIRETTY:-}\" ] && [ -z \"${FETTLE_FAKE_TTY:-}\" ]; then",
+    "  echo 'sudo: sorry, you must have a tty to run sudo' >&2",
+    "  exit 1",
+    "fi",
+    "if [ $s = 1 ]; then",
+    "  IFS= read -r pw || pw=",
+    "  if [ \"$pw\" != right ]; then",
+    "    echo 'Sorry, try again.' >&2",
+    "    echo 'sudo: 1 incorrect password attempt' >&2",
+    "    exit 1",
+    "  fi",
+    "fi",
+    "exec \"$@\"",
+    ""
+  ].mkString("\n")
+  _ = fs.writeText(dir + "/sudo", fake)
+  _ = fs.writeText(dir + "/doas", fake)
+  _ = LocalTransport().run(s"chmod +x '$dir/sudo' '$dir/doas'", Array.empty[byte]())
+  FakeSudo(dir, requiretty)
+
+class FakeSudo(val dir: string, val requiretty: bool): Transport
+  private val local = LocalTransport()
+
+  private prefix -> string = s"PATH='$dir':$$PATH\nexport PATH\n${if requiretty then "FETTLE_FAKE_REQUIRETTY=1\nexport FETTLE_FAKE_REQUIRETTY\n" else ""}"
+
+  override run(script: string, input: Array[byte]) -> Result[Ran, TransportError] = local.run(prefix + script, input)
+
+  // `script` run as if on a terminal: sudo's tty check passes.
+  onTerminal(script: string, input: Array[byte]) -> Result[Ran, TransportError] =
+    local.run(prefix + "FETTLE_FAKE_TTY=1\nexport FETTLE_FAKE_TTY\n" + script, input)
+
+  override close() -> Result[unit, TransportError]
+    _ = fs.removeDirAll(dir)
+    Ok(())
+
+// A Ran that exited with `code` and printed `err` on standard error.
+failedWith(code: int, err: string) -> Ran = Ran(ExitCode(code), Array.empty[byte](), err.utf8)
+
+// One MiB of every byte value, over and over, a line end and NUL among them.
+mebibyte() -> Array[byte] = Array.tabulate(1048576, i -> byte((i * 7 + i / 256) % 256))
+
+@test("become scripts: sudo -n, sudo -k -S -p '', doas -n, each with the user, the marker and the script quoted once")
+becomeScripts()
+  assertEq(
+    becomeScript(Sudo, "root", "id -un", "M"),
+    Ok("exec sudo -n -u root -- /bin/sh -c 'printf '\\''%s\\n'\\'' M >&2\nexec /bin/sh -c \"$1\"' fettle 'id -un'")
+  )
+  assertEq(becomeScript(SudoPassword("pw"), "root", "true", "M").map(s -> s.startsWith("exec sudo -k -S -p '' -u root -- /bin/sh -c ")), Ok(true))
+  assertEq(becomeScript(Doas, "postgres", "true", "M").map(s -> s.startsWith("exec doas -n -u postgres -- ")), Ok(true))
+  assertEq(becomeScript(NoBecome, "root", "echo hi", "M"), Ok("echo hi"))
+  assertEq(becomeScript(Sudo, "o'brien", "true", "M").map(s -> s.contains("-u 'o'\\''brien'")), Ok(true))
+  assertEq(becomeScript(Sudo, "root", "a\u{0}b", "M").isErr, true)
+  assertEq(becomeScript(Sudo, "", "true", "M").map(s -> s.contains("-u '' --")), Ok(true))
+
+@test("the sudo password line: the password and a line end; a line end or NUL in it is refused")
+passwordLines()
+  assertEq(passwordLine("s3cret").map(b -> b.toVector), Ok("s3cret\n".utf8.toVector))
+  assertEq(passwordLine("").map(b -> b.toVector), Ok("\n".utf8.toVector))
+  assertEq(passwordLine("pässwörd 日本").map(b -> string.fromUtf8Lossy(b)), Ok("pässwörd 日本\n"))
+  assertEq(passwordLine("a\nb").isErr, true)
+  assertEq(passwordLine("a\rb").isErr, true)
+  assertEq(passwordLine("a\u{0}b").isErr, true)
+
+@test("finding bytes in bytes")
+findingBytes()
+  assertEq(indexOfBytes("abcabc".utf8, "ca".utf8), 2)
+  assertEq(indexOfBytes("abc".utf8, "abc".utf8), 0)
+  assertEq(indexOfBytes("abc".utf8, "abcd".utf8), -1)
+  assertEq(indexOfBytes("".utf8, "a".utf8), -1)
+  assertEq(indexOfBytes("aaa".utf8, "".utf8), 0)
+  assertEq(indexOfBytes("abab".utf8, "ab".utf8, 1), 2)
+
+@test("the marker line splits sudo's own error output from the script's")
+markers()
+  val ran = Ran(ExitCode(3), "out".utf8, "sudo: lecture\nMARK\nscript err\n".utf8)
+  val after = afterMarker(ran, "MARK").get
+  assertEq(after.err, "sudo: lecture\nscript err\n")
+  assertEq(after.out, "out")
+  assertEq(after.ending, ExitCode(3))
+  assertEq(afterMarker(Ran(ExitCode(0), Array.empty[byte](), "MARK\n".utf8), "MARK").map(r -> r.stderr.length), Some(0))
+  assertEq(afterMarker(failedWith(1, "sudo: a password is required\n"), "MARK"), None)
+  // Only the first marker line is taken: a script that prints it again keeps its own.
+  assertEq(afterMarker(Ran(ExitCode(0), Array.empty[byte](), "MARK\nMARK\n".utf8), "MARK").map(r -> r.err), Some("MARK\n"))
+  // A marker without its line end is not the marker.
+  assertEq(afterMarker(failedWith(1, "MARK"), "MARK"), None)
+
+@test("why sudo or doas refused, read from what it printed")
+refusals()
+  assertEq(refusalOf(failedWith(1, "sudo: a password is required\n")), NeedsPassword)
+  assertEq(refusalOf(failedWith(1, "sudo: a terminal is required to read the password; either use the -S option\n")), NeedsPassword)
+  assertEq(refusalOf(failedWith(1, "doas: Authorization required\n")), NeedsPassword)
+  assertEq(refusalOf(failedWith(1, "doas: Authentication required\n")), NeedsPassword)
+  assertEq(refusalOf(failedWith(1, "Sorry, try again.\nsudo: 1 incorrect password attempt\n")), WrongPassword)
+  assertEq(refusalOf(failedWith(1, "sudo: no password was provided\n")), WrongPassword)
+  assertEq(refusalOf(failedWith(1, "sudo: sorry, you must have a tty to run sudo\n")), NeedsTerminal)
+  assertEq(refusalOf(failedWith(1, "bob is not in the sudoers file.  This incident will be reported.\n")), NotPermitted)
+  assertEq(refusalOf(failedWith(1, "Sorry, user bob is not allowed to execute '/bin/sh' as root on web1.\n")), NotPermitted)
+  assertEq(refusalOf(failedWith(1, "Sorry, user bob may not run sudo on web1.\n")), NotPermitted)
+  assertEq(refusalOf(failedWith(1, "doas: Operation not permitted\n")), NotPermitted)
+  assertEq(refusalOf(failedWith(127, "sh: 1: exec: sudo: not found\n")), NotInstalled)
+  assertEq(refusalOf(failedWith(1, "")), OtherRefusal)
+  assertEq(refusalOf(Ran(KilledBy(9), Array.empty[byte](), Array.empty[byte]())), OtherRefusal)
+
+@test("a refusal's message says what to do about it")
+refusalMessages()
+  val r = failedWith(1, "sudo: a password is required\n")
+  assertEq(refusalText(Sudo, "root", NeedsPassword, r).contains("use `SudoPassword(…)`"), true)
+  assertEq(refusalText(Doas, "root", NeedsPassword, r).contains("nopass"), true)
+  assertEq(refusalText(SudoPassword("x"), "root", WrongPassword, r).startsWith("sudo refused the password"), true)
+  assertEq(refusalText(Sudo, "root", NeedsTerminal, r).contains("requiretty"), true)
+  assertEq(refusalText(Doas, "pg", NotPermitted, r), "the login user may not use doas to run as `pg` (sudo: a password is required)")
+  assertEq(refusalText(Sudo, "root", NotInstalled, failedWith(127, "")), "sudo is not installed on the host (exited with status 127)")
+  assertEq(refusalText(SudoPassword("hunter2"), "root", WrongPassword, r).contains("hunter2"), false)
+
+@test("NoBecome passes the script and its input through untouched")
+noBecome()
+  val rec = Recording((_, _) -> Ran(ExitCode(0), "x".utf8, Array.empty[byte]()))
+  val t = BecomeTransport(rec, NoBecome)
+  assertEq(t.run("echo hi", "in".utf8).map(r -> r.out), Ok("x"))
+  assertEq(rec.scripts.toVector, ["echo hi"])
+  assertEq(rec.inputs(0).toVector, "in".utf8.toVector)
+
+@test("a refused sudo is a BecomeRefused error, never a Ran")
+refusedSudo()
+  val rec = Recording((_, _) -> failedWith(1, "sudo: a password is required\n"))
+  val t = BecomeTransport(rec, Sudo)
+  t.run("true", Array.empty[byte]()) match
+    Err(e) ->
+      assertEq(e.failure, BecomeRefused)
+      assertEq(e.reason.startsWith("become root: sudo needs a password"), true)
+    Ok(_) -> assertEq("ran", "refused")
+
+@test("SudoPassword checks the password once, alone, before the first script")
+passwordChecked()
+  val rec = Recording((s, _) ->
+    val marker = s.split(' ').find(w -> w.startsWith("fettle-become-")).getOrElse("")
+    Ran(ExitCode(0), Array.empty[byte](), s"$marker\n".utf8))
+  val t = BecomeTransport(rec, SudoPassword("right"), "root")
+  assertEq(t.run("echo one", "data".utf8).isOk, true)
+  assertEq(t.run("echo two", Array.empty[byte]()).isOk, true)
+  assertEq(rec.scripts.length, 3)
+  assertEq(rec.scripts(0).endsWith("fettle :"), true)
+  assertEq(rec.inputs(0).toVector, "right\n".utf8.toVector)
+  assertEq(rec.inputs(1).toVector, "right\ndata".utf8.toVector)
+  assertEq(rec.inputs(2).toVector, "right\n".utf8.toVector)
+
+@test("become through a fake sudo: the script runs, its output and exit code come back, the marker is gone")
+throughFakeSudo()
+  val fake = fakeSudo()
+  val t = BecomeTransport(fake, Sudo)
+  val r = t.run("echo out; echo err >&2; exit 4", Array.empty[byte]()).ok.get
+  assertEq(r.out, "out\n")
+  assertEq(r.err, "err\n")
+  assertEq(r.ending, ExitCode(4))
+  assertEq(t.run("kill -9 $$", Array.empty[byte]()).map(x -> x.ending), Ok(KilledBy(9)))
+  assertEq(t.run("printf '%s' \"$0\"", Array.empty[byte]()).map(x -> x.out), Ok("/bin/sh"))
+  assertEq(t.run("printf 'é 日本 🙂'", Array.empty[byte]()).map(x -> x.out), Ok("é 日本 🙂"))
+  assertEq(t.run("echo 'it'\\''s'", Array.empty[byte]()).map(x -> x.out), Ok("it's\n"))
+  assertEq(BecomeTransport(fake, Doas).run("echo doas", Array.empty[byte]()).map(x -> x.out), Ok("doas\n"))
+  _ = fake.close()
+
+@test("become through a fake sudo with a password: the script's input arrives intact after the password line")
+fakeSudoPassword()
+  val fake = fakeSudo()
+  val t = BecomeTransport(fake, SudoPassword("right"))
+  assertEq(t.run("cat", allBytes()).map(r -> r.stdout.toVector), Ok(allBytes().toVector))
+  assertEq(t.run("cat", Array.empty[byte]()).map(r -> r.stdout.length), Ok(0))
+  assertEq(t.run("cat", "right\nsecond line\n".utf8).map(r -> r.out), Ok("right\nsecond line\n"))
+  assertEq(t.run("cat", "\n\n".utf8).map(r -> r.out), Ok("\n\n"))
+  val big = mebibyte()
+  assertEq(t.run("cat", big).map(r -> r.stdout.toVector == big.toVector), Ok(true))
+  _ = fake.close()
+
+@test("a wrong password is refused before the script's input goes anywhere")
+fakeWrongPassword()
+  val fake = fakeSudo()
+  val t = BecomeTransport(fake, SudoPassword("wrong"))
+  t.run("cat >/dev/null", "payload".utf8) match
+    Err(e) ->
+      assertEq(e.failure, BecomeRefused)
+      assertEq(e.reason.startsWith("become root: sudo refused the password"), true)
+    Ok(_) -> assertEq("ran", "refused")
+  _ = fake.close()
+
+@test("requiretty: refused without a terminal, run through files with one")
+fakeRequiretty()
+  val fake = fakeSudo(true)
+  BecomeTransport(fake, Sudo).run("true", Array.empty[byte]()) match
+    Err(e) -> assertEq(e.reason.contains("requiretty"), true)
+    Ok(_) -> assertEq("ran", "refused")
+  val t = BecomeTransport(fake, Sudo, "root", Some((s, i) -> fake.onTerminal(s, i)))
+  val r = t.run("cat; echo err >&2; exit 3", allBytes()).ok.get
+  assertEq(r.stdout.toVector, allBytes().toVector)
+  assertEq(r.err, "err\n")
+  assertEq(r.ending, ExitCode(3))
+  // Once sudo has asked for a terminal, every later run goes through one.
+  assertEq(t.run("printf x", Array.empty[byte]()).map(x -> x.out), Ok("x"))
+  val pw = BecomeTransport(fake, SudoPassword("right"), "root", Some((s, i) -> fake.onTerminal(s, i)))
+  assertEq(pw.run("cat", mebibyte()).map(x -> x.stdout.length), Ok(1048576))
+  assertEq(pw.run("cat", "right\n".utf8).map(x -> x.out), Ok("right\n"))
+  val wrong = BecomeTransport(fake, SudoPassword("wrong"), "root", Some((s, i) -> fake.onTerminal(s, i)))
+  assertEq(wrong.run("true", Array.empty[byte]()).map(x -> x.out).mapErr(e -> e.reason.contains("refused the password")), Err(true))
+  _ = fake.close()
+
+@test("a sudo that is not there is reported as not installed")
+noSudo()
+  val t = BecomeTransport(LocalTransport(), Sudo)
+  val r = LocalTransport().run("PATH=/nonexistent exec sudo -n true", Array.empty[byte]())
+  assertEq(r.map(x -> refusalOf(x)), Ok(NotInstalled))
+  assertEq(t.close(), Ok(()))
+
+@test("closing a become transport closes the one under it")
+becomeCloses()
+  val inner = LocalTransport()
+  val t = BecomeTransport(inner, Sudo)
+  assertEq(t.close(), Ok(()))
+  assertEq(inner.run("true", Array.empty[byte]()).map(r -> r.succeeded), Err(TransportError("local: the transport is closed", Broken)))

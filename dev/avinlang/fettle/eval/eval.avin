@@ -3,7 +3,7 @@ module dev.avinlang.fettle.eval
 import avin.collections.mutable.{Map as Table}
 import dev.avinlang.fettle.facts.{Facts}
 import dev.avinlang.fettle.shell.{quote}
-import dev.avinlang.fettle.check.{builtinData, templatePath}
+import dev.avinlang.fettle.check.{builtinData, connectionFields, templatePath}
 import dev.avinlang.fettle.kinds.{KindSpec, PathT, kindNamed}
 import dev.avinlang.fettle.graph.{After, BoolV, CommandV, DurationV, Graph, GraphBuilder, GroupV, IntV, ListV, MapV, ModeV, Node, NoneV, PathV, RecordV, RefV, Reference, ResourceId, SecretV, SetV, SizeV, StrV, Value, VariantV}
 import dev.avinlang.fettle.syntax.{AfterS, AltP, ApplyD, Arg, Arm, AsS, BinaryE, BindP, BoolE, CallE, CallS, ConnectD, DataD, DataDecl, Decl, Diagnostic, DurationE, Expr, ExprP, FailE, FieldE, FieldInit, FieldS, FnD, FnDecl, ForE, ForS, GroupD, GroupDecl, HostDecl, IfE, IfS, IntE, LambdaE, ListE, LitP, MapE, MatchE, MatchS, ModeE, NameE, NoneE, OnS, Param, Pattern, Pos, ResourceDecl, ResourceS, RoleD, RoleDecl, ShE, SizeE, SourceFile, Span, Stmt, StrE, StrPart, Template, TextP, TupleE, TupleP, UnaryE, ValD, ValDecl, ValS, Variant, VariantP, WildP, WithE}
@@ -47,19 +47,7 @@ class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[s
   private var made = Buffer[ResourceId]()
 
   run(hostName: string, facts: Facts) -> Evaluated
-    for d in builtinData
-      register(d)
-    for f in files
-      for d in f.decls
-        d match
-          DataD(x) -> register(x)
-          FnD(x) -> fns(x.name) = x
-          RoleD(x) -> roles(x.name) = x
-          ValD(x) -> x.pattern match
-            BindP(n, _) -> vals(n) = x
-            _ -> ()
-          GroupD(x) -> groups += x
-          _ -> ()
+    declare()
     val memberships = groups.filter(g -> g.hosts.exists(h -> h.name == hostName))
     if memberships.isEmpty
       diagnostics += Diagnostic("E0310", s"no group of the inventory holds a host `$hostName`", files.headOption.map(f -> spanOfFile(f)).getOrElse(Span("", builtinPos, builtinPos)), "unknown host")
@@ -83,6 +71,67 @@ class Evaluator(val files: List[SourceFile], val readLocal: (string) -> Option[s
     val g = builder.finish()
     diagnostics ++= builder.diagnostics
     Evaluated(g, diagnostics.toVector)
+
+  // The connection settings of the host `hostName` and its address: `connect all`, then the `connect`
+  // of each group holding it, then its own `connect`, then the settings of its groups, then its own,
+  // a later one over an earlier. Only connection settings are answered, never a group's vars. An
+  // error when no group holds the host, or a setting's value does not evaluate.
+  connectionOf(hostName: string) -> Result[(Value, List[(string, Value)]), string]
+    declare()
+    val memberships = groups.filter(g -> g.hosts.exists(h -> h.name == hostName))
+    if memberships.isEmpty then return Err(s"no group of the inventory holds a host `$hostName`")
+    val names = memberships.map(g -> g.name)
+    val given = Table[string, Value]()
+    val order = Buffer[string]()
+    val settings = Buffer[Stmt]()
+    for f in files
+      for d in f.decls
+        d match
+          ConnectD(c) if c.target == "all" -> settings ++= c.fields
+          _ -> ()
+    for f in files
+      for d in f.decls
+        d match
+          ConnectD(c) if names.contains(c.target) -> settings ++= c.fields
+          _ -> ()
+    for f in files
+      for d in f.decls
+        d match
+          ConnectD(c) if c.target == hostName -> settings ++= c.fields
+          _ -> ()
+    for g in memberships
+      settings ++= g.fields
+    val h = memberships(0).hosts.find(x -> x.name == hostName).get
+    settings ++= h.fields
+    for s in settings
+      s match
+        FieldS(n, v, _) if connectionFields.exists((x, _) -> x == n) ->
+          if !given.contains(n) then order += n
+          given(n) = expr(v, [])
+        _ -> ()
+    val address = expr(h.address, [])
+    if diagnostics.nonEmpty then return Err(diagnostics(0).message)
+    Ok((address, order.toList.map(n -> (n, given(n)))))
+
+  // Reads the declarations of every file once: data types, functions, roles, values and groups.
+  private declare()
+    if declared then return
+    declared = true
+    for d in builtinData
+      register(d)
+    for f in files
+      for d in f.decls
+        d match
+          DataD(x) -> register(x)
+          FnD(x) -> fns(x.name) = x
+          RoleD(x) -> roles(x.name) = x
+          ValD(x) -> x.pattern match
+            BindP(n, _) -> vals(n) = x
+            _ -> ()
+          GroupD(x) -> groups += x
+          _ -> ()
+
+  private var declared = false
 
   private val builtinPos = Pos(0, 1, 1)
 

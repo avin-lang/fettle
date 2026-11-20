@@ -3,4 +3,9 @@ package { name = "fettle", version = "0.0.1", description = "Agentless configura
 dependencies {
   json { git = "github.com/avin-lang/json", version = "0.0.3" }
   parsing { git = "github.com/avin-lang/parsing", version = "0.6.0" }
+  ssh { git = "github.com/avin-lang/ssh", version = "0.0.1" }
+}
+
+c-linking {
+  static = ["ssh/libssh2"]
 }

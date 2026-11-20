@@ -1,0 +1,95 @@
+module dev.avinlang.fettle.hosts
+
+// How fettle reaches a host named on the command line: a host of the inventory, its `connect`
+// settings evaluated, or one named ad hoc as `[user@]host[:port]`.
+import avin.fs
+import avin.process
+import dev.avinlang.fettle.eval.{Evaluator}
+import dev.avinlang.fettle.graph.{IntV, SecretV, StrV, Value, VariantV}
+import dev.avinlang.fettle.syntax.{GroupD, SourceFile}
+import dev.avinlang.fettle.transport.{Become, Doas, NoBecome, SshTarget, Sudo, SudoPassword, expandHome}
+
+// A host as fettle reaches it: where and how it logs in, and how its scripts become root.
+data Reach(target: SshTarget, become: Become)
+
+// Whether a group of `files` holds a host named `name`.
+inInventory(files: List[SourceFile], name: string) -> bool =
+  files.exists(f -> f.decls.exists(d -> d match
+    GroupD(g) -> g.hosts.exists(h -> h.name == name)
+    _ -> false))
+
+// How to reach the inventory host `name`: its address, and its settings (`user`, `port`, `key`,
+// `password`, `hostKey`, `become`) from `connect all`, its groups' `connect`, its own, its groups and
+// itself, a later one over an earlier. A host with no `become` runs as the login user.
+reachOf(files: List[SourceFile], name: string) -> Result[Reach, string]
+  val (address, settings) = Evaluator(files, _ -> None, []).connectionOf(name)?
+  var target = address match
+    StrV(a) if a.nonEmpty -> SshTarget(a)
+    _ -> return Err(s"the address of host `$name` is not a host name")
+  var become: Become = NoBecome
+  for (setting, value) in settings
+    (setting, value) match
+      ("user", StrV(u)) -> target = target with { user = Some(u) }
+      ("port", IntV(p)) ->
+        if !(1 <= p <= 65535) then return Err(s"host `$name`: there is no TCP port $p")
+        target = target with { port = Some(int(p)) }
+      ("key", StrV(k)) -> target = target with { keys = [k] }
+      ("password", SecretV(s)) -> target = target with { password = Some(secretText(s, name)?) }
+      ("hostKey", StrV(fp)) -> target = target with { hostKey = Some(fp) }
+      ("become", VariantV(_, variant, fields)) ->
+        become = variant match
+          "Sudo" -> Sudo
+          "Doas" -> Doas
+          "NoBecome" -> NoBecome
+          "SudoPassword" -> fields.headOption match
+            Some((_, SecretV(s))) -> SudoPassword(secretText(s, name)?)
+            _ -> return Err(s"host `$name`: `SudoPassword` needs a secret")
+          other -> return Err(s"host `$name`: `$other` is not a way to become root")
+      _ -> ()
+  Ok(Reach(target, become))
+
+// The text of the secret `source` names, as the evaluator records it: `env NAME` is the environment
+// variable, `file PATH` the file's text without its last line end. The others (`command`, `literal`,
+// `concat`) are read once the vault is in place, and are refused here, by `host`.
+secretText(source: string, host: string) -> Result[string, string]
+  val space = source.indexOf(' ')
+  val (how, what) = if space < 0 then (source, "") else (source.slice(0, space), source.slice(space + 1, source.byteLength))
+  how match
+    "env" -> process.env(what) match
+      Some(v) -> Ok(v)
+      None -> Err(s"host `$host`: the secret `secret.env(\"$what\")` is not set in the environment")
+    "file" -> fs.readText(expandHome(what)) match
+      Ok(t) -> Ok(t.stripSuffix("\n"))
+      Err(e) -> Err(s"host `$host`: the secret file: ${e.message}")
+    other -> Err(s"host `$host`: a `secret.$other` secret cannot be read for a connection yet; use `secret.env` or `secret.file`")
+
+// The target `[user@]host[:port]` names, `[address]:port` for an IPv6 address, or why it names none.
+adHoc(spec: string) -> Result[SshTarget, string]
+  val at = spec.lastIndexOf('@')
+  val user = if at >= 0 then Some(spec.slice(0, at)) else None
+  if user == Some("") then return Err(s"`$spec` names an empty user")
+  val rest = if at >= 0 then spec.slice(at + 1, spec.byteLength) else spec
+  var host = rest
+  var portText: Option[string] = None
+  if rest.startsWith("[")
+    val close = rest.indexOf(']')
+    if close < 0 then return Err(s"`$spec` has no closing `]`")
+    host = rest.slice(1, close)
+    val after = rest.slice(close + 1, rest.byteLength)
+    if after.startsWith(":")
+      portText = Some(after.drop(1))
+    elif after.nonEmpty
+      return Err(s"`$spec` is not `[user@]host[:port]`")
+  else
+    val colon = rest.indexOf(':')
+    if colon >= 0
+      if rest.lastIndexOf(':') != colon then return Err(s"`$spec`: write an IPv6 address in brackets, `[address]:port`")
+      host = rest.slice(0, colon)
+      portText = Some(rest.slice(colon + 1, rest.byteLength))
+  if host.isEmpty then return Err(s"`$spec` names no host")
+  val port = portText match
+    Some(t) -> t.toIntOption() match
+      Some(p) if 1 <= p <= 65535 -> Some(p)
+      _ -> return Err(s"`$spec`: `$t` is not a TCP port")
+    None -> None
+  Ok(SshTarget(host, port = port, user = user))

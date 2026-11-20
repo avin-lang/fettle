@@ -1,0 +1,115 @@
+module tests
+
+import avin.fs
+import dev.avinlang.fettle.hosts.{Reach, adHoc, inInventory, reachOf, secretText}
+import dev.avinlang.fettle.project.{fromTexts, load}
+import dev.avinlang.fettle.transport.{Doas, NoBecome, SshTarget, Sudo, SudoPassword}
+
+// The inventory `text` as a project's files.
+inventory(text: string) -> List[dev.avinlang.fettle.syntax.SourceFile] = fromTexts(".", [("inventory.fettle", text)]).files
+
+// How the inventory `text` reaches `host`, or its error.
+reached(text: string, host: string) -> Result[Reach, string] = reachOf(inventory(text), host)
+
+@test("the example inventory: connect all's user, key and become, and a host's pinned key")
+exampleInventory()
+  val p = load("tests/examples/site").ok.get
+  assertEq(inInventory(p.files, "web1"), true)
+  assertEq(inInventory(p.files, "db1"), true)
+  assertEq(inInventory(p.files, "web"), false)
+  assertEq(inInventory(p.files, "nowhere"), false)
+  val web1 = reachOf(p.files, "web1").ok.get
+  assertEq(web1.target.host, "10.0.0.11")
+  assertEq(web1.target.user, Some("deploy"))
+  assertEq(web1.target.keys, ["~/.ssh/deploy_ed25519"])
+  assertEq(web1.target.hostKey, None)
+  assertEq(web1.become, Sudo)
+  val db1 = reachOf(p.files, "db1").ok.get
+  assertEq(db1.target.hostKey, Some("SHA256:Xo4kJtq1…"))
+  assertEq(unitOf(reachOf(p.files, "nowhere")), Err("no group of the inventory holds a host `nowhere`"))
+
+@test("settings: connect all, then the group's connect, the host's connect, the group, the host, each over the one before")
+settingOrder()
+  val text = [
+    "connect all",
+    "  user = \"a\"",
+    "  port = 1",
+    "connect g",
+    "  user = \"b\"",
+    "  port = 2",
+    "connect h1",
+    "  port = 3",
+    "group g",
+    "  key = \"/g\"",
+    "  host h1 at \"10.0.0.1\"",
+    "    key = \"/h1\"",
+    "  host h2 at \"10.0.0.2\"",
+    ""
+  ].mkString("\n")
+  val h1 = reached(text, "h1").ok.get
+  assertEq(targetText(h1.target), targetText(SshTarget("10.0.0.1", port = Some(3), user = Some("b"), keys = ["/h1"])))
+  assertEq(h1.become, NoBecome)
+  val h2 = reached(text, "h2").ok.get
+  assertEq(h2.target.port, Some(2))
+  assertEq(h2.target.keys, ["/g"])
+
+@test("every way to become root, and none")
+becomeSettings()
+  val base = "group g\n  host h at \"h.example\"\n    become = "
+  assertEq(reached(base + "Sudo\n", "h").map(r -> r.become), Ok(Sudo))
+  assertEq(reached(base + "Doas\n", "h").map(r -> r.become), Ok(Doas))
+  assertEq(reached(base + "NoBecome\n", "h").map(r -> r.become), Ok(NoBecome))
+  assertEq(reached("group g\n  host h at \"h.example\"\n", "h").map(r -> r.become), Ok(NoBecome))
+  val home = fs.createTempDir("fettle-secret").getOrElse("")
+  _ = fs.writeText(home + "/pw", "s3cret\n")
+  assertEq(reached(base + s"SudoPassword(secret.file(\"$home/pw\"))\n", "h").map(r -> r.become), Ok(SudoPassword("s3cret")))
+  assertEq(unitOf(reached(base + "SudoPassword(secret.env(\"FETTLE_TEST_UNSET_VARIABLE\"))\n", "h")).mapErr(e -> e.contains("not set")), Err(true))
+  assertEq(unitOf(reached(base + "SudoPassword(secret.literal(\"x\"))\n", "h")).mapErr(e -> e.contains("cannot be read for a connection yet")), Err(true))
+  _ = fs.removeDirAll(home)
+
+@test("secrets for a connection: the environment and files; the others refused")
+connectionSecrets()
+  assertEq(secretText("env HOME", "h").isOk, true)
+  assertEq(secretText("env FETTLE_TEST_UNSET_VARIABLE", "h"), Err("host `h`: the secret `secret.env(\"FETTLE_TEST_UNSET_VARIABLE\")` is not set in the environment"))
+  assertEq(secretText("file /nonexistent/fettle", "h").isErr, true)
+  assertEq(secretText("command pass show x", "h").isErr, true)
+  assertEq(secretText("concat", "h").isErr, true)
+
+@test("a port outside 1 to 65535 and an empty address are refused")
+badSettings()
+  assertEq(unitOf(reached("group g\n  host h at \"x\"\n    port = 0\n", "h")), Err("host `h`: there is no TCP port 0"))
+  assertEq(unitOf(reached("group g\n  host h at \"x\"\n    port = 65536\n", "h")), Err("host `h`: there is no TCP port 65536"))
+  assertEq(reached("group g\n  host h at \"x\"\n    port = 65535\n", "h").map(r -> r.target.port), Ok(Some(65535)))
+  assertEq(unitOf(reached("group g\n  host h at \"\"\n", "h")), Err("the address of host `h` is not a host name"))
+
+@test("a host named ad hoc: [user@]host[:port], [address]:port for IPv6")
+adHocTargets()
+  assertEq(shownTarget(adHoc("web1")), Ok(targetText(SshTarget("web1"))))
+  assertEq(shownTarget(adHoc("root@web1")), Ok(targetText(SshTarget("web1", user = Some("root")))))
+  assertEq(shownTarget(adHoc("root@web1:2222")), Ok(targetText(SshTarget("web1", port = Some(2222), user = Some("root")))))
+  assertEq(shownTarget(adHoc("10.0.0.1:22")), Ok(targetText(SshTarget("10.0.0.1", port = Some(22)))))
+  assertEq(shownTarget(adHoc("[::1]:2200")), Ok(targetText(SshTarget("::1", port = Some(2200)))))
+  assertEq(shownTarget(adHoc("me@[fe80::1]")), Ok(targetText(SshTarget("fe80::1", user = Some("me")))))
+  assertEq(shownTarget(adHoc("a@b@host")), Ok(targetText(SshTarget("host", user = Some("a@b")))))
+  assertEq(shownTarget(adHoc("ünï@hôst")), Ok(targetText(SshTarget("hôst", user = Some("ünï")))))
+  assertEq(shownTarget(adHoc("h:1")), Ok(targetText(SshTarget("h", port = Some(1)))))
+  assertEq(shownTarget(adHoc("h:65535")), Ok(targetText(SshTarget("h", port = Some(65535)))))
+  assertEq(shownTarget(adHoc("h:0")), Err("`h:0`: `0` is not a TCP port"))
+  assertEq(shownTarget(adHoc("h:65536")), Err("`h:65536`: `65536` is not a TCP port"))
+  assertEq(shownTarget(adHoc("h:")), Err("`h:`: `` is not a TCP port"))
+  assertEq(shownTarget(adHoc("h:ssh")), Err("`h:ssh`: `ssh` is not a TCP port"))
+  assertEq(shownTarget(adHoc("")), Err("`` names no host"))
+  assertEq(shownTarget(adHoc("me@")), Err("`me@` names no host"))
+  assertEq(shownTarget(adHoc("@h")), Err("`@h` names an empty user"))
+  assertEq(shownTarget(adHoc(":22")), Err("`:22` names no host"))
+  assertEq(shownTarget(adHoc("::1")), Err("`::1`: write an IPv6 address in brackets, `[address]:port`"))
+  assertEq(shownTarget(adHoc("[::1")), Err("`[::1` has no closing `]`"))
+  assertEq(shownTarget(adHoc("[::1]x")), Err("`[::1]x` is not `[user@]host[:port]`"))
+
+// A target in words, for comparing: everything but how a passphrase is asked for.
+targetText(t: SshTarget) -> string =
+  s"${t.user}@${t.host}:${t.port} keys=${t.keys} password=${t.password.isDefined} hostKey=${t.hostKey} knownHosts=${t.knownHosts} acceptNew=${t.acceptNew}"
+
+unitOf(r: Result[Reach, string]) -> Result[unit, string] = r.map(_ -> ())
+
+shownTarget(r: Result[SshTarget, string]) -> Result[string, string] = r.map(t -> targetText(t))

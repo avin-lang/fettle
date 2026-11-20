@@ -1,0 +1,455 @@
+module tests
+
+// Integration tests against the containers of `tests/integration/` (its README). Each needs the
+// targets up (`tests/integration/targets.zsh up`), which writes `tests/integration/.state/ssh_config`;
+// where that file is missing or a target does not answer, the test says it is skipped and passes, so
+// `avin test .` stays green on a machine without them. `avin test . "ssh target"` runs only these.
+import avin.fs
+import avin.time.{Duration, seconds}
+import dev.avinlang.fettle.cli.{factsText, trust}
+import dev.avinlang.fettle.facts.{factsScript, gather, parseFacts}
+import dev.avinlang.fettle.transport.{BecomeRefused, BecomeTransport, Broken, ChangedKey, Doas, ExitCode, HostKeyRefused, KilledBy, KnownKey, LocalTransport, LoginRefused, PinnedKey, TransportError, Sudo, SudoPassword, SshTarget, SshTransport, Transport, UnknownKey, Unreachable, connectSsh, hostKeyOf, trustHostKey}
+import dev.avinlang.ssh
+
+private val targetsConfig = "tests/integration/.state/ssh_config"
+
+// The targets' SSH configuration, or `None`, saying the test is skipped, where they are not up.
+targetConfig() -> Option[ssh.SshConfig]
+  if !fs.exists(targetsConfig)
+    println(s"skipped: $targetsConfig is missing; run `tests/integration/targets.zsh up`")
+    return None
+  ssh.SshConfig.read(targetsConfig).ok
+
+// Says the test is skipped where `e` says the target is not reachable, and fails it otherwise.
+private skippedFor(alias: string, e: TransportError) -> unit
+  if e.failure == Unreachable
+    println(s"skipped: $alias does not answer (${e.reason}); run `tests/integration/targets.zsh up`")
+  else assertEq(e.reason, s"connected to $alias")
+
+// A transport to the target `alias` (`fettle-debian12`, `fettle-alpine3-pw`, …), or `None` where it
+// is not up.
+onTarget(alias: string, timeout: Option[Duration] = None) -> Option[SshTransport]
+  val config = targetConfig() match
+    Some(c) -> c
+    None -> return None
+  connectSsh(SshTarget(alias, timeout = timeout), config) match
+    Ok(t) -> Some(t)
+    Err(e) ->
+      skippedFor(alias, e)
+      None
+
+// The target `alias` with everything spelled out (address, port, user, key) and its known hosts in
+// `knownHosts`, to be used with an empty configuration; `None` where the targets are not up.
+direct(alias: string, knownHosts: string) -> Option[SshTarget]
+  val h = targetConfig().flatMap(c -> c.host(alias).ok) match
+    Some(x) -> x
+    None -> return None
+  Some(SshTarget(h.hostName, port = Some(h.port), user = Some(h.user), keys = h.identityFiles, knownHosts = Some(knownHosts), connectTimeout = Some(5.seconds)))
+
+// An empty configuration, so that a `direct` target takes nothing from `~/.ssh/config`.
+emptyConfig() -> ssh.SshConfig = ssh.SshConfig.parse("").ok.get
+
+// A fresh scratch directory and an empty known-hosts file in it.
+scratchKnownHosts() -> (string, string)
+  val dir = fs.createTempDir("fettle-kh").getOrElse("")
+  val file = dir + "/known_hosts"
+  _ = fs.writeText(file, "")
+  (dir, file)
+
+// `script` run on `t`, which must reach the host, as text.
+outOf(t: Transport, script: string, input: Array[byte] = Array.empty[byte]()) -> string = t.run(script, input) match
+  Ok(r) -> r.out
+  Err(e) -> s"error: ${e.reason}"
+
+// The keys of `key=value` lines, in order.
+factKeys(text: string) -> Vector[string] = text.split('\n').filter(l -> l.contains("=")).map(l -> l.slice(0, l.indexOf('=')))
+
+// The facts of `alias` gathered over SSH, checked against what the image is, and the keys of the
+// script's raw output against the hand-written fixture `fixture`.
+factsOf(alias: string, distro: string, version: string, init: string, fixture: string)
+  val t = onTarget(alias) match
+    Some(x) -> x
+    None -> return
+  val raw = t.run(factsScript, Array.empty[byte]()).ok.get
+  println(s"facts of $alias:\n${raw.out}")
+  val f = gather(t).ok.get
+  assertEq(f.os, "Linux")
+  assertEq(f.distro, distro)
+  assertEq(f.version, version)
+  assertEq(f.init, init)
+  assertEq(f.user, "fettle")
+  assertEq(f.root, false)
+  assertEq(f.cpus >= 1, true)
+  assertEq(f.memory > 0, true)
+  val recorded = fs.readText(s"tests/fixtures/facts/$fixture.txt").getOrElse("")
+  assertEq(factKeys(raw.out), factKeys(recorded))
+  assertEq(parseFacts(recorded).map(x -> (x.distro, x.version, x.init)), Ok((distro, version, init)))
+  _ = t.close()
+
+@test("ssh target: facts of debian12")
+factsDebian() = factsOf("fettle-debian12", "Debian", "12", "Systemd", "debian12")
+
+@test("ssh target: facts of ubuntu2404")
+factsUbuntu() = factsOf("fettle-ubuntu2404", "Ubuntu", "24.04", "Systemd", "ubuntu2404")
+
+@test("ssh target: facts of alpine3")
+factsAlpine() = factsOf("fettle-alpine3", "Alpine", "3.20", "OpenRc", "alpine320")
+
+@test("ssh target: fettle facts <alias> --json through the targets' SSH configuration")
+factsCommandOverSsh()
+  if targetConfig().isEmpty then return
+  factsText(["fettle-debian12", "--ssh-config", targetsConfig, "--json"]) match
+    Ok(text) -> assertEq(text.contains("\"distro\": \"Debian\"") || text.contains("\"distro\":\"Debian\""), true)
+    Err((_, message)) -> skippedFor("fettle-debian12", TransportError(message, if message.contains("cannot connect") then Unreachable else Broken))
+
+@test("ssh target: fettle facts of an inventory host, its connection settings from the inventory")
+factsOfInventoryHost()
+  val (dir, kh) = scratchKnownHosts()
+  val target = direct("fettle-alpine3", kh) match
+    Some(x) -> x
+    None -> return
+  val inventory = [
+    "connect all",
+    s"  user = \"${target.user.get}\"",
+    s"  key = \"${target.keys(0)}\"",
+    "group edge",
+    s"  host box at \"${target.host}\"",
+    s"    port = ${target.port.get}",
+    ""
+  ].mkString("\n")
+  _ = fs.writeText(dir + "/inventory.fettle", inventory)
+  factsText(["box", "--dir", dir, "--ssh-config", "/dev/null", "--known-hosts", kh, "--accept-new"]) match
+    Ok(text) -> assertEq(text.contains("Alpine"), true)
+    Err((_, message)) ->
+      _ = fs.removeDirAll(dir)
+      skippedFor("fettle-alpine3", TransportError(message, if message.contains("cannot connect") then Unreachable else Broken))
+      return
+  // The key was recorded by --accept-new, so a strict run now passes.
+  assertEq(factsText(["box", "--dir", dir, "--ssh-config", "/dev/null", "--known-hosts", kh]).isOk, true)
+  _ = fs.removeDirAll(dir)
+
+@test("ssh target: exit codes, signals, output and error output apart, Unicode, one session for many runs")
+runsOverSsh()
+  val t = onTarget("fettle-debian12") match
+    Some(x) -> x
+    None -> return
+  val r = t.run("echo out; echo err >&2; exit 7", Array.empty[byte]()).ok.get
+  assertEq(r.ending, ExitCode(7))
+  assertEq(r.out, "out\n")
+  assertEq(r.err, "err\n")
+  assertEq(t.run("kill -9 $$", Array.empty[byte]()).map(x -> x.ending), Ok(KilledBy(9)))
+  assertEq(t.run("kill -TERM $$", Array.empty[byte]()).map(x -> x.ending), Ok(KilledBy(15)))
+  assertEq(outOf(t, "printf '%s' 'é 日本 🙂'"), "é 日本 🙂")
+  assertEq(outOf(t, "printf '%s' \"$0\""), "/bin/sh")
+  assertEq(outOf(t, "echo 'it'\\''s'"), "it's\n")
+  assertEq(t.run("if then", Array.empty[byte]()).map(x -> x.succeeded), Ok(false))
+  var i = 0
+  while i < 20
+    assertEq(outOf(t, s"echo $i"), s"$i\n")
+    i += 1
+  assertEq(t.close(), Ok(()))
+  assertEq(t.run("true", Array.empty[byte]()).isErr, true)
+  assertEq(t.close(), Ok(()))
+
+@test("ssh target: standard input arrives byte for byte, NULs and 1 MiB included")
+inputOverSsh()
+  val t = onTarget("fettle-ubuntu2404") match
+    Some(x) -> x
+    None -> return
+  assertEq(t.run("cat", allBytes()).map(r -> r.stdout.toVector), Ok(allBytes().toVector))
+  val big = mebibyte()
+  assertEq(t.run("cat", big).map(r -> r.stdout.toVector == big.toVector), Ok(true))
+  assertEq(outOf(t, "wc -c", big).trim, "1048576")
+  assertEq(t.run("cat", Array.empty[byte]()).map(r -> r.stdout.length), Ok(0))
+  val large = t.run("head -c 3000000 /dev/zero", Array.empty[byte]()).map(r -> r.stdout.length)
+  assertEq(large, Ok(3000000))
+  _ = t.close()
+
+@test("ssh target: a wait longer than the timeout breaks the run and the session")
+timeoutOverSsh()
+  val t = onTarget("fettle-alpine3", Some(1.seconds)) match
+    Some(x) -> x
+    None -> return
+  t.run("sleep 3", Array.empty[byte]()) match
+    Err(e) ->
+      assertEq(e.failure, Broken)
+      assertEq(e.reason.contains("timed out"), true)
+    Ok(_) -> assertEq("finished", "timed out")
+  assertEq(t.run("true", Array.empty[byte]()).isErr, true)
+  _ = t.close()
+
+@test("ssh target: become Sudo as fettle runs as root or another user, input intact")
+becomeSudo()
+  val t = onTarget("fettle-debian12") match
+    Some(x) -> x
+    None -> return
+  val root = BecomeTransport(t, Sudo)
+  assertEq(outOf(root, "id -un"), "root\n")
+  assertEq(outOf(BecomeTransport(t, Sudo, "fettlepw"), "id -un"), "fettlepw\n")
+  assertEq(root.run("cat", allBytes()).map(r -> r.stdout.toVector), Ok(allBytes().toVector))
+  val big = mebibyte()
+  assertEq(root.run("cat", big).map(r -> r.stdout.toVector == big.toVector), Ok(true))
+  val r = root.run("echo out; echo err >&2; exit 5", Array.empty[byte]()).ok.get
+  assertEq((r.out, r.err, r.ending), ("out\n", "err\n", ExitCode(5)))
+  assertEq(root.run("kill -9 $$", Array.empty[byte]()).map(x -> x.ending), Ok(KilledBy(9)))
+  assertEq(outOf(root, "cat >/root/fettle-upload && cat /root/fettle-upload && rm /root/fettle-upload", "root-owned\n".utf8), "root-owned\n")
+  assertEq(BecomeTransport(t, Sudo, "no-such-user").run("true", Array.empty[byte]()).map(x -> x.out).mapErr(e -> e.failure), Err(BecomeRefused))
+  _ = t.close()
+
+@test("ssh target: become Sudo where sudo wants a password is refused, saying so")
+sudoNeedsPassword()
+  val t = onTarget("fettle-debian12-pw") match
+    Some(x) -> x
+    None -> return
+  BecomeTransport(t, Sudo).run("true", Array.empty[byte]()) match
+    Err(e) ->
+      assertEq(e.failure, BecomeRefused)
+      assertEq(e.reason.contains("sudo needs a password"), true)
+    Ok(_) -> assertEq("ran", "refused")
+  _ = t.close()
+
+@test("ssh target: become SudoPassword as fettlepw, the script's input intact after the password")
+becomeSudoPassword()
+  for alias in ["fettle-debian12-pw", "fettle-alpine3-pw"]
+    val t = onTarget(alias) match
+      Some(x) -> x
+      None -> return
+    val root = BecomeTransport(t, SudoPassword("fettlepw"))
+    assertEq(outOf(root, "id -un"), "root\n")
+    assertEq(root.run("cat", allBytes()).map(r -> r.stdout.toVector), Ok(allBytes().toVector))
+    val big = mebibyte()
+    assertEq(root.run("cat", big).map(r -> r.stdout.toVector == big.toVector), Ok(true))
+    assertEq(outOf(root, "cat", "fettlepw\nsecond\n".utf8), "fettlepw\nsecond\n")
+    assertEq(outOf(root, "cat", "\n".utf8), "\n")
+    assertEq(root.run("cat", Array.empty[byte]()).map(r -> r.stdout.length), Ok(0))
+    _ = t.close()
+
+@test("ssh target: a wrong sudo password is refused before the script runs")
+wrongSudoPassword()
+  val t = onTarget("fettle-ubuntu2404-pw") match
+    Some(x) -> x
+    None -> return
+  BecomeTransport(t, SudoPassword("not-it")).run("touch /tmp/fettle-should-not-exist", Array.empty[byte]()) match
+    Err(e) ->
+      assertEq(e.failure, BecomeRefused)
+      assertEq(e.reason.contains("refused the password"), true)
+      assertEq(e.reason.contains("not-it"), false)
+    Ok(_) -> assertEq("ran", "refused")
+  assertEq(outOf(t, "test -e /tmp/fettle-should-not-exist && echo there || echo absent"), "absent\n")
+  _ = t.close()
+
+// Makes the user `name` on the target `t` reaches as root: its key the login user's, sudo as
+// `sudoers` says, its password `password`.
+private makeUser(t: Transport, name: string, sudoers: string, password: string) -> bool
+  val root = BecomeTransport(t, Sudo)
+  val script = [
+    s"id $name >/dev/null 2>&1 || useradd -m -s /bin/sh $name || adduser -D -s /bin/sh $name",
+    s"echo '$name:$password' | chpasswd",
+    s"install -d -m 700 -o $name -g $name /home/$name/.ssh",
+    s"cp /home/fettle/.ssh/authorized_keys /home/$name/.ssh/authorized_keys",
+    s"chown $name:$name /home/$name/.ssh/authorized_keys",
+    s"printf '%s\\n' \"$$1\" >/etc/sudoers.d/$name",
+    s"chmod 0440 /etc/sudoers.d/$name"
+  ].mkString("\n")
+  root.run(s"set -e\nset -- '${sudoers.replace("'", "'\\''")}'\n$script", Array.empty[byte]()).map(r -> r.succeeded).getOrElse(false)
+
+@test("ssh target: sudo with requiretty is refused without a terminal and runs through one")
+requirettyOverSsh()
+  val admin = onTarget("fettle-ubuntu2404") match
+    Some(x) -> x
+    None -> return
+  assertEq(makeUser(admin, "fettletty", "Defaults:fettletty requiretty\nfettletty ALL=(ALL) NOPASSWD:ALL", "fettletty"), true)
+  assertEq(makeUser(admin, "fettlettypw", "Defaults:fettlettypw requiretty\nfettlettypw ALL=(ALL) ALL", "fettlettypw"), true)
+  _ = admin.close()
+  val config = targetConfig().get
+  val h = config.host("fettle-ubuntu2404").ok.get
+  for (user, how) in [("fettletty", Sudo), ("fettlettypw", SudoPassword("fettlettypw"))]
+    val t = connectSsh(SshTarget("fettle-ubuntu2404", user = Some(user)), config).ok.get
+    BecomeTransport(t, how).run("true", Array.empty[byte]()) match
+      Err(e) -> assertEq(e.reason.contains("requiretty"), true)
+      Ok(_) -> assertEq("ran", "refused")
+    val root = BecomeTransport(t, how, "root", Some((s, i) -> t.runOnTerminal(s, i)))
+    assertEq(outOf(root, "id -un"), "root\n")
+    val r = root.run("cat; echo err >&2; exit 3", allBytes()).ok.get
+    assertEq(r.stdout.toVector, allBytes().toVector)
+    assertEq(r.err, "err\n")
+    assertEq(r.ending, ExitCode(3))
+    val big = mebibyte()
+    assertEq(root.run("cat", big).map(x -> x.stdout.toVector == big.toVector), Ok(true))
+    // The scratch directories are gone.
+    assertEq(outOf(t, "ls -d \"${TMPDIR:-/tmp}\"/fettle.* 2>/dev/null | wc -l").trim, "0")
+    _ = t.close()
+  assertEq(h.port > 0, true)
+
+@test("ssh target: become Doas on alpine3")
+becomeDoas()
+  val t = onTarget("fettle-alpine3") match
+    Some(x) -> x
+    None -> return
+  val installed = BecomeTransport(t, Sudo).run(
+    "command -v doas >/dev/null || apk add --no-cache doas >/dev/null 2>&1 || exit 9\nmkdir -p /etc/doas.d\necho 'permit nopass fettle as root' >/etc/doas.d/fettle.conf\nchmod 0400 /etc/doas.d/fettle.conf",
+    Array.empty[byte]()
+  ).map(r -> r.ending)
+  if installed == Ok(ExitCode(9))
+    println("skipped: doas could not be installed on alpine3 (no network?)")
+    return
+  assertEq(installed, Ok(ExitCode(0)))
+  val root = BecomeTransport(t, Doas)
+  assertEq(outOf(root, "id -un"), "root\n")
+  assertEq(root.run("cat", allBytes()).map(r -> r.stdout.toVector), Ok(allBytes().toVector))
+  BecomeTransport(t, Doas, "fettlepw").run("true", Array.empty[byte]()) match
+    Err(e) -> assertEq(e.failure, BecomeRefused)
+    Ok(_) -> assertEq("ran", "refused")
+  _ = t.close()
+
+@test("ssh target: an unknown host key is refused, a trusted one accepted, a pinned one checked")
+unknownAndTrusted()
+  val (dir, kh) = scratchKnownHosts()
+  val target = direct("fettle-debian12", kh) match
+    Some(x) -> x
+    None -> return
+  val config = emptyConfig()
+  connectSsh(target, config) match
+    Err(e) ->
+      if e.failure == Unreachable
+        skippedFor("fettle-debian12", e)
+        return
+      assertEq(e.failure, HostKeyRefused)
+      assertEq(e.reason.contains("is not known"), true)
+      assertEq(e.reason.contains("fettle trust"), true)
+    Ok(_) -> assertEq("connected", "refused")
+  val fp = hostKeyOf(target, config) match
+    Ok(UnknownKey(f, file)) ->
+      assertEq(file, kh)
+      assertEq(f.startsWith("SHA256:"), true)
+      f
+    _ ->
+      assertEq("another state", "unknown")
+      return
+  // A fingerprint other than the host's is never recorded.
+  assertEq(trustHostKey(target, config, "SHA256:not-the-key").mapErr(e -> e.failure), Err(HostKeyRefused))
+  assertEq(fs.readText(kh), Ok(""))
+  assertEq(trustHostKey(target, config, fp), Ok(()))
+  assertEq(fs.readText(kh).map(t -> t.split('\n').filter(l -> l.nonEmpty).length), Ok(1))
+  assertEq(hostKeyOf(target, config).mapErr(e -> e.reason), Ok(KnownKey(fp)))
+  val t = connectSsh(target, config).ok.get
+  assertEq(outOf(t, "echo trusted"), "trusted\n")
+  _ = t.close()
+  // Pinned: the right fingerprint connects with no known-hosts file at all, a wrong one is refused.
+  val (dir2, empty) = scratchKnownHosts()
+  val pinned = target with { knownHosts = Some(empty), hostKey = Some(fp) }
+  assertEq(hostKeyOf(pinned, config).mapErr(e -> e.reason), Ok(PinnedKey(fp)))
+  val p = connectSsh(pinned, config).ok.get
+  _ = p.close()
+  assertEq(connectSsh(target with { hostKey = Some("SHA256:AAAA") }, config).map(_ -> ()).mapErr(e -> e.failure), Err(HostKeyRefused))
+  // --accept-new records it during a run.
+  val t2 = connectSsh(target with { knownHosts = Some(empty), acceptNew = true }, config).ok.get
+  _ = t2.close()
+  assertEq(hostKeyOf(target with { knownHosts = Some(empty) }, config).mapErr(e -> e.reason), Ok(KnownKey(fp)))
+  _ = fs.removeDirAll(dir)
+  _ = fs.removeDirAll(dir2)
+
+@test("ssh target: fettle trust --yes records the key; asked again it is already known")
+trustCommand()
+  val (dir, kh) = scratchKnownHosts()
+  val target = direct("fettle-alpine3", kh) match
+    Some(x) -> x
+    None -> return
+  val name = s"${target.user.get}@${target.host}:${target.port.get}"
+  val args = [name, "--yes", "--ssh-config", "/dev/null", "--known-hosts", kh]
+  if trust(args) == 1 && fs.readText(kh) == Ok("")
+    println("skipped: alpine3 does not answer")
+    return
+  assertEq(fs.readText(kh).map(t -> t.contains("ssh-ed25519") || t.contains("ecdsa") || t.contains("ssh-rsa")), Ok(true))
+  assertEq(trust(args), 0)
+  assertEq(trust([name, "--bogus"]), 2)
+  assertEq(trust([]), 2)
+  _ = fs.removeDirAll(dir)
+
+@test("ssh target: a host key that changed is refused, and trust will not record over it")
+changedKey()
+  val (dir, kh) = scratchKnownHosts()
+  val debian = direct("fettle-debian12", kh) match
+    Some(x) -> x
+    None -> return
+  val alpine = direct("fettle-alpine3", kh).get
+  val config = emptyConfig()
+  // alpine3's key, recorded under debian12's address and port.
+  val t = connectSsh(alpine with { acceptNew = true }, config) match
+    Ok(x) -> x
+    Err(e) ->
+      skippedFor("fettle-alpine3", e)
+      return
+  _ = t.close()
+  val line = fs.readText(kh).getOrElse("").trim
+  val swapped = s"[${debian.host}]:${debian.port.get}" + line.slice(line.indexOf(' '), line.byteLength) + "\n"
+  _ = fs.writeText(kh, swapped)
+  connectSsh(debian, config) match
+    Err(e) ->
+      assertEq(e.failure, HostKeyRefused)
+      assertEq(e.reason.contains("is not the one known"), true)
+    Ok(_) -> assertEq("connected", "refused")
+  // --accept-new never takes a changed key.
+  assertEq(connectSsh(debian with { acceptNew = true }, config).map(_ -> ()).mapErr(e -> e.failure), Err(HostKeyRefused))
+  hostKeyOf(debian, config) match
+    Ok(ChangedKey(_, file)) -> assertEq(file, kh)
+    _ -> assertEq("another state", "changed")
+  assertEq(trust([s"${debian.user.get}@${debian.host}:${debian.port.get}", "--yes", "--ssh-config", "/dev/null", "--known-hosts", kh]), 1)
+  assertEq(fs.readText(kh), Ok(swapped))
+  _ = fs.removeDirAll(dir)
+
+@test("ssh target: a login refused: no such user, a key the host does not take, a key file that is not there")
+authFailures()
+  val (dir, kh) = scratchKnownHosts()
+  val target = direct("fettle-debian12", kh) match
+    Some(x) -> x
+    None -> return
+  val config = emptyConfig()
+  val known = target with { acceptNew = true }
+  connectSsh(known with { user = Some("no-such-user") }, config) match
+    Err(e) ->
+      if e.failure == Unreachable
+        skippedFor("fettle-debian12", e)
+        return
+      assertEq(e.failure, LoginRefused)
+      assertEq(e.reason.contains("refused"), true)
+    Ok(_) -> assertEq("logged in", "refused")
+  val keygen = LocalTransport().run(s"ssh-keygen -q -t ed25519 -N '' -f '$dir/other'", Array.empty[byte]())
+  assertEq(keygen.map(r -> r.succeeded), Ok(true))
+  assertEq(connectSsh(known with { keys = [dir + "/other"] }, config).map(_ -> ()).mapErr(e -> e.failure), Err(LoginRefused))
+  connectSsh(known with { keys = [dir + "/missing"] }, config) match
+    Err(e) ->
+      assertEq(e.failure, LoginRefused)
+      assertEq(e.reason.contains("no such file"), true)
+    Ok(_) -> assertEq("logged in", "refused")
+  _ = fs.removeDirAll(dir)
+
+@test("ssh target: a key under a passphrase is used with its passphrase, and refused with a wrong one")
+passphraseKeys()
+  val (dir, kh) = scratchKnownHosts()
+  val target = direct("fettle-alpine3", kh) match
+    Some(x) -> x
+    None -> return
+  val config = emptyConfig()
+  val local = LocalTransport()
+  assertEq(local.run(s"ssh-keygen -q -t ed25519 -N 'pass phrase' -C fettle-passphrase -f '$dir/locked'", Array.empty[byte]()).map(r -> r.succeeded), Ok(true))
+  val admin = connectSsh(target with { acceptNew = true }, config) match
+    Ok(x) -> x
+    Err(e) ->
+      skippedFor("fettle-alpine3", e)
+      return
+  val pub = fs.readBytes(dir + "/locked.pub").getOrElse(Array.empty[byte]())
+  assertEq(admin.run("grep -q fettle-passphrase ~/.ssh/authorized_keys || cat >>~/.ssh/authorized_keys", pub).map(r -> r.succeeded), Ok(true))
+  _ = admin.close()
+  val locked = target with { keys = [dir + "/locked"] }
+  val asked = Buffer[string]()
+  val ask: (string) -> Option[string] = k ->
+    asked += k
+    Some("pass phrase")
+  connectSsh(locked with { passphrase = ask }, config) match
+    Ok(t) -> _ = t.close()
+    Err(e) -> assertEq(e.reason, "logged in")
+  assertEq(asked.toVector, [dir + "/locked"])
+  assertEq(connectSsh(locked with { passphrase = _ -> Some("wrong") }, config).map(_ -> ()).mapErr(e -> e.failure), Err(LoginRefused))
+  assertEq(connectSsh(locked with { passphrase = _ -> None }, config).map(_ -> ()).mapErr(e -> e.failure), Err(LoginRefused))
+  _ = fs.removeDirAll(dir)

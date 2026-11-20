@@ -1,6 +1,7 @@
 module dev.avinlang.fettle.cli
 
 import avin.fs
+import avin.io
 import dev.avinlang.fettle.syntax.{Diagnostic, parseSource}
 import dev.avinlang.fettle.report.{render}
 import dev.avinlang.fettle.project.{Project, checkProject, filesUnder, load}
@@ -8,9 +9,11 @@ import dev.avinlang.fettle.fmt.{format}
 import dev.avinlang.fettle.eval.{evaluate}
 import dev.avinlang.fettle.facts.{factsJson, gather, readFacts, showFacts}
 import dev.avinlang.fettle.graph.{showGraph}
-import dev.avinlang.fettle.transport.{LocalTransport}
+import dev.avinlang.fettle.hosts.{Reach, adHoc, inInventory, reachOf as hostReach}
+import dev.avinlang.fettle.transport.{ChangedKey, KnownKey, LocalTransport, NoBecome, PinnedKey, UnknownKey, connectSsh, hostKeyOf, trustHostKey}
+import dev.avinlang.ssh
 
-val usage: string = "usage: fettle check [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [dir]\n       fettle facts --local [--json]"
+val usage: string = "usage: fettle check [dir]\n       fettle fmt [--check] [files…]\n       fettle graph --facts <fixture.json> --host <name> [dir]\n       fettle facts --local [--json]\n       fettle facts <host> [--json] [--dir d] [--ssh-config f] [--known-hosts f] [--accept-new]\n       fettle trust <host> [--yes] [--dir d] [--ssh-config f] [--known-hosts f]"
 
 // Runs the command `args` names, answering the exit status.
 main(args: Vector[string]) -> int
@@ -23,6 +26,7 @@ main(args: Vector[string]) -> int
     "fmt" -> fmt(rest)
     "graph" -> graph(rest)
     "facts" -> facts(rest)
+    "trust" -> trust(rest)
     _ ->
       eprintln(s"fettle: unknown command `${args(0)}`\n$usage")
       2
@@ -119,7 +123,9 @@ graph(args: Vector[string]) -> int
   0
 
 // `fettle facts --local [--json]`: this machine's facts, gathered by running the facts script under
-// `/bin/sh`, printed one a line or, with `--json`, as the JSON a fact fixture holds.
+// `/bin/sh`, printed one a line or, with `--json`, as the JSON a fact fixture holds. `fettle facts
+// <host>`: the facts of a host of the inventory in `--dir` (the current directory by default), or of
+// one named `[user@]host[:port]`, gathered over SSH as its login user.
 facts(args: Vector[string]) -> int = factsText(args) match
   Ok(text) ->
     print(text)
@@ -128,14 +134,133 @@ facts(args: Vector[string]) -> int = factsText(args) match
     eprintln(message)
     code
 
+// What the commands that reach a host were given: the host, and the options.
+data Remote(
+  name: string = "",
+  dir: string = ".",
+  dirGiven: bool = false,
+  sshConfig: Option[string] = None,
+  knownHosts: Option[string] = None,
+  acceptNew: bool = false,
+  json: bool = false,
+  yes: bool = false,
+  local: bool = false
+)
+
+// `args` read as the options `flags` allows (of `--json`, `--local`, `--yes`, `--accept-new`, `--dir`,
+// `--ssh-config`, `--known-hosts`) and one host, or the usage error.
+remoteArgs(args: Vector[string], flags: Vector[string]) -> Result[Remote, string]
+  var r = Remote()
+  var i = 0
+  while i < args.length
+    val a = args(i)
+    val valued = a == "--dir" || a == "--ssh-config" || a == "--known-hosts"
+    if a.startsWith("-") && !flags.contains(a) then return Err(s"fettle: unknown argument `$a`")
+    if valued
+      if i + 1 >= args.length then return Err(s"fettle: `$a` needs a value")
+      val v = args(i + 1)
+      r = a match
+        "--dir" -> r with { dir = v, dirGiven = true }
+        "--ssh-config" -> r with { sshConfig = Some(v) }
+        _ -> r with { knownHosts = Some(v) }
+      i += 2
+      continue
+    r = a match
+      "--json" -> r with { json = true }
+      "--local" -> r with { local = true }
+      "--yes" -> r with { yes = true }
+      "--accept-new" -> r with { acceptNew = true }
+      _ ->
+        if r.name.nonEmpty then return Err(s"fettle: one host at a time, not `${r.name}` and `$a`")
+        r with { name = a }
+    i += 1
+  Ok(r)
+
 // What `fettle facts` prints for `args`, or the exit status and message it fails with.
 factsText(args: Vector[string]) -> Result[string, (int, string)]
-  val unknown = args.filter(a -> a != "--local" && a != "--json")
-  if !unknown.isEmpty || !args.contains("--local")
-    return Err((2, if unknown.isEmpty then s"fettle: facts of a remote host are not gathered yet; use --local\n$usage" else s"fettle: unknown argument `${unknown(0)}`\n$usage"))
-  val t = LocalTransport()
-  val gathered = gather(t)
-  _ = t.close()
+  val r = remoteArgs(args, ["--local", "--json", "--dir", "--ssh-config", "--known-hosts", "--accept-new"]).mapErr(e -> (2, s"$e\n$usage"))?
+  if r.local && r.name.nonEmpty then return Err((2, s"fettle: --local takes no host, and `${r.name}` was given\n$usage"))
+  if !r.local && r.name.isEmpty then return Err((2, s"fettle: facts needs a host, or --local\n$usage"))
+  val gathered = if r.local
+    val t = LocalTransport()
+    val f = gather(t).mapErr(e -> s"fettle: local: $e")
+    _ = t.close()
+    f
+  else
+    val (reach, config) = reachOf(r).mapErr(e -> (1, e))?
+    val t = connectSsh(reach.target, config).mapErr(e -> (1, s"fettle: ${e.message}"))?
+    val f = gather(t).mapErr(e -> s"fettle: ${r.name}: $e")
+    _ = t.close()
+    f
   gathered match
-    Ok(f) -> Ok(if args.contains("--json") then factsJson(f) + "\n" else showFacts(f))
-    Err(e) -> Err((1, s"fettle: local: $e"))
+    Ok(f) -> Ok(if r.json then factsJson(f) + "\n" else showFacts(f))
+    Err(e) -> Err((1, e))
+
+// How to reach the host `r` names, and the SSH configuration: a host of the inventory in `r.dir`
+// where it holds one by that name, otherwise `[user@]host[:port]`, an alias of the configuration among
+// them. The command line's known-hosts file and `--accept-new` go over what the inventory says.
+reachOf(r: Remote) -> Result[(Reach, ssh.SshConfig), string]
+  val config = (r.sshConfig match
+    Some(f) -> ssh.SshConfig.read(f)
+    None -> ssh.SshConfig.load()).mapErr(e -> s"fettle: ${e.message}")?
+  val inventory: Option[Project] = if r.name.contains("@") then None else load(r.dir) match
+    Ok(p) -> if inInventory(p.files, r.name) then Some(p) else None
+    Err(e) -> if r.dirGiven then return Err(s"fettle: $e") else None
+  val reach = inventory match
+    Some(p) ->
+      if report(p, checkProject(p)) > 0 then return Err(s"fettle: the project in ${r.dir} has errors")
+      hostReach(p.files, r.name).mapErr(e -> s"fettle: $e")?
+    None -> Reach(adHoc(r.name).mapErr(e -> s"fettle: $e")?, NoBecome)
+  val target = reach.target with {
+    knownHosts = r.knownHosts.orElse(reach.target.knownHosts),
+    acceptNew = r.acceptNew || reach.target.acceptNew
+  }
+  Ok((reach with { target = target }, config))
+
+// `fettle trust <host> [--yes]`: the host's key fingerprint shown and, once confirmed (or at once
+// with `--yes`), added to the known-hosts file. A key already known, or pinned by the inventory, is
+// left alone; a changed one is refused.
+trust(args: Vector[string]) -> int
+  val r = remoteArgs(args, ["--yes", "--dir", "--ssh-config", "--known-hosts"]) match
+    Ok(x) -> x
+    Err(e) ->
+      eprintln(s"$e\n$usage")
+      return 2
+  if r.name.isEmpty
+    eprintln(s"fettle: trust needs a host\n$usage")
+    return 2
+  val (reach, config) = reachOf(r) match
+    Ok(x) -> x
+    Err(e) ->
+      eprintln(e)
+      return 1
+  val state = hostKeyOf(reach.target, config) match
+    Ok(s) -> s
+    Err(e) ->
+      eprintln(s"fettle: ${e.message}")
+      return 1
+  state match
+    KnownKey(fp) ->
+      println(s"${r.name}: the key $fp is already known")
+      0
+    PinnedKey(fp) ->
+      println(s"${r.name}: the inventory pins the key $fp; nothing is recorded")
+      0
+    ChangedKey(fp, file) ->
+      eprintln(s"fettle: ${r.name}: the host now presents $fp, not the key $file lists for it; if the change is expected, remove the old line (`ssh-keygen -R`) and trust it again")
+      1
+    UnknownKey(fp, file) ->
+      println(s"${r.name}: $fp")
+      if !r.yes
+        print(s"Add this key to $file? [y/N] ")
+        val answer = io.readLine().getOrElse("").trim.toLower
+        if answer != "y" && answer != "yes"
+          eprintln("fettle: nothing recorded")
+          return 1
+      trustHostKey(reach.target, config, fp) match
+        Ok(_) ->
+          println(s"${r.name}: recorded in $file")
+          0
+        Err(e) ->
+          eprintln(s"fettle: ${e.message}")
+          1

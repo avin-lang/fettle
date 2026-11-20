@@ -35,8 +35,25 @@ impl Ran
     KilledBy(s) -> s"killed by signal $s"
 
 // Why a script could not be run at all: the host could not be reached, the session broke, a local
-// process could not be started. A script that ran and failed is a `Ran`, not this.
-data TransportError(reason: string)
+// process could not be started. A script that ran and failed is a `Ran`, not this. `failure` says
+// which kind of trouble it is, for a report that separates "the network is wrong" from the rest.
+data TransportError(reason: string, failure: TransportFailure = Broken)
+
+// The kinds of `TransportError`.
+data TransportFailure
+  // The host could not be reached: its name does not resolve, nothing listens, the connection or the
+  // SSH handshake timed out or failed.
+  Unreachable
+  // The host's key was refused: not known, changed, or not the pinned one.
+  HostKeyRefused
+  // The login was refused, or no key or password could be used for it.
+  LoginRefused
+  // Becoming another user failed before the script ran: sudo wanted a password, refused the one
+  // given, wanted a terminal, or the user may not use it.
+  BecomeRefused
+  // Anything else: the session broke or timed out mid-run, a channel was refused, a local process
+  // could not be started, the transport was closed.
+  Broken
 
 impl Error for TransportError
   message -> string = reason

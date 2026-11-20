@@ -1,3 +1,3 @@
-github.com/avin-lang/json v0.0.2 sha256:22ace67aa20af30b62c6b4431aca2cf89a0bf9e20ab400847128769c3ed4efbf
 github.com/avin-lang/parsing v0.6.0 sha256:940b41f046f197eeb0edc67c3521ecdfe0112a14cc22bdd7ebe282d66635338e
 github.com/avin-lang/json v0.0.3 sha256:d9ff4cce8affeea681ace712105a753d4c4d3dfaf3bbd76c05acdeee7366401a
+github.com/avin-lang/ssh v0.0.1 sha256:b864480a22604dec67aa8dfda2efd3e6c81b78f28d540c3a9c68d34e032f2dd7
