@@ -1147,3 +1147,72 @@ user.
     Review with the user.
 49. **A field may be named `group`** although `group` is the inventory's word, as a resource's kind
     may (decision 23); `user`'s `group = "staff"` had been a syntax error. Review with the user.
+50. **Probes are shared, and resources of a batching kind apply together.** A probe command that
+    another resource's probe already runs runs once and both read its output: every `package` of a
+    host probes all of the host's packages in one command. Within an apply, a probe is answered from
+    the last run of the same commands until a step runs. A provider that batches (`package`,
+    `aptRepository`) applies the resources of its kind that stand next to each other in the order,
+    with no edge into one from another or from a resource that failed, with one set of steps; each is
+    still verified, reported and fires its triggers on its own, and the triggers of all of them are
+    recorded as pending before the steps run. Providers see the host's facts and graph, the
+    resources changed so far in the run, and marks such as "the index was refreshed" through the
+    `Context`. Review with the user.
+51. **The package index is refreshed at most once a run**, by the first step that installs or
+    upgrades something when the index is older than the smallest `refresh` of those packages (one
+    hour by default) or of unknown age: `apt-get update` (age from
+    `/var/lib/apt/periodic/update-success-stamp`, which apt's own hook touches, else
+    `/var/lib/apt/lists`), `apk update` (the newest `/var/cache/apk/APKINDEX.*`). dnf keeps its
+    metadata fresh itself, so it is never refreshed and `refresh` does nothing there. `latest` is the
+    candidate in the host's index; a `latest` package that is current in an index older than
+    `refresh` plans as a change (`2.8.4; refresh the index (older than 1h) for a newer version`), so
+    `latest` keeps looking without the plan inventing a version. An index already refreshed in the
+    run is taken as it stands. Review with the user.
+52. **Package commands.** apt: `dpkg-query -W -f '${Package}=${db:Status-Status} ${Version}'` and
+    `apt-cache policy` (under `LC_ALL=C`) probe; one `DEBIAN_FRONTEND=noninteractive apt-get install
+    -y --no-install-recommends -o Dpkg::Options::=--force-confold` installs and upgrades (with
+    `--allow-downgrades` when an installed package is pinned to an exact version, `name=version`);
+    `apt-get remove` removes (not `purge`: configuration stays, as `config-files` reads as not
+    installed). dnf: `rpm -q --qf` and `dnf repoquery --latest-limit 1` probe; `dnf install -y`
+    (`name-version`) and `dnf upgrade -y` for `latest`, `dnf remove -y`; a declared version matches
+    the installed one with or without its release. apk: apk's database `/lib/apk/db/installed` and
+    `apk version -l '<'` probe (a newer version is keyed by the installed one, so no version
+    comparison is done in Fettle); `apk add` (`name=version`, which pins it in `world`), `apk add -u`
+    for `latest`, `apk del`. Removals run before installs. Package names are ASCII letters, digits and
+    `. + _ -`, not starting with a symbol; versions add `~ :`. The manager comes from the `Distro`
+    fact; `provider =` is not read yet. Review with the user.
+53. **`aptRepository`'s fields** are `uris`, `suites`, `components`, `architectures` (lists of
+    strings), `key` (an `https://`, `http://` or `file:///` URL) and `keySha256` (64 lowercase hex
+    digits), and `present`. Its file is `/etc/apt/sources.list.d/<name>.sources` in deb822 form
+    (`Types: deb`, then the fields given, then `Signed-By:`); a repository with no `components` names
+    each suite as an exact path ending in `/`. The key is fetched on the host with `curl -fsSL`, else
+    `wget`, to a temporary file in `/etc/apt/keyrings`, and refused unless its SHA-256 is the pin,
+    before anything is written. It is **kept as fetched, not dearmored**: `<name>.asc` when it starts
+    with `-----BEGIN PGP PUBLIC KEY BLOCK-----`, `<name>.gpg` otherwise. apt reads an armored key
+    named `.asc` in `Signed-By` since 1.4, so Debian 12 (apt 2.6) and Ubuntu 24.04 (apt 2.7) need no
+    `gpg`, which minimal images lack; Docker's own instructions for both write `docker.asc` the same
+    way. A key already matching its pin is not fetched again. The repositories written in one step
+    run `apt-get update` once after; a removed one (`rm -f` of its file and keys) does not refresh.
+    Every `package` is ordered after every `aptRepository` (a known relationship, shown as "packages
+    come after apt repositories"). Review with the user.
+54. **Services.** systemd's probe reads `LoadState`, `is-enabled`, `is-active` and
+    `NeedDaemonReload`. `enabled`, `enabled-runtime`, `alias`, `linked` and `linked-runtime` are
+    enabled; `static`, `indirect`, `generated` and `transient` units are as declared whichever way
+    (systemd decides them); a masked unit declared running or enabled cannot be planned. A unit not
+    installed yet (its package comes in the same run) plans as `start, enable (not installed yet)`.
+    Steps are `systemctl enable --now` or `disable --now` when both change, one command each
+    otherwise, after `systemctl daemon-reload` when systemd reports the unit changed on disk or a
+    `file` of the unit (`/etc/systemd/system/<unit>` or a drop-in under `<unit>.d/`) changed in this
+    run since the last reload; an action reloads first under the same rule. On OpenRC, enabled means
+    in the `default` runlevel (`rc-update add|del <name> default`), running is `rc-service <name>
+    status`, and existence `rc-service --exists`. A host whose `init` is `NoInit` or `Launchd` cannot
+    plan a service, and says so. Actions run as named (`systemctl reload`, `rc-service <name>
+    reload`), so a reload of a stopped service fails. Review with the user.
+55. **A restart does what a reload or a start would**: when one run asks for a restart and a reload
+    of one service (from triggers or the pending record), the plan shows one restart with the
+    sources of both, the apply runs it once, and it clears both from the pending record. A provider
+    says which of its actions subsume which. Review with the user.
+56. **`staged` stands for the staged file wherever it lands in `validate`**: the evaluator makes it
+    the path `${staged}`, which the `file` provider reads as `%s` (decision 36) as an argument,
+    inside a word (`--config=${staged}`) and in shell text, quoted or not. Until now only a literal
+    `%s` was read, so example 2.2's `cmd("visudo", "-cf", staged)` could not be planned. Review with
+    the user.

@@ -1,0 +1,290 @@
+module tests
+
+import avin.crypto
+import avin.encoding
+import avin.fs
+import dev.avinlang.fettle.engine.{Failed, aptRepoOf, aptSourcesLines}
+import dev.avinlang.fettle.eval.{evaluate}
+import dev.avinlang.fettle.graph.{BoolV, GraphBuilder, ListV, Node, Repository, StrV, Value}
+import dev.avinlang.fettle.project.{Project, checkProject, filesUnder, load, under}
+import dev.avinlang.fettle.syntax.{parseSource}
+import dev.avinlang.fettle.fmt.{format}
+
+// `aptRepository`: its checks, the deb822 file and the key it writes on a stub host (the key fetched
+// with curl from a `file://` URL and checked against its pin), packages ordered after it, the index
+// refreshed once after it, and the Caddy program planned against the Debian fixture.
+
+// An ASCII-armored key, as Caddy's `gpg.key` begins.
+val armoredKey: string = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmQINBGSm1x0BEAC8test\n-----END PGP PUBLIC KEY BLOCK-----\n"
+
+// The SHA-256 of `text`, in lowercase hexadecimal.
+sha(text: string) -> string = encoding.toHex(crypto.sha256(text.utf8.toVector))
+
+// Caddy's repository, its key at `key` pinned to `pin`, with `more` fields.
+caddyRepo(key: string, pin: string, more: List[(string, Value)] = []) -> Node
+  val fields: List[(string, Value)] = [
+    ("uris", ListV([StrV("https://dl.cloudsmith.io/public/caddy/stable/deb/debian")])),
+    ("suites", ListV([StrV("any-version")])),
+    ("components", ListV([StrV("main")])),
+    ("key", StrV(key)),
+    ("keySha256", StrV(pin))
+  ]
+  node("aptRepository", "caddy-stable", 1, fields ++ more)
+
+// A stub host with `text` as the key served at `<dir>/key`.
+keyHost(name: string, text: string) -> string
+  val dir = stubHost(name)
+  _ = fs.writeText(s"$dir/key", text)
+  dir
+
+// The sources file the repository of `dir` is expected to hold, its key `<name>.<ext>`.
+sourcesIn(dir: string, ext: string) -> string =
+  "Types: deb\nURIs: https://dl.cloudsmith.io/public/caddy/stable/deb/debian\nSuites: any-version\nComponents: main\n"
+    + s"Signed-By: $dir/apt/keyrings/caddy-stable.$ext\n"
+
+@test("a repository is written as a deb822 file with its fetched key, the index refreshed, then nothing to do")
+repositoryCreated()
+  val dir = keyHost("repo-create", armoredKey)
+  val g = graphOf([caddyRepo(s"file://$dir/key", sha(armoredKey))])
+  val e = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e, g, "debian12")
+  assertEq(
+    planText(p, dir).lines(1),
+    " + aptRepository caddy-stable https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
+  )
+  assertEq(outcomesOf(e.apply(p)), "changed")
+  assertEq(logOf(dir), "apt-get update\n")
+  assertEq(textAt(s"$dir/apt/keyrings/caddy-stable.asc"), armoredKey)
+  assertEq(textAt(s"$dir/apt/sources.list.d/caddy-stable.sources"), sourcesIn(dir, "asc"))
+  assertEq(modeOf(s"$dir/apt/keyrings/caddy-stable.asc"), "644")
+  assertEq(modeOf(s"$dir/apt/sources.list.d/caddy-stable.sources"), "644")
+  assertEq(entriesOf(s"$dir/apt/keyrings"), "caddy-stable.asc\n")
+  assertEq(entriesOf(s"$dir/apt"), "keyrings\nsources.list.d\n")
+  assertEq(stubPlan(stubEngine(dir, StubTransport(dir)), g, "debian12").hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("a key whose SHA-256 is not the pin is refused before anything is written")
+keyHashMismatch()
+  val dir = keyHost("repo-mismatch", armoredKey)
+  val pin = sha("another key")
+  val e = stubEngine(dir, StubTransport(dir))
+  val a = e.apply(stubPlan(e, graphOf([caddyRepo(s"file://$dir/key", pin)]), "debian12"))
+  assertEq(outcomesOf(a), "failed")
+  val err = a.outcomes(0) match
+    Failed(f) -> f.stderr.mkString("\n")
+    _ -> ""
+  assertEq(err, s"the key at file://$dir/key has SHA-256 ${sha(armoredKey)}, not the pinned $pin")
+  assertEq(entriesOf(s"$dir/apt/keyrings"), "")
+  assertEq(fs.exists(s"$dir/apt/sources.list.d/caddy-stable.sources"), false)
+  assertEq(logOf(dir), "")
+  _ = fs.removeDirAll(dir)
+
+@test("a key that cannot be fetched fails the repository, and nothing is written")
+keyMissing()
+  val dir = stubHost("repo-nokey")
+  val e = stubEngine(dir, StubTransport(dir))
+  val a = e.apply(stubPlan(e, graphOf([caddyRepo(s"file://$dir/nokey", sha("x"))]), "debian12"))
+  assertEq(outcomesOf(a), "failed")
+  assertEq(entriesOf(s"$dir/apt/keyrings"), "")
+  _ = fs.removeDirAll(dir)
+
+@test("a binary key is kept as `.gpg`, and replaces an armored one of the same name")
+binaryKey()
+  val binary = "\u{99}\u{02}\u{0D}\u{04}binary key packet"
+  val dir = keyHost("repo-binary", armoredKey)
+  val e = stubEngine(dir, StubTransport(dir))
+  _ = e.apply(stubPlan(e, graphOf([caddyRepo(s"file://$dir/key", sha(armoredKey))]), "debian12"))
+  _ = fs.writeText(s"$dir/key", binary)
+  val g = graphOf([caddyRepo(s"file://$dir/key", sha(binary))])
+  val e2 = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e2, g, "debian12")
+  assertEq(
+    planText(p, dir).lines(1),
+    s" ~ aptRepository caddy-stable key ${sha(armoredKey).slice(0, 12)} -> ${sha(binary).slice(0, 12)}"
+  )
+  assertEq(outcomesOf(e2.apply(p)), "changed")
+  assertEq(entriesOf(s"$dir/apt/keyrings"), "caddy-stable.gpg\n")
+  assertEq(textAt(s"$dir/apt/sources.list.d/caddy-stable.sources"), sourcesIn(dir, "gpg"))
+  assertEq(stubPlan(stubEngine(dir, StubTransport(dir)), g, "debian12").hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("a changed field rewrites the sources file without fetching the key again, its diff in the plan")
+sourcesChanged()
+  val dir = keyHost("repo-sources", armoredKey)
+  val e = stubEngine(dir, StubTransport(dir))
+  _ = e.apply(stubPlan(e, graphOf([caddyRepo(s"file://$dir/key", sha(armoredKey))]), "debian12"))
+  val g = graphOf(
+    [caddyRepo(s"file://$dir/key", sha(armoredKey), [("architectures", ListV([StrV("amd64"), StrV("arm64")]))])]
+  )
+  val t = StubTransport(dir)
+  val e2 = stubEngine(dir, t)
+  val p = stubPlan(e2, g, "debian12")
+  assertEq(
+    planText(p, dir).lines.slice(1, 4),
+    [" ~ aptRepository caddy-stable", " @@ -4,0 +5 @@", " +Architectures: amd64 arm64"]
+  )
+  assertEq(outcomesOf(e2.apply(p)), "changed")
+  assert(!t.scripts.exists(s -> s.contains("curl")))
+  assert(
+    textAt(s"$dir/apt/sources.list.d/caddy-stable.sources").contains(
+      "Components: main\nArchitectures: amd64 arm64\nSigned-By: "
+    )
+  )
+  assertEq(logOf(dir), "apt-get update\napt-get update\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a repository declared absent is removed with its keys, and the index is left alone")
+repositoryRemoved()
+  val dir = keyHost("repo-remove", armoredKey)
+  val e = stubEngine(dir, StubTransport(dir))
+  _ = e.apply(stubPlan(e, graphOf([caddyRepo(s"file://$dir/key", sha(armoredKey))]), "debian12"))
+  val gone = graphOf([caddyRepo(s"file://$dir/key", sha(armoredKey), [("present", BoolV(false))])])
+  val e2 = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e2, gone, "debian12")
+  assertEq(planText(p, dir).lines(1), " - aptRepository caddy-stable remove")
+  assertEq(outcomesOf(e2.apply(p)), "changed")
+  assertEq(entriesOf(s"$dir/apt/keyrings"), "")
+  assertEq(entriesOf(s"$dir/apt/sources.list.d"), "")
+  assertEq(logOf(dir), "apt-get update\n")
+  assertEq(stubPlan(stubEngine(dir, StubTransport(dir)), gone, "debian12").hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("two repositories next to each other are written together and refresh the index once")
+twoRepositories()
+  val dir = keyHost("repo-two", armoredKey)
+  val other = node(
+    "aptRepository",
+    "nodesource",
+    2,
+    [
+      ("uris", ListV([StrV("https://deb.nodesource.com/node_22.x")])),
+      ("suites", ListV([StrV("nodistro")])),
+      ("components", ListV([StrV("main")])),
+      ("key", StrV(s"file://$dir/key")),
+      ("keySha256", StrV(sha(armoredKey)))
+    ]
+  )
+  val e = stubEngine(dir, StubTransport(dir))
+  assertEq(
+    outcomesOf(e.apply(stubPlan(e, graphOf([caddyRepo(s"file://$dir/key", sha(armoredKey)), other]), "debian12"))),
+    "changed changed"
+  )
+  assertEq(logOf(dir), "apt-get update\n")
+  assertEq(entriesOf(s"$dir/apt/sources.list.d"), "caddy-stable.sources\nnodesource.sources\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a package comes after every apt repository, wherever it is declared, and installs after one refresh")
+packageAfterRepository()
+  val b = GraphBuilder()
+  b.add(node("package", "caddy", 1))
+  b.add(node("aptRepository", "caddy-stable", 2))
+  b.add(node("package", "curl", 3))
+  val g = b.finish()
+  assertEq(g.nodes.map(n -> n.id.shown).mkString(", "), "aptRepository caddy-stable, package caddy, package curl")
+  assertEq(g.edges.filter(e -> e.why == Repository).length, 2)
+  assertEq(Repository.shown, "packages come after apt repositories")
+  val dir = keyHost("repo-package", armoredKey)
+  put(dir, "next/caddy", "2.9.1")
+  val ordered = graphOf([node("package", "caddy", 1), caddyRepo(s"file://$dir/key", sha(armoredKey))])
+  val e = stubEngine(dir, StubTransport(dir))
+  val p = stubPlan(e, ordered, "debian12")
+  assertEq(planText(p, dir).lines(2), " + package caddy install")
+  assertEq(outcomesOf(e.apply(p)), "changed changed")
+  assertEq(
+    logOf(dir),
+    "apt-get update\napt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold caddy\n"
+  )
+  assertEq(textAt(s"$dir/dpkg/caddy"), "installed 2.9.1\n")
+  _ = fs.removeDirAll(dir)
+
+@test("an apt repository's fields are checked before anything runs")
+repositoryChecks()
+  val pin = sha("k")
+  val ok = caddyRepo("https://example.com/key.asc", pin)
+  assertEq(aptRepoOf(ok).map(r -> r.name), Ok("caddy-stable"))
+  assertEq(
+    aptSourcesLines(aptRepoOf(ok).ok.get, "/etc/apt/keyrings/caddy-stable.asc"),
+    [
+      "Types: deb",
+      "URIs: https://dl.cloudsmith.io/public/caddy/stable/deb/debian",
+      "Suites: any-version",
+      "Components: main",
+      "Signed-By: /etc/apt/keyrings/caddy-stable.asc"
+    ]
+  )
+  val bad = (fields: List[(string, Value)]) -> aptRepoOf(
+    node("aptRepository", "r", 1, fields)
+  ).err.getOrElse("accepted")
+  val base: List[(string, Value)] = [
+    ("uris", ListV([StrV("https://e.com/deb")])),
+    ("suites", ListV([StrV("stable")])),
+    ("components", ListV([StrV("main")])),
+    ("key", StrV("https://e.com/key")),
+    ("keySha256", StrV(pin))
+  ]
+  assertEq(bad(base), "accepted")
+  assertEq(bad(base.filter((k, _) -> k != "uris")), "an aptRepository needs `uris`")
+  assertEq(bad(base.filter((k, _) -> k != "suites")), "an aptRepository needs `suites`")
+  assertEq(bad(base.filter((k, _) -> k != "key")), "an aptRepository needs `key`, the URL of its signing key")
+  assertEq(
+    bad(base.filter((k, _) -> k != "keySha256")),
+    "an aptRepository needs `keySha256`, the SHA-256 its key must have"
+  )
+  assertEq(
+    bad(base.filter((k, _) -> k != "components")),
+    "an aptRepository with no `components` names each suite as an exact path ending in `/`"
+  )
+  assertEq(
+    bad(("suites", ListV([StrV("./")])) :: base.filter((k, _) -> k != "suites" && k != "components")),
+    "accepted"
+  )
+  val replaced = (f: string, v: Value) -> (f, v) :: base.filter((k, _) -> k != f)
+  assertEq(bad(replaced("keySha256", StrV(pin.slice(0, 63)))).startsWith("`keySha256` is 64"), true)
+  assertEq(bad(replaced("keySha256", StrV(pin.replace("a", "A")))).startsWith("`keySha256` is 64"), pin.contains("a"))
+  assertEq(
+    bad(replaced("key", StrV("ftp://e.com/key"))),
+    "`key` is the URL of the signing key (https://…), not `ftp://e.com/key`"
+  )
+  assertEq(
+    bad(replaced("uris", ListV([StrV("https://e.com/a b")]))),
+    "`https://e.com/a b` in `uris` holds white space, a control character or `#`"
+  )
+  assertEq(bad(replaced("suites", ListV([StrV("stable\nX: y")]))).contains("white space"), true)
+  assertEq(bad(replaced("uris", ListV([StrV("")]))).contains("white space"), true)
+  for name in ["", ".hidden", "-x", "a b", "a/b", "caddy:stable", "ünï"]
+    assertEq(aptRepoOf(node("aptRepository", name, 1, base)).isErr, true)
+  for name in ["caddy-stable", "docker_ce", "pg.16", "X1"]
+    assertEq(aptRepoOf(node("aptRepository", name, 1, base)).isOk, true)
+
+// --- the Caddy program -----------------------------------------------------------------------------
+
+val caddySite: string = "tests/examples/caddy"
+
+@test("the Caddy program checks clean, formats to itself, and plans against the Debian fixture")
+caddyProgram()
+  val p = load(caddySite).getOrElse(Project("", [], [], [], []))
+  assertEq(p.files.map(f -> f.path).mkString(" "), "inventory.fettle roles/caddy.fettle")
+  assertEq(checkProject(p).map(d -> shown(d)).mkString("\n"), "")
+  for rel in filesUnder(caddySite, "", ".fettle")
+    val text = fs.readText(under(caddySite, rel)).getOrElse("")
+    assertEq(format(parseSource(rel, text).file), text)
+  val ev = evaluate(p.files, "vps", facts("debian12"), x -> p.read(x), p.templates)
+  assertEq(ev.diagnostics.map(d -> shown(d)).mkString("\n"), "")
+  assertEq(
+    ev.graph.nodes.map(n -> n.id.shown).mkString(", "),
+    "aptRepository caddy-stable, package caddy, file /etc/caddy/Caddyfile, service caddy"
+  )
+  val dir = stubHost("caddy-program")
+  val plan = stubEngine(dir, StubTransport(dir)).plan("vps", facts("debian12"), ev.graph) match
+    Ok(x) -> x
+    Err(m) -> fail(m)
+  assertEq(
+    planText(plan, dir),
+    "vps (debian 12, amd64)\n" + " + aptRepository caddy-stable https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main\n"
+      + " + package caddy install\n"
+      + " + file /etc/caddy/Caddyfile 3 lines\n"
+      + " ~ service caddy start, enable (not installed yet)\n"
+      + " > service caddy reload (file /etc/caddy/Caddyfile)\n"
+      + "\nPlan: 1 host; 3 to create, 1 to change, 0 to remove, 1 action.\n"
+  )
+  _ = fs.removeDirAll(dir)

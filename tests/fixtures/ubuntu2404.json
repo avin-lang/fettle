@@ -1,0 +1,1 @@
+{"os": "Linux", "distro": "Ubuntu", "version": "24.04", "arch": "Arm64", "init": "Systemd", "cpus": 4, "memory": 8323002368, "hostname": "vps-7f3a", "user": "ubuntu", "root": false}

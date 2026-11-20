@@ -100,6 +100,18 @@ val downloadKind: KindSpec = KindSpec("download", PathT, "Download", [
   FieldSpec("mode", ModeT)
 ])
 
+// A vendor's apt repository (decision 17): a deb822 `.sources` file naming a signing key fetched
+// from `key` and pinned by `keySha256`.
+val aptRepositoryKind: KindSpec = KindSpec("aptRepository", StringT, "AptRepository", [
+  FieldSpec("uris", ListT(StringT)),
+  FieldSpec("suites", ListT(StringT)),
+  FieldSpec("components", ListT(StringT)),
+  FieldSpec("architectures", ListT(StringT)),
+  FieldSpec("key", StringT),
+  FieldSpec("keySha256", StringT),
+  FieldSpec("present", BoolT, false, "true")
+])
+
 // Every built-in kind of phase 1, in the order the design lists them.
 val builtinKinds: List[KindSpec] = [
   packageKind,
@@ -110,7 +122,8 @@ val builtinKinds: List[KindSpec] = [
   directoryKind,
   symlinkKind,
   commandKind,
-  downloadKind
+  downloadKind,
+  aptRepositoryKind
 ]
 
 // The built-in kind named `name`.

@@ -4,7 +4,10 @@ import dev.avinlang.fettle.kinds.{ContentT, ModeT, PathT, builtinKinds, kindName
 
 @test("phase 1's kinds are known by name, and nothing else is")
 kindNames()
-  assertEq(builtinKinds.map(k -> k.name).mkString(" "), "package service user group file directory symlink command download")
+  assertEq(builtinKinds.map(k -> k.name).mkString(" "), "package service user group file directory symlink command download aptRepository")
+  assertEq(kindNamed("aptRepository").map(k -> k.refType), Some("AptRepository"))
+  assertEq(kindNamed("aptRepository").get.fields.map(f -> f.name).mkString(" "), "uris suites components architectures key keySha256 present")
+  assertEq(kindNamed("aptRepository").get.actions.isEmpty, true)
   assertEq(kindNamed("file").isDefined, true)
   assertEq(kindNamed("sysctl").isDefined, false)
   assertEq(kindNamed("File").isDefined, false)

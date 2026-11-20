@@ -1,5 +1,6 @@
 module dev.avinlang.fettle.engine
 
+import avin.collections.mutable.{Map as Table}
 import avin.random.{Random}
 import dev.avinlang.json.{Arr, Str, parse as parseJson, quote as jsonQuote}
 import dev.avinlang.fettle.facts.{Facts}
@@ -153,20 +154,32 @@ class Engine(
   // Whether the host has been changed during this apply, so that a plan's probe may be stale.
   private var touched = false
 
+  // The outputs of the probes run since the host last changed, by their commands.
+  private val probed = Table[string, Vector[Output]]()
+
   // The plan of `graph` on the host `host`, whose facts are `facts`: every resource's probe and the
   // pending record read in one round trip. An error is a host that could not be probed.
   plan(host: string, facts: Facts, graph: Graph) -> Result[Plan, string]
+    ctx.facts = Some(facts)
+    ctx.graph = Some(graph)
     val f = hostPath(pendingFile)?
     val commands = Buffer[Command]()
     commands += Shell(s"f=$f\nif [ -f \"$$f\" ]; then cat \"$$f\"; fi")
-    val slots = Buffer[Result[(int, int), string]]()
+    val slots = Buffer[Result[Vector[int], string]]()
     for node in graph.nodes
       providers(node.id.kind) match
         None -> slots += Err(s"there is no provider for `${node.id.kind}` yet")
         Some(p) -> p.probes(node, ctx) match
           Ok(cs) ->
-            slots += Ok((commands.length, cs.length))
-            commands ++= cs
+            // A command another resource's probe already runs (every package's) runs once.
+            val at = Buffer[int]()
+            for c in cs
+              val k = commands.indexWhere(x -> x == c)
+              if k >= 0 then at += k
+              else
+                at += commands.length
+                commands += c
+            slots += Ok(at.toVector)
           Err(e) -> slots += Err(e)
     val outputs = runProbes(commands.toVector)?
     if !outputs(0).succeeded then return Err(s"the pending record cannot be read: ${outputs(0).stderr.trim}")
@@ -175,7 +188,7 @@ class Engine(
     var i = 0
     for node in graph.nodes
       val delta = slots(i) match
-        Ok((start, n)) -> providers(node.id.kind).get.delta(node, outputs.slice(start, start + n), ctx)
+        Ok(at) -> providers(node.id.kind).get.delta(node, at.map(k -> outputs(k)), ctx)
         Err(e) -> Err(e)
       entries += Entry(node, delta)
       i += 1
@@ -206,7 +219,25 @@ class Engine(
       if !out.exists(
         a -> a.target == target && a.action == p.action
       ) then out += PlannedAction(target, p.action, [], true)
-    out.toVector.sortBy(a -> a.target)
+    // An action another on the same resource does too (a reload under a restart) is folded into it.
+    val kept = Buffer[PlannedAction]()
+    for a in out
+      if !out.exists(b -> b.target == a.target && subsumes(a.target, graph, b.action, a.action))
+        var merged = a
+        for b in out
+          if b.target == a.target && subsumes(a.target, graph, a.action, b.action)
+            merged = PlannedAction(
+              merged.target,
+              merged.action,
+              merged.sources ++ b.sources.filter(s -> !merged.sources.contains(s)),
+              merged.pending || b.pending
+            )
+        kept += merged
+    kept.toVector.sortBy(a -> a.target)
+
+  // Whether the action `action` on the resource at `target` also does what `other` would.
+  private subsumes(target: int, graph: Graph, action: string, other: string) -> bool =
+    action != other && providers(graph.nodes(target).id.kind).exists(p -> p.subsumes(action, other))
 
   // Runs `commands` as one probe script, answering their outputs.
   private runProbes(commands: Vector[Command]) -> Result[Vector[Output], string]
@@ -215,18 +246,28 @@ class Engine(
     val ran = transport.run(script, Array.empty[byte]()).mapErr(e -> e.message)?
     parseProbe(ran.stdout, marker, commands.length).mapErr(e -> s"$e (the probe ${ran.endingText}: ${ran.err.trim})")
 
-  // What `node` needs now, from a probe of it alone.
+  // What `node` needs now, from a probe of it alone. A probe whose commands already ran since the
+  // host last changed is answered from that run (every package of a host shares one probe).
   private probeOne(p: Provider, node: Node) -> Result[Delta, string]
-    val outputs = runProbes(p.probes(node, ctx)?)?
+    val commands = p.probes(node, ctx)?
+    val key = commands.map(c -> c.render.getOrElse("")).mkString("\n")
+    val outputs = probed.get(key) match
+      Some(o) -> o
+      None ->
+        val o = runProbes(commands)?
+        probed(key) = o
+        o
     p.delta(node, outputs, ctx)
 
   // Runs one step, answering why it failed, if it did.
-  private run(step: Step) -> Option[Failure] = transport.run(step.script, step.input) match
-    Err(e) -> Some(Failure(e.message, step.shown, "", []))
-    Ok(r) if r.succeeded -> None
-    Ok(r) ->
-      val err = if step.withheld then ["(not shown: the step handles a secret)"] else lastLines(r.err, 20)
-      Some(Failure("a command failed", step.shown, r.endingText, err))
+  private run(step: Step) -> Option[Failure]
+    probed.clear()
+    transport.run(step.script, step.input) match
+      Err(e) -> Some(Failure(e.message, step.shown, "", []))
+      Ok(r) if r.succeeded -> None
+      Ok(r) ->
+        val err = if step.withheld then ["(not shown: the step handles a secret)"] else lastLines(r.err, 20)
+        Some(Failure("a command failed", step.shown, r.endingText, err))
 
   // Writes the pending record as `record` holds it, removing it when it is empty.
   private writeRecord(record: Buffer[Pending]) -> Option[Failure]
@@ -244,6 +285,10 @@ class Engine(
   // Applies `plan`: each resource in the graph's order, then the actions on it.
   apply(plan: Plan) -> Applied
     touched = false
+    probed.clear()
+    // The providers read the host's facts and graph from the plan, whichever engine made it.
+    ctx.facts = Some(plan.facts)
+    ctx.graph = Some(plan.graph)
     val g = plan.graph
     val outcomes = Buffer[Outcome]()
     for _ in 0 ..< g.nodes.length
@@ -252,15 +297,18 @@ class Engine(
     val record = Buffer[Pending]()
     record ++= plan.recorded
     val fired = Buffer[(int, string)]()
+    // Outcomes of resources applied together with an earlier one, by their index.
+    val decided = Table[int, Outcome]()
     if !plan.dropped.isEmpty
       record.filterInPlace(p -> !plan.dropped.contains(p))
       _ = writeRecord(record)
     for i in 0 ..< g.nodes.length
       val node = g.nodes(i)
       val blocker = g.edges.find(e -> e.to == i && outcomes(e.from).blocks)
-      outcomes(i) = blocker match
-        Some(e) -> Skipped(e.from)
-        None -> resource(plan, i, record, fired)
+      outcomes(i) = (decided.get(i), blocker) match
+        (Some(o), _) -> o
+        (None, Some(e)) -> Skipped(e.from)
+        (None, None) -> resource(plan, i, outcomes, record, fired, decided)
       listener(node, "", outcomes(i))
       if !outcomes(i).blocks
         for a in actionsFor(plan, i, record, fired)
@@ -283,25 +331,62 @@ class Engine(
         out += t.action
     for p in record
       if p.id == id && !out.contains(p.action) then out += p.action
-    out.toVector
+    out.toVector.filter(a -> !out.exists(b -> subsumes(i, plan.graph, b, a)))
 
-  // Applies the resource at `i`.
-  private resource(plan: Plan, i: int, record: Buffer[Pending], fired: Buffer[(int, string)]) -> Outcome
+  // What the resource at `i` needs now: the plan's finding, or a fresh probe once the host has
+  // changed in this run.
+  private current(plan: Plan, p: Provider, i: int) -> Result[Delta, string] =
+    if touched then probeOne(p, plan.graph.nodes(i)) else plan.entries(i).delta
+
+  // Applies the resource at `i`, together with the resources of its kind that follow it with nothing
+  // ordering them after it or after a resource that failed, when its provider batches; their
+  // outcomes go into `decided`.
+  private resource(
+      plan: Plan,
+      i: int,
+      outcomes: Buffer[Outcome],
+      record: Buffer[Pending],
+      fired: Buffer[(int, string)],
+      decided: Table[int, Outcome]
+  ) -> Outcome
     val g = plan.graph
     val node = g.nodes(i)
     val provider = providers(node.id.kind) match
       Some(p) -> p
       None -> return Failed(Failure(s"there is no provider for `${node.id.kind}` yet", "", "", []))
-    var delta = plan.entries(i).delta match
+    val delta = current(plan, provider, i) match
       Ok(d) -> d
       Err(e) -> return Failed(Failure(e, "", "", []))
-    if touched
-      delta = probeOne(provider, node) match
-        Ok(d) -> d
-        Err(e) -> return Failed(Failure(e, "", "", []))
     if delta.inSync then return Unchanged
-    // Record the actions this change triggers before making it.
-    val triggers = g.triggers.filter(t -> t.sources.contains(i))
+    val group = Buffer[(int, Delta)]()
+    group += (i, delta)
+    if provider.batches
+      var j = i + 1
+      while j < g.nodes.length && g.nodes(j).id.kind == node.id.kind && !g.edges.exists(
+        e -> e.to == j && (e.from >= i || outcomes(e.from).blocks)
+      )
+        current(plan, provider, j) match
+          Ok(d) -> if !d.inSync then group += (j, d)
+          Err(_) -> break
+        j += 1
+    val ended = together(g, provider, group.toVector, record, fired)
+    for k in 1 ..< group.length
+      val (at, _) = group(k)
+      decided(at) = ended(k)
+    ended(0)
+
+  // Applies the resources of `group` (each with what it needs) with one set of steps, answering
+  // each one's outcome.
+  private together(
+      g: Graph,
+      provider: Provider,
+      group: Vector[(int, Delta)],
+      record: Buffer[Pending],
+      fired: Buffer[(int, string)]
+  ) -> Vector[Outcome]
+    val all = (o: Outcome) -> group.map(_ -> o)
+    // Record the actions these changes trigger before making them.
+    val triggers = g.triggers.filter(t -> group.exists((k, _) -> t.sources.contains(k)))
     var added = false
     for t in triggers
       val p = Pending(g.nodes(t.target).id, t.action)
@@ -310,26 +395,41 @@ class Engine(
         added = true
     if added
       writeRecord(record) match
-        Some(f) -> return Failed(f)
+        Some(f) -> return all(Failed(f))
         None -> ()
-    val steps = provider.steps(node, delta, ctx) match
+    val (first, firstDelta) = group(0)
+    val made =
+      if provider.batches then provider.together(group.map((k, d) -> (g.nodes(k), d)), ctx)
+      else provider.steps(g.nodes(first), firstDelta, ctx)
+    val steps = made match
       Ok(s) -> s
-      Err(e) -> return Failed(Failure(e, "", "", []))
+      Err(e) -> return all(Failed(Failure(e, "", "", [])))
     touched = true
     for s in steps
       run(s) match
-        Some(f) -> return Failed(f)
+        Some(f) -> return all(Failed(f))
         None -> ()
-    if !runs(delta.op)
-      val after = probeOne(provider, node) match
-        Ok(d) -> d
-        Err(e) -> return Failed(Failure(s"it cannot be verified: $e", "", "", []))
-      if !after.inSync
-        val what = if after.summary.nonEmpty then after.summary else after.changes.map(c -> c.field).mkString(", ")
-        return Failed(Failure(s"it did not converge: $what", "", "", []))
-    for t in triggers
-      if !fired.contains((t.target, t.action)) then fired += (t.target, t.action)
-    Changed
+    val out = Buffer[Outcome]()
+    for (k, d) in group
+      val node = g.nodes(k)
+      // A command that ran is not probed again: its exit status was its outcome.
+      val verified =
+        if runs(d.op) then Ok(())
+        else probeOne(provider, node) match
+          Err(e) -> Err(Failure(s"it cannot be verified: $e", "", "", []))
+          Ok(after) if !after.inSync ->
+            val what = if after.summary.nonEmpty then after.summary else after.changes.map(c -> c.field).mkString(", ")
+            Err(Failure(s"it did not converge: $what", "", "", []))
+          Ok(_) -> Ok(())
+      val outcome = verified match
+        Err(f) -> Failed(f)
+        Ok(_) ->
+          ctx.changed += node.id
+          for t in triggers
+            if t.sources.contains(k) && !fired.contains((t.target, t.action)) then fired += (t.target, t.action)
+          Changed
+      out += outcome
+    out.toVector
 
   // Runs the action `a` on `node`, and clears it from the pending record once it has run.
   private action(node: Node, a: string, record: Buffer[Pending]) -> Outcome
@@ -344,9 +444,10 @@ class Engine(
       run(s) match
         Some(f) -> return Failed(Failure(s"the action `$a` failed", f.command, f.ending, f.stderr))
         None -> ()
-    val p = Pending(node.id, a)
-    if record.contains(p)
-      record.filterInPlace(x -> x != p)
+    // The action clears itself and every action it does the work of from the record.
+    val done = (x: Pending) -> x.id == node.id && (x.action == a || provider.subsumes(a, x.action))
+    if record.exists(done)
+      record.filterInPlace(x -> !done(x))
       writeRecord(record) match
         Some(f) -> return Failed(f)
         None -> ()

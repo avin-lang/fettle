@@ -1,0 +1,22 @@
+// roles/caddy.fettle
+module roles
+
+// Caddy from its own apt repository, serving `domain` with the certificates it obtains itself.
+role caddy(domain: string)
+  aptRepository "caddy-stable"
+    uris = ["https://dl.cloudsmith.io/public/caddy/stable/deb/debian"]
+    suites = ["any-version"]
+    components = ["main"]
+    key = "https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
+    keySha256 = "783dfee04b19e851a928cd87b34710213ebbe7628f98d9f34595ab83be578c00"
+
+  package "caddy"
+
+  val conf = file "/etc/caddy/Caddyfile"
+    content = "${domain} {\n  respond \"hello\"\n}\n"
+    validate = cmd("caddy", "validate", "--config", staged, "--adapter", "caddyfile")
+
+  service "caddy"
+    running = true
+    enabled = true
+    on conf -> reload

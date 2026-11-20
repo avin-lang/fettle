@@ -1,0 +1,505 @@
+module dev.avinlang.fettle.engine
+
+import dev.avinlang.fettle.graph.{BoolV, DurationV, ListV, Node, StrV, durationText}
+import dev.avinlang.fettle.shell.{Command, Output, Shell, quote}
+
+// The providers of `package` and `aptRepository`.
+//
+// A host's packages are probed by one command, which every `package` of the host shares (the engine
+// runs a command two probes share once): it prints `installed:<name>=installed <version>` for each
+// installed package, the version the manager would install as `candidate:<name>=<version>` (apt,
+// dnf) or, for an installed package with a newer one, `upgrade:<name>-<installed>=<version>` (apk),
+// and `index-age=<seconds>` since the package index was last refreshed (apt, apk). Packages that
+// stand next to each other in the order install in one transaction. The index is refreshed at most
+// once a run, before something is installed or upgraded, when it is older than the package's
+// `refresh` (one hour unless set); a changed `aptRepository` refreshes it itself.
+
+// The package manager of a host.
+data Manager
+  Apt
+  Dnf
+  Apk
+
+// The manager of the distribution `distro`, a variant name of `Distro`.
+managerFor(distro: string) -> Result[Manager, string] = distro match
+  "Debian" | "Ubuntu" -> Ok(Apt)
+  "Rhel" | "Fedora" -> Ok(Dnf)
+  "Alpine" -> Ok(Apk)
+  d -> Err(s"packages on $d are not supported yet (apt, dnf and apk are)")
+
+// The manager of the host whose facts `ctx` holds.
+private managerOf(ctx: Context) -> Result[Manager, string] = ctx.facts match
+  Some(f) -> managerFor(f.distro)
+  None -> Err("the host's facts are not known")
+
+// Whether `c` may stand in a package name or version: ASCII letters and digits and `. + _ -`, and
+// in a version also `~` and `:`.
+private nameChar(
+    c: char
+) -> bool = 'a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9' || c == '.' || c == '+' || c == '_' || c == '-'
+
+private versionChar(c: char) -> bool = nameChar(c) || c == '~' || c == ':'
+
+// Whether `name` is a package name every manager takes: plain characters, not starting with one a
+// command would read as an option or a hidden file.
+validPackageName(name: string) -> bool =
+  name.nonEmpty && !name.exists(c -> !nameChar(c)) && !(
+    name.startsWith("-") || name.startsWith(".") || name.startsWith("+") || name.startsWith("_")
+  )
+
+// Whether `v` is a package version: plain characters, not starting with `-`.
+validVersion(v: string) -> bool = v.nonEmpty && !v.exists(c -> !versionChar(c)) && !v.startsWith("-")
+
+// The version `node` declares: none, `latest`, or an exact one.
+private declaredVersion(node: Node) -> Result[Option[string], string] = node.field("version") match
+  None -> Ok(None)
+  Some(StrV(v)) if v == "latest" || validVersion(v) -> Ok(Some(v))
+  Some(StrV(v)) -> Err(s"`$v` is not a package version (exact, such as `2.8.4-1`, or `latest`)")
+  Some(other) -> Err(s"a package's `version` is a string, not `${other.shown}`")
+
+// Whether the package `node` is declared present (the default).
+private wantsPackage(node: Node) -> bool = node.field("present") match
+  Some(BoolV(b)) -> b
+  _ -> true
+
+// How old the package index may be before a run that installs refreshes it: one hour by default.
+val defaultRefresh: long = 3600000
+
+private refreshOf(node: Node) -> long = node.field("refresh") match
+  Some(DurationV(ms)) -> ms
+  _ -> defaultRefresh
+
+// Whether the index the probe `p` found is older than `limit` milliseconds, or of unknown age.
+private indexStale(p: Probed, limit: long) -> bool = p.get("index-age").flatMap(a -> a.toLongOption()) match
+  Some(age) -> age * 1000 > limit
+  None -> true
+
+// The names of the packages of the graph `ctx` holds that the shared probe reads, in the graph's
+// order, with `node`'s; names that are not package names are left to their own resource's error.
+private packageNames(node: Node, ctx: Context) -> Vector[string]
+  val out = Buffer[string]()
+  ctx.graph match
+    Some(g) -> for n in g.nodes
+      if n.id.kind == "package" && validPackageName(n.id.title) && !out.contains(n.id.title)
+        out += n.id.title
+    None -> ()
+  if !out.contains(node.id.title) then out += node.id.title
+  out.toVector
+
+// The shell line, under `root` (empty on a real host), that prints `index-age=` for the file `f`.
+private indexAgeLine(f: string) -> string =
+  "if [ -e \"" + f + "\" ]; then m=$(stat -c %Y \"" + f + "\" 2>/dev/null || stat -f %m \"" + f
+    + "\"); echo \"index-age=$(( $(date +%s) - m ))\"; fi\n"
+
+// The probe of `words` (package names, as shell words) on an apt host whose files are under `root`.
+aptProbe(words: string, root: string) -> string =
+  "export LC_ALL=C\n"
+    + "command -v dpkg-query >/dev/null 2>&1 || { echo 'dpkg-query is not on this host' >&2; exit 1; }\n"
+    + s"f=$root/var/lib/apt/periodic/update-success-stamp\n"
+    + s"[ -e \"$$f\" ] || f=$root/var/lib/apt/lists\n"
+    + indexAgeLine("$f")
+    + s"dpkg-query -W -f 'installed:$${Package}=$${db:Status-Status} $${Version}\\n' $words 2>/dev/null\n"
+    + s"apt-cache policy $words 2>/dev/null | awk '/^[^ ]/ { p = $$1; sub(/:$$/, \"\", p) } /^  Candidate:/ { print \"candidate:\" p \"=\" $$2 }'\n"
+    + "exit 0"
+
+// The probe of `words` on a dnf host. dnf keeps its own metadata fresh, so it prints no index age.
+dnfProbe(words: string) -> string =
+  "export LC_ALL=C\n"
+    + "command -v rpm >/dev/null 2>&1 || { echo 'rpm is not on this host' >&2; exit 1; }\n"
+    + s"rpm -q --qf 'installed:%{NAME}=installed %{VERSION}-%{RELEASE}\\n' $words 2>/dev/null\n"
+    + s"dnf -q repoquery --latest-limit 1 --qf 'candidate:%{name}=%{version}-%{release}\\n' $words 2>/dev/null\n"
+    + "exit 0"
+
+// The probe of `words` on an apk host whose files are under `root`: the installed versions from
+// apk's database, and `apk version`'s list of the installed packages with a newer version.
+apkProbe(words: string, root: string) -> string =
+  "export LC_ALL=C\n"
+    + s"db=$root/lib/apk/db/installed\n"
+    + "[ -r \"$db\" ] || { echo \"$db cannot be read\" >&2; exit 1; }\n"
+    + s"f=$$(ls -t $root/var/cache/apk/APKINDEX.*.tar.gz 2>/dev/null | head -n 1)\n"
+    + "[ -n \"$f\" ] || f=/nonexistent\n"
+    + indexAgeLine("$f")
+    + s"awk -v want=' $words ' '/^P:/ { p = substr($$0, 3) } /^V:/ { v = substr($$0, 3) } "
+    + "/^$/ { if (p != \"\" && index(want, \" \" p \" \")) print \"installed:\" p \"=installed \" v; p = \"\" } "
+    + "END { if (p != \"\" && index(want, \" \" p \" \")) print \"installed:\" p \"=installed \" v }' \"$db\"\n"
+    + s"apk version -l '<' $words 2>/dev/null | awk 'NR > 1 { print \"upgrade:\" $$1 \"=\" $$3 }'\n"
+    + "exit 0"
+
+// What the probe found of one package: its installed version, if it is installed, and the version
+// the manager would install or upgrade it to, if it knows one.
+data PackageState(installed: Option[string], candidate: Option[string])
+
+// The state of the package `name` in what the probe printed.
+packageState(m: Manager, name: string, p: Probed) -> PackageState
+  val installed = p.get(s"installed:$name") match
+    Some(v) if v.startsWith("installed ") -> Some(v.slice(10, v.byteLength).trim)
+    _ -> None
+  val candidate = m match
+    Apt -> p.get(s"candidate:$name").filter(c -> c.nonEmpty && c != "(none)")
+    Dnf -> p.get(s"candidate:$name").filter(c -> c.nonEmpty)
+    Apk -> installed match
+      Some(v) -> p.get(s"upgrade:$name-$v") match
+        Some(c) -> Some(c)
+        None -> Some(v)
+      None -> None
+  PackageState(installed, candidate)
+
+// Whether the installed version `installed` is the declared `wanted`: the same, or for dnf the
+// version without its release.
+private sameVersion(m: Manager, installed: string, wanted: string) -> bool =
+  installed == wanted || (m == Dnf && installed.startsWith(wanted + "-"))
+
+// The word that installs `name` at the exact version `v`.
+private versioned(m: Manager, name: string, v: string) -> string = m match
+  Dnf -> s"$name-$v"
+  _ -> s"$name=$v"
+
+// The command that refreshes the index, for apt and apk.
+private refreshLine(m: Manager) -> string = m match
+  Apk -> "apk update"
+  _ -> "apt-get update"
+
+// The line that installs `words`; `downgrade` lets apt go to an older exact version.
+private installLine(m: Manager, words: string, downgrade: bool) -> string = m match
+  Apt ->
+    val down = if downgrade then " --allow-downgrades" else ""
+    s"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold$down $words"
+  Dnf -> s"dnf install -y $words"
+  Apk -> s"apk add $words"
+
+// The line that upgrades the installed `words` to their newest version.
+private upgradeLine(m: Manager, words: string) -> string = m match
+  Apt ->
+    s"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold $words"
+  Dnf -> s"dnf upgrade -y $words"
+  Apk -> s"apk add -u $words"
+
+// The line that removes `words`.
+private removeLine(m: Manager, words: string) -> string = m match
+  Apt -> s"DEBIAN_FRONTEND=noninteractive apt-get remove -y $words"
+  Dnf -> s"dnf remove -y $words"
+  Apk -> s"apk del $words"
+
+// `items` as shell words, one each.
+private wordsOf(items: Vector[string]) -> Result[string, string]
+  val out = Buffer[string]()
+  for w in items
+    out += quote(w)?
+  Ok(out.mkString(" "))
+
+// A step that runs the one command line `line`.
+private lineStep(line: string) -> Step = Step(s"set -e\n$line\n", Array.empty[byte](), line)
+
+// The provider of `package`, on apt, dnf or apk as the host's distribution says. `root` is where the
+// host's files are (empty, but a scratch directory in tests).
+class PackageProvider(val root: string = ""): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string]
+    if !validPackageName(node.id.title) then return Err(s"`${node.id.title}` is not a package name")
+    _ = declaredVersion(node)?
+    val m = managerOf(ctx)?
+    val words = wordsOf(packageNames(node, ctx))?
+    val text = m match
+      Apt -> aptProbe(words, root)
+      Dnf -> dnfProbe(words)
+      Apk -> apkProbe(words, root)
+    Ok([Shell(text)])
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    if outputs.length != 1 then return Err("the probe gave no output")
+    val o = outputs(0)
+    if !o.succeeded then return Err(s"the probe failed with status ${o.code}: ${o.stderr.trim}")
+    val p = readProbed(o.stdout)
+    val m = managerOf(ctx)?
+    val name = node.id.title
+    val state = packageState(m, name, p)
+    if !wantsPackage(node)
+      return state.installed match
+        Some(v) -> Ok(Delta(Remove, s"remove $v", [FieldChange("present", "true", "false")], None, p))
+        None -> Ok(Delta(InSync, "", [], None, p))
+    val wanted = declaredVersion(node)?
+    val installed = state.installed match
+      Some(v) -> v
+      None ->
+        val to = wanted match
+          Some(v) if v != "latest" -> s"install $v"
+          _ -> state.candidate.map(c -> s"install $c").getOrElse("install")
+        return Ok(Delta(Create, to, [], None, p))
+    wanted match
+      None -> Ok(Delta(InSync, "", [], None, p))
+      Some("latest") -> state.candidate match
+        Some(c) if c != installed ->
+          Ok(Delta(Modify, s"upgrade $installed -> $c", [FieldChange("version", installed, c)], None, p))
+        _ if m != Dnf && !ctx.marked("index") && indexStale(p, refreshOf(node)) ->
+          val limit = durationText(refreshOf(node))
+          val why = s"$installed; refresh the index (older than $limit) for a newer version"
+          Ok(Delta(Modify, why, [FieldChange("index", "stale", "fresh")], None, p))
+        _ -> Ok(Delta(InSync, "", [], None, p))
+      Some(v) if sameVersion(m, installed, v) -> Ok(Delta(InSync, "", [], None, p))
+      Some(v) -> Ok(Delta(Modify, s"$installed -> $v", [FieldChange("version", installed, v)], None, p))
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string] = together(
+    [(node, delta)],
+    ctx
+  )
+
+  override batches -> bool = true
+
+  // One refresh of the index when something is installed or upgraded and the index is stale, then
+  // one removal, one installation and one upgrade, each of every package that needs it.
+  override together(items: Vector[(Node, Delta)], ctx: Context) -> Result[Vector[Step], string]
+    val m = managerOf(ctx)?
+    val installs = Buffer[string]()
+    val upgrades = Buffer[string]()
+    val removes = Buffer[string]()
+    var downgrade = false
+    var limit = long.MaxValue
+    var probe: Option[Probed] = None
+    for (node, d) in items
+      val name = node.id.title
+      probe = Some(d.current)
+      if d.op == Remove then removes += name
+      else if d.op != InSync
+        val state = packageState(m, name, d.current)
+        declaredVersion(node)? match
+          // apt upgrades a package it is asked to install, in the same transaction.
+          Some("latest") -> if state.installed.isDefined && m != Apt then upgrades += name else installs += name
+          Some(v) ->
+            installs += versioned(m, name, v)
+            if state.installed.isDefined then downgrade = true
+          None -> installs += name
+        if refreshOf(node) < limit then limit = refreshOf(node)
+    val out = Buffer[Step]()
+    val installing = !installs.isEmpty || !upgrades.isEmpty
+    val stale = probe.map(p -> indexStale(p, limit)).getOrElse(false)
+    if installing && m != Dnf && stale && !ctx.marked("index")
+      out += lineStep(refreshLine(m))
+      ctx.mark("index")
+    if !removes.isEmpty then out += lineStep(removeLine(m, wordsOf(removes.toVector)?))
+    if !installs.isEmpty then out += lineStep(installLine(m, wordsOf(installs.toVector)?, downgrade))
+    if !upgrades.isEmpty then out += lineStep(upgradeLine(m, wordsOf(upgrades.toVector)?))
+    Ok(out.toVector)
+
+// --- aptRepository ---------------------------------------------------------------------------------
+
+// What an `aptRepository` declares: its name, the deb822 fields, and its signing key's URL and
+// pinned SHA-256.
+data AptRepo(
+    name: string,
+    uris: Vector[string],
+    suites: Vector[string],
+    components: Vector[string],
+    architectures: Vector[string],
+    key: string,
+    keySha256: string
+)
+
+// Whether `c` may stand in a repository's file name: what apt reads in `sources.list.d`.
+private repoNameChar(
+    c: char
+) -> bool = 'a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9' || c == '_' || c == '-' || c == '.'
+
+// Whether `w` may stand as one value of a deb822 field: no white space, no control character, no
+// `#`.
+private deb822Word(w: string) -> bool = w.nonEmpty && !w.exists(c -> int(c) <= 32 || int(c) == 127 || c == '#')
+
+// The list of strings `field` of `node`, each checked as a deb822 word.
+private repoWords(node: Node, field: string) -> Result[Vector[string], string]
+  val out = Buffer[string]()
+  node.field(field) match
+    None -> ()
+    Some(ListV(items)) -> for v in items
+      v match
+        StrV(t) if deb822Word(t) -> out += t
+        StrV(t) -> return Err(s"`$t` in `$field` holds white space, a control character or `#`")
+        other -> return Err(s"`$field` holds strings, not `${other.shown}`")
+    Some(other) -> return Err(s"`$field` is a list of strings, not `${other.shown}`")
+  Ok(out.toVector)
+
+// The repository `node` declares, checked.
+aptRepoOf(node: Node) -> Result[AptRepo, string]
+  val name = node.id.title
+  if name.isEmpty || name.exists(c -> !repoNameChar(c)) || name.startsWith(".") || name.startsWith("-")
+    return Err(s"`$name` is not a repository name (letters, digits, `_`, `-` and `.`, as apt reads them)")
+  val uris = repoWords(node, "uris")?
+  val suites = repoWords(node, "suites")?
+  val components = repoWords(node, "components")?
+  val architectures = repoWords(node, "architectures")?
+  if uris.isEmpty then return Err("an aptRepository needs `uris`")
+  if suites.isEmpty then return Err("an aptRepository needs `suites`")
+  if components.isEmpty && suites.exists(s -> !s.endsWith("/"))
+    return Err("an aptRepository with no `components` names each suite as an exact path ending in `/`")
+  val key = node.field("key") match
+    Some(StrV(k)) if deb822Word(k) && (
+      k.startsWith("https://") || k.startsWith("http://") || k.startsWith("file:///")
+    ) -> k
+    Some(StrV(k)) -> return Err(s"`key` is the URL of the signing key (https://…), not `$k`")
+    _ -> return Err("an aptRepository needs `key`, the URL of its signing key")
+  val sha = node.field("keySha256") match
+    Some(StrV(h)) if h.byteLength == 64 && !h.exists(c -> !('0' <= c <= '9' || 'a' <= c <= 'f')) -> h
+    Some(StrV(h)) -> return Err(s"`keySha256` is 64 lowercase hexadecimal digits, not `$h`")
+    _ -> return Err("an aptRepository needs `keySha256`, the SHA-256 its key must have")
+  Ok(AptRepo(name, uris, suites, components, architectures, key, sha))
+
+// The deb822 lines of `r`, its key at `keyFile`.
+aptSourcesLines(r: AptRepo, keyFile: string) -> Vector[string]
+  val out = Buffer[string]()
+  out += "Types: deb"
+  out += s"URIs: ${r.uris.mkString(" ")}"
+  out += s"Suites: ${r.suites.mkString(" ")}"
+  if !r.components.isEmpty then out += s"Components: ${r.components.mkString(" ")}"
+  if !r.architectures.isEmpty then out += s"Architectures: ${r.architectures.mkString(" ")}"
+  out += s"Signed-By: $keyFile"
+  out.toVector
+
+// The first twelve digits of a SHA-256, as the plan shows one.
+private shortHash(h: string) -> string = if h.byteLength > 12 then h.slice(0, 12) else h
+
+// Whether the repository `node` is declared present (the default).
+private wantsRepo(node: Node) -> bool = node.field("present") match
+  Some(BoolV(b)) -> b
+  _ -> true
+
+// The shell function `hash FILE`, which sets `h` to the file's SHA-256 with whichever tool the host
+// has.
+private val hashFunction: string = "hash() {\n"
+  + "  if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum <\"$1\")\n"
+  + "  elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 <\"$1\")\n"
+  + "  else h=$(openssl dgst -sha256 -r <\"$1\"); fi\n"
+  + "  h=${h%% *}\n"
+  + "}\n"
+
+// The provider of `aptRepository`: a deb822 `<name>.sources` file in `<dir>/sources.list.d` naming
+// its key, which is fetched on the host, checked against its pinned SHA-256 before anything is
+// written, and kept as fetched in `<dir>/keyrings` (`.asc` when ASCII-armored, `.gpg` otherwise).
+// Repositories next to each other in the order are written together, then the index is refreshed
+// once. `dir` is `/etc/apt` (a scratch directory in tests).
+class AptRepositoryProvider(val dir: string = "/etc/apt"): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string]
+    if wantsRepo(node)
+      _ = aptRepoOf(node)?
+    val d = quote(dir)?
+    val n = quote(node.id.title)?
+    Ok(
+      [
+        Shell(
+          s"d=$d\nn=$n\n" + hashFunction
+            + "for e in asc gpg; do\n"
+            + "  if [ -f \"$d/keyrings/$n.$e\" ]; then hash \"$d/keyrings/$n.$e\"; printf '%s=%s\\n' \"$e\" \"$h\"; fi\n"
+            + "done\n"
+            + "if [ -f \"$d/sources.list.d/$n.sources\" ]; then echo sources=yes; echo --; cat \"$d/sources.list.d/$n.sources\"; fi"
+        )
+      ]
+    )
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    if outputs.length != 1 then return Err("the probe gave no output")
+    val o = outputs(0)
+    if !o.succeeded then return Err(s"the probe failed with status ${o.code}: ${o.stderr.trim}")
+    val p = readProbed(o.stdout)
+    val asc = p.get("asc")
+    val gpg = p.get("gpg")
+    val sources = p.get("sources").isDefined
+    val any = asc.isDefined || gpg.isDefined || sources
+    if !wantsRepo(node)
+      return Ok(
+        if any then Delta(
+          Remove,
+          "remove",
+          [FieldChange("present", "true", "false")],
+          None,
+          p
+        ) else Delta(InSync, "", [], None, p)
+      )
+    val r = aptRepoOf(node)?
+    val shown = (r.uris ++ r.suites ++ r.components).mkString(" ")
+    if !any then return Ok(Delta(Create, shown, [], None, p))
+    val ext =
+      if asc == Some(r.keySha256) then Some("asc")
+      else if gpg == Some(r.keySha256) then Some("gpg")
+      else None
+    val changes = Buffer[FieldChange]()
+    val words = Buffer[string]()
+    if ext.isEmpty
+      val now = asc.orElse(gpg).map(h -> shortHash(h)).getOrElse("absent")
+      changes += FieldChange("key", now, shortHash(r.keySha256))
+      words += s"key $now -> ${shortHash(r.keySha256)}"
+    val expected = aptSourcesLines(
+      r,
+      s"$dir/keyrings/${r.name}.${ext.getOrElse("asc")}"
+    ).map(l -> l + "\n").mkString("")
+    var diff: Option[(string, string)] = None
+    val current = if sources then p.rest.getOrElse("") else ""
+    if !sources || current != expected
+      changes += FieldChange("sources", if sources then "differs" else "absent", "declared")
+      if sources && ext.isDefined
+        diff = Some((current, expected))
+      else words += if sources then "sources changed" else "sources missing"
+    if changes.isEmpty then Ok(Delta(InSync, "", [], None, p))
+    else Ok(Delta(Modify, words.mkString(", "), changes.toVector, diff, p))
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string] = together(
+    [(node, delta)],
+    ctx
+  )
+
+  override batches -> bool = true
+
+  // Each repository's write (or removal), then one refresh of the index when one was written.
+  override together(items: Vector[(Node, Delta)], ctx: Context) -> Result[Vector[Step], string]
+    val out = Buffer[Step]()
+    var wrote = false
+    for (node, delta) in items
+      out += repoStep(node, delta)?
+      if delta.op != Remove then wrote = true
+    if wrote
+      out += lineStep("apt-get update")
+      ctx.mark("index")
+    Ok(out.toVector)
+
+  // The step that writes the repository `node` from the state `delta` found, or removes it.
+  private repoStep(node: Node, delta: Delta) -> Result[Step, string]
+    val d = quote(dir)?
+    val n = quote(node.id.title)?
+    if delta.op == Remove
+      val line = s"rm -f $d/sources.list.d/$n.sources $d/keyrings/$n.asc $d/keyrings/$n.gpg"
+      return Ok(Step(s"set -e\n$line\n", Array.empty[byte](), line))
+    val r = aptRepoOf(node)?
+    val p = delta.current
+    val known =
+      if p.get("asc") == Some(r.keySha256) then Some("asc")
+      else if p.get("gpg") == Some(r.keySha256) then Some("gpg")
+      else None
+    val body = StringWriter()
+    body.write(s"set -e\numask 022\nd=$d\nn=$n\n")
+    body.write("mkdir -p \"$d/keyrings\" \"$d/sources.list.d\"\n")
+    known match
+      Some(e) -> body.write(s"e=$e\n")
+      None ->
+        val url = quote(r.key)?
+        body.write(hashFunction)
+        body.write("t=$(mktemp \"$d/keyrings/.fettle.XXXXXX\")\n")
+        body.write("trap 'rm -f \"$t\"' EXIT\n")
+        body.write(s"if command -v curl >/dev/null 2>&1; then curl -fsSL -o \"$$t\" $url\n")
+        body.write(s"elif command -v wget >/dev/null 2>&1; then wget -q -O \"$$t\" $url\n")
+        body.write("else echo 'the key cannot be fetched: neither curl nor wget is on this host' >&2; exit 1; fi\n")
+        body.write("hash \"$t\"\n")
+        body.write(s"if [ \"$$h\" != ${r.keySha256} ]; then\n")
+        body.write(s"  echo \"the key at \"$url\" has SHA-256 $$h, not the pinned ${r.keySha256}\" >&2\n")
+        body.write("  exit 1\nfi\n")
+        body.write(
+          "if head -c 64 \"$t\" | grep -q 'BEGIN PGP PUBLIC KEY BLOCK'; then e=asc; o=gpg; else e=gpg; o=asc; fi\n"
+        )
+        body.write("chmod 0644 \"$t\"\n")
+        body.write("mv -f \"$t\" \"$d/keyrings/$n.$e\"\n")
+        body.write("trap - EXIT\n")
+        body.write("rm -f \"$d/keyrings/$n.$o\"\n")
+    val lines = Buffer[string]()
+    for l in aptSourcesLines(r, "@KEY@").filter(l -> !l.startsWith("Signed-By:"))
+      lines += quote(l)?
+    body.write("s=$(mktemp \"$d/.fettle.XXXXXX\")\n")
+    body.write("trap 'rm -f \"$s\"' EXIT\n")
+    body.write(s"printf '%s\\n' ${lines.mkString(" ")} \"Signed-By: $$d/keyrings/$$n.$$e\" >\"$$s\"\n")
+    body.write("chmod 0644 \"$s\"\n")
+    body.write("mv -f \"$s\" \"$d/sources.list.d/$n.sources\"\n")
+    body.write("trap - EXIT\n")
+    Ok(Step(body.text, Array.empty[byte](), s"write $dir/sources.list.d/${node.id.title}.sources"))

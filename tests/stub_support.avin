@@ -1,0 +1,252 @@
+module tests
+
+import avin.fs
+
+import dev.avinlang.fettle.engine.{
+  AptRepositoryProvider, Context, Engine, PackageProvider, Plan, Provider, builtinProvider
+}
+
+import dev.avinlang.fettle.graph.{Graph}
+import dev.avinlang.fettle.shell.{Output}
+import dev.avinlang.fettle.transport.{LocalTransport, Ran, Transport, TransportError}
+
+// A host played on this machine: the scripts the engine sends run here with a directory of stub
+// programs first on `PATH` (`dpkg-query`, `apt-cache`, `apt-get`, `rpm`, `dnf`, `apk`, `systemctl`,
+// `rc-update`, `rc-service`). Each stub prints what the real program prints on Debian 12, Ubuntu
+// 24.04, Rocky 9 or Alpine 3.20 for the state kept in files under the host's directory, changes that
+// state as the real one would, and appends each changing command to `log`.
+
+// The host's state: `dpkg/<name>` (`<status> <version>`), `repo/<name>` (the candidate version),
+// `next/<name>` (the candidate once the index is refreshed), `units/<unit>.load|enabled|active|reload`,
+// `initd/<name>`, `runlevel/<name>`, `started/<name>`, and `fail` (every changing command fails).
+val dpkgQueryStub: string = "#!/bin/sh\n"
+  + "fmt=\n"
+  + "while [ $# -gt 0 ]; do\n"
+  + "  case \"$1\" in -W) shift ;; -f) fmt=$2; shift 2 ;; *) break ;; esac\n"
+  + "done\n"
+  + "code=0\n"
+  + "for n in \"$@\"; do\n"
+  + "  if [ -f \"$STUB/dpkg/$n\" ]; then\n"
+  + "    read -r st ver <\"$STUB/dpkg/$n\"\n"
+  + "    printf '%s' \"$fmt\" | awk -v p=\"$n\" -v s=\"$st\" -v v=\"$ver\" '{ gsub(/\\$\\{Package\\}/, p); gsub(/\\$\\{db:Status-Status\\}/, s); gsub(/\\$\\{Version\\}/, v); gsub(/\\\\n/, \"\\n\"); printf \"%s\", $0 }'\n"
+  + "  else\n"
+  + "    echo \"dpkg-query: no packages found matching $n\" >&2; code=1\n"
+  + "  fi\n"
+  + "done\n"
+  + "exit $code\n"
+
+val aptCacheStub: string = "#!/bin/sh\n"
+  + "[ \"$1\" = policy ] || exit 100\n"
+  + "shift\n"
+  + "for n in \"$@\"; do\n"
+  + "  i='(none)'\n"
+  + "  if [ -f \"$STUB/dpkg/$n\" ]; then read -r st ver <\"$STUB/dpkg/$n\"; [ \"$st\" = installed ] && i=$ver; fi\n"
+  + "  if [ -f \"$STUB/repo/$n\" ]; then c=$(cat \"$STUB/repo/$n\")\n"
+  + "  elif [ \"$i\" != '(none)' ]; then c=$i\n"
+  + "  else echo \"N: Unable to locate package $n\" >&2; continue; fi\n"
+  + "  printf '%s:\\n  Installed: %s\\n  Candidate: %s\\n  Version table:\\n' \"$n\" \"$i\" \"$c\"\n"
+  + "  printf '     %s 500\\n        500 http://deb.debian.org/debian bookworm/main amd64 Packages\\n' \"$c\"\n"
+  + "  if [ \"$i\" != '(none)' ] && [ \"$i\" != \"$c\" ]; then printf ' *** %s 100\\n        100 /var/lib/dpkg/status\\n' \"$i\"; fi\n"
+  + "done\n"
+
+// apt-get, dnf and apk share the logic of installing and removing: each word not an option is a
+// package, `name=version` (`name-version` for dnf) an exact one; the version installed is that or
+// the candidate in `repo/`.
+private val installLogic: string = "skip=0\n"
+  + "for a in \"$@\"; do\n"
+  + "  if [ $skip = 1 ]; then skip=0; continue; fi\n"
+  + "  case \"$a\" in\n"
+  + "    -o) skip=1 ;;\n"
+  + "    -*) ;;\n"
+  + "    *)\n"
+  + "      n=${a%%=*}; v=${a#*=}; [ \"$v\" = \"$a\" ] && v=$(cat \"$STUB/repo/$n\" 2>/dev/null)\n"
+  + "      case \"$cmd\" in\n"
+  + "        install|add|upgrade) [ -n \"$v\" ] || { echo \"E: Unable to locate package $n\" >&2; exit 100; }; echo \"installed $v\" >\"$STUB/dpkg/$n\" ;;\n"
+  + "        remove|del) rm -f \"$STUB/dpkg/$n\" ;;\n"
+  + "      esac ;;\n"
+  + "  esac\n"
+  + "done\n"
+  + "case \"$cmd\" in update)\n"
+  + "  if [ -d \"$STUB/next\" ]; then cp \"$STUB/next/\"* \"$STUB/repo/\" 2>/dev/null; fi\n"
+  + "  mkdir -p \"$STUB/root/var/lib/apt/lists\" \"$STUB/root/var/cache/apk\"\n"
+  + "  touch \"$STUB/root/var/lib/apt/lists\" \"$STUB/root/var/cache/apk/APKINDEX.0.tar.gz\" ;;\n"
+  + "esac\n"
+
+val aptGetStub: string = "#!/bin/sh\n"
+  + "echo \"apt-get $*\" >>\"$STUB/log\"\n"
+  + "[ -f \"$STUB/fail\" ] && { echo 'E: Could not get lock /var/lib/dpkg/lock-frontend' >&2; exit 100; }\n"
+  + "cmd=$1; shift\n"
+  + installLogic
+
+val apkStub: string = "#!/bin/sh\n"
+  + "if [ \"$1\" = version ]; then\n"
+  + "  shift 2\n"
+  + "  echo 'Installed:                                Available:'\n"
+  + "  for n in \"$@\"; do\n"
+  + "    [ \"$n\" = '<' ] && continue\n"
+  + "    if [ -f \"$STUB/dpkg/$n\" ] && [ -f \"$STUB/repo/$n\" ]; then\n"
+  + "      read -r st ver <\"$STUB/dpkg/$n\"; c=$(cat \"$STUB/repo/$n\")\n"
+  + "      [ \"$ver\" != \"$c\" ] && printf '%-40s < %s\\n' \"$n-$ver\" \"$c\"\n"
+  + "    fi\n"
+  + "  done\n"
+  + "  exit 0\n"
+  + "fi\n"
+  + "echo \"apk $*\" >>\"$STUB/log\"\n"
+  + "cmd=$1; shift\n"
+  + installLogic
+  + "awk_db=\"$STUB/root/lib/apk/db/installed\"\n"
+  + ": >\"$awk_db\"\n"
+  + "for f in \"$STUB\"/dpkg/*; do [ -e \"$f\" ] || continue; read -r st ver <\"$f\"; printf 'C:Q1x=\\nP:%s\\nV:%s\\nA:x86_64\\n\\n' \"${f##*/}\" \"$ver\" >>\"$awk_db\"; done\n"
+
+val rpmStub: string = "#!/bin/sh\n"
+  + "[ \"$1\" = -q ] || exit 1\n"
+  + "shift 3\n"
+  + "code=0\n"
+  + "for n in \"$@\"; do\n"
+  + "  if [ -f \"$STUB/dpkg/$n\" ]; then read -r st ver <\"$STUB/dpkg/$n\"; printf 'installed:%s=installed %s\\n' \"$n\" \"$ver\"\n"
+  + "  else echo \"package $n is not installed\"; code=1; fi\n"
+  + "done\n"
+  + "exit $code\n"
+
+val dnfStub: string = "#!/bin/sh\n"
+  + "if [ \"$1\" = -q ] && [ \"$2\" = repoquery ]; then\n"
+  + "  shift 6\n"
+  + "  for n in \"$@\"; do\n"
+  + "    [ -f \"$STUB/repo/$n\" ] && printf 'candidate:%s=%s\\n\\n' \"$n\" \"$(cat \"$STUB/repo/$n\")\"\n"
+  + "  done\n"
+  + "  exit 0\n"
+  + "fi\n"
+  + "echo \"dnf $*\" >>\"$STUB/log\"\n"
+  + "cmd=$1; shift\n"
+  + "spec() {\n"
+  + "  for a in \"$@\"; do\n"
+  + "    n=$a\n"
+  + "    for p in \"$STUB\"/repo/*; do\n"
+  + "      b=${p##*/}\n"
+  + "      case \"$a\" in\n"
+  + "        \"$b\"-[0-9]*) n=\"$b=${a#\"$b\"-}\" ;;\n"
+  + "      esac\n"
+  + "    done\n"
+  + "    printf '%s\\n' \"$n\"\n"
+  + "  done\n"
+  + "}\n"
+  + "set -- $(spec \"$@\")\n"
+  + installLogic
+
+val systemctlStub: string = "#!/bin/sh\n"
+  + "unit() { case \"$1\" in *.*) echo \"$1\" ;; *) echo \"$1.service\" ;; esac; }\n"
+  + "get() { cat \"$STUB/units/$1.$2\" 2>/dev/null; }\n"
+  + "cmd=$1\n"
+  + "case \"$cmd\" in show|is-enabled|is-active) ;; *) echo \"systemctl $*\" >>\"$STUB/log\" ;; esac\n"
+  + "case \"$cmd\" in\n"
+  + "  show)\n"
+  + "    u=$(unit \"$5\")\n"
+  + "    case \"$3\" in\n"
+  + "      LoadState) if [ -f \"$STUB/units/$u.load\" ]; then get \"$u\" load; else echo not-found; fi ;;\n"
+  + "      NeedDaemonReload) if [ -f \"$STUB/units/$u.reload\" ]; then get \"$u\" reload; else echo no; fi ;;\n"
+  + "    esac ;;\n"
+  + "  is-enabled)\n"
+  + "    u=$(unit \"$2\")\n"
+  + "    if [ -f \"$STUB/units/$u.load\" ]; then get \"$u\" enabled; else echo \"Failed to get unit file state for $u: No such file or directory\" >&2; exit 1; fi ;;\n"
+  + "  is-active) u=$(unit \"$2\"); w=$(get \"$u\" active); echo \"${w:-inactive}\"; [ \"$w\" = active ] ;;\n"
+  + "  daemon-reload) for f in \"$STUB\"/units/*.reload; do [ -e \"$f\" ] && echo no >\"$f\"; done; true ;;\n"
+  + "  enable|disable)\n"
+  + "    now=; if [ \"$2\" = --now ]; then now=1; shift; fi\n"
+  + "    u=$(unit \"$2\")\n"
+  + "    [ -f \"$STUB/units/$u.load\" ] || { echo \"Failed to $cmd unit: Unit file $u does not exist.\" >&2; exit 1; }\n"
+  + "    if [ \"$cmd\" = enable ]; then echo enabled; else echo disabled; fi >\"$STUB/units/$u.enabled\"\n"
+  + "    if [ -n \"$now\" ]; then if [ \"$cmd\" = enable ]; then echo active; else echo inactive; fi >\"$STUB/units/$u.active\"; fi ;;\n"
+  + "  start|restart|reload) u=$(unit \"$2\"); [ -f \"$STUB/fail\" ] && { echo \"Job for $u failed.\" >&2; exit 1; }; echo active >\"$STUB/units/$u.active\" ;;\n"
+  + "  stop) u=$(unit \"$2\"); echo inactive >\"$STUB/units/$u.active\" ;;\n"
+  + "esac\n"
+
+val rcUpdateStub: string = "#!/bin/sh\n"
+  + "case \"$1\" in\n"
+  + "  show) for f in \"$STUB\"/runlevel/*; do [ -e \"$f\" ] && printf '%20s | default\\n' \"${f##*/}\"; done; true ;;\n"
+  + "  add) echo \"rc-update $*\" >>\"$STUB/log\"; touch \"$STUB/runlevel/$2\"; echo \" * service $2 added to runlevel $3\" ;;\n"
+  + "  del) echo \"rc-update $*\" >>\"$STUB/log\"; rm -f \"$STUB/runlevel/$2\"; echo \" * service $2 removed from runlevel $3\" ;;\n"
+  + "esac\n"
+
+val rcServiceStub: string = "#!/bin/sh\n"
+  + "if [ \"$1\" = --exists ]; then [ -f \"$STUB/initd/$2\" ]; exit; fi\n"
+  + "[ \"$2\" = status ] || echo \"rc-service $*\" >>\"$STUB/log\"\n"
+  + "case \"$2\" in\n"
+  + "  status) if [ -f \"$STUB/started/$1\" ]; then echo ' * status: started'; else echo ' * status: stopped'; exit 3; fi ;;\n"
+  + "  start|restart|reload) touch \"$STUB/started/$1\"; echo \" * Starting $1 ... [ ok ]\" ;;\n"
+  + "  stop) rm -f \"$STUB/started/$1\"; echo \" * Stopping $1 ... [ ok ]\" ;;\n"
+  + "esac\n"
+
+// A scratch host for the stubs: its directory, with every stub installed in `bin` and the state
+// directories made.
+stubHost(name: string) -> string
+  val dir = scratchDir(name)
+  for d in ["bin", "dpkg", "repo", "next", "units", "initd", "runlevel", "started", "root/lib/apk/db", "apt"]
+    _ = fs.createDirAll(s"$dir/$d")
+  val stubs = [
+    ("dpkg-query", dpkgQueryStub),
+    ("apt-cache", aptCacheStub),
+    ("apt-get", aptGetStub),
+    ("apk", apkStub),
+    ("rpm", rpmStub),
+    ("dnf", dnfStub),
+    ("systemctl", systemctlStub),
+    ("rc-update", rcUpdateStub),
+    ("rc-service", rcServiceStub)
+  ]
+  for (n, text) in stubs
+    _ = fs.writeText(s"$dir/bin/$n", text)
+  _ = fs.writeText(s"$dir/log", "")
+  _ = fs.writeText(s"$dir/root/lib/apk/db/installed", "")
+  _ = shOut(s"chmod +x ${sq(dir)}/bin/*")
+  dir
+
+// Writes `text` to the state file `rel` of the stub host `dir`.
+put(dir: string, rel: string, text: string)
+  _ = fs.writeText(s"$dir/$rel", text + "\n")
+
+// The apk database of the stub host `dir`, written from its `dpkg/` state as Alpine writes it.
+apkDb(dir: string)
+  _ = shOut(
+    s"STUB=${sq(dir)}; : >\"$$STUB/root/lib/apk/db/installed\"; for f in \"$$STUB\"/dpkg/*; do [ -e \"$$f\" ] || continue; read -r st ver <\"$$f\"; printf 'C:Q1x=\\nP:%s\\nV:%s\\nA:x86_64\\n\\n' \"$${f##*/}\" \"$$ver\" >>\"$$STUB/root/lib/apk/db/installed\"; done"
+  )
+
+// The changing commands the stub host `dir` ran, one a line.
+logOf(dir: string) -> string = textAt(s"$dir/log")
+
+// A transport that runs each script here with the stubs of `dir` first on `PATH`, keeping every
+// script it was given.
+class StubTransport(val dir: string): Transport
+  val scripts = Buffer[string]()
+  private val inner = LocalTransport()
+
+  override run(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+    scripts += script
+    inner.run(s"PATH=${sq(dir)}/bin:$$PATH\nexport PATH\nSTUB=${sq(dir)}\nexport STUB\n" + script, input)
+
+  override close() -> Result[unit, TransportError] = inner.close()
+
+// The providers of a stub host `dir`: packages read their files under `dir/root`, apt repositories
+// are written under `dir/apt`.
+stubProviders(dir: string) -> (string) -> Option[Provider] = k -> k match
+  "package" -> Some(PackageProvider(s"$dir/root"))
+  "aptRepository" -> Some(AptRepositoryProvider(s"$dir/apt"))
+  _ -> builtinProvider(k)
+
+// An engine on the stub host `dir`, its pending record inside it.
+stubEngine(dir: string, t: StubTransport) -> Engine =
+  Engine(t, testContext(), pendingIn(dir), stubProviders(dir))
+
+// The plan of `g` on the stub host with the fact fixture `fixture`.
+stubPlan(e: Engine, g: Graph, fixture: string) -> Plan = e.plan("web1", facts(fixture), g) match
+  Ok(p) -> p
+  Err(m) -> fail(s"the plan failed: $m")
+
+// A context holding the facts of `fixture` and the graph `g`, for calling a provider directly.
+contextOn(fixture: string, g: Graph) -> Context
+  val c = testContext()
+  c.facts = Some(facts(fixture))
+  c.graph = Some(g)
+  c
+
+// One successful probe output printing `text`.
+printed(text: string) -> Vector[Output] = [Output(0, text, "")]

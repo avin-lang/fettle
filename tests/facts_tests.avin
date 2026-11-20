@@ -68,7 +68,7 @@ recordedFacts()
 
 @test("recorded facts agree with the fixtures the evaluator reads")
 recordedAgreeWithFixtures()
-  for name in ["debian12", "alpine320"]
+  for name in ["debian12", "alpine320", "ubuntu2404", "rocky93"]
     val fixture = fs.readText(s"tests/fixtures/$name.json").getOrElse("")
     assertEq(recorded(name), fixture.trim)
 

@@ -36,8 +36,8 @@ The modules under the front end:
 - `transport`: the `Transport` trait (run a script with bytes on its standard input, close) and
   `LocalTransport`, which runs `/bin/sh` here; the SSH transport is built against the same trait.
 - `engine`: the plan, apply and verify loop over any `Transport`, the `Provider` trait each kind
-  implements, the `file`, `directory`, `symlink`, `user`, `group`, `command` and `download`
-  providers, and the pending-trigger record.
+  implements, the `file`, `directory`, `symlink`, `user`, `group`, `command`, `download`,
+  `package`, `service` and `aptRepository` providers, and the pending-trigger record.
 
 ## Plan and apply
 
@@ -56,19 +56,25 @@ me (macos 15.1, arm64)
 Plan: 1 host; 1 to create, 1 to change, 0 to remove, 0 actions.
 ```
 
-The kinds, and which have a provider so far (a resource of a kind without one is an `x` line):
+The kinds with providers so far (a resource of another kind is an `x` line):
 
-| Kind | Title | Fields | Provider |
+| Kind | Title | Fields | Providers |
 |---|---|---|---|
-| `file` | path | `content` (string or secret), `source`, `owner`, `group`, `mode`, `validate`, `present` | yes |
-| `directory` | path | `owner`, `group`, `mode`, `present` | yes |
-| `symlink` | path | `target`, `present` | yes |
+| `file` | path | `content` (string or secret) or `source`, `owner`, `group`, `mode`, `validate`, `present` | POSIX shell |
+| `directory` | path | `owner`, `group`, `mode`, `present` | POSIX shell |
+| `symlink` | path | `target`, `present` | POSIX shell |
 | `user` | name | `present`, `uid`, `group`, `groups` (exclusive), `shell`, `home`, `system`, `authorizedKeys` (exclusive), `password` (a crypt hash, string or secret) | shadow utilities or busybox |
 | `group` | name | `present`, `gid`, `system` | shadow utilities or busybox |
-| `command` | name | `run` (required), `creates`, `unless`, `onlyIf`, `always`; action `run` | yes |
+| `command` | name | `run` (required), `creates`, `unless`, `onlyIf`, `always`; action `run` | POSIX shell |
 | `download` | path | `url`, `sha256` (both required), `owner`, `group`, `mode` | `curl` or `wget` |
-| `package` | name | `present`, `version`, `refresh` | not yet |
-| `service` | name | `running`, `enabled`; actions `start`, `stop`, `restart`, `reload` | not yet |
+| `package` | name | `present`, `version` (exact or `latest`), `refresh` (index age, `1h`) | apt (Debian, Ubuntu), dnf (RHEL family, Fedora), apk (Alpine) |
+| `service` | name | `running`, `enabled`; actions `start`, `stop`, `restart`, `reload` | systemd, OpenRC |
+| `aptRepository` | name | `uris`, `suites`, `components`, `architectures`, `key` (URL), `keySha256`, `present` | apt (a deb822 `.sources` file and its key) |
+
+A host's packages are probed in one command and those next to each other install in one
+transaction; the package index is refreshed at most once a run. Packages come after every
+`aptRepository`, and a changed repository refreshes the index itself. A restart asked for in the same
+run as a reload or a start does both.
 
 `+` creates, `~` changes (a line diff for text under 256 KiB), `-` removes (`present = false`), `>`
 runs an action a trigger asked for or a command its guards say will run, `!` a command that runs
