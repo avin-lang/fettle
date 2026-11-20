@@ -1,0 +1,6 @@
+tools=busybox
+passwd=ana:x:1000:1000:Linux User,,,:/home/ana:/bin/ash
+primary=ana
+groups=ana wheel
+ssh=absent
+keys=absent

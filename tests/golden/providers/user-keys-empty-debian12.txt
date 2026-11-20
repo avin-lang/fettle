@@ -1,0 +1,21 @@
+## write the authorized keys of ana
+set -e
+n=ana
+if command -v getent >/dev/null 2>&1; then e=$(getent passwd "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '$1 == n { print; exit }' /etc/passwd); fi
+h=$(printf '%s\n' "$e" | cut -d: -f6)
+g=$(id -gn "$n")
+if [ -z "$h" ] || [ ! -d "$h" ]; then echo "fettle: the home directory of $n does not exist" >&2; exit 1; fi
+if [ -L "$h/.ssh" ]; then echo "fettle: $h/.ssh is a symlink" >&2; exit 1; fi
+if [ ! -d "$h/.ssh" ]; then mkdir "$h/.ssh"; fi
+chown -h "$n:$g" "$h/.ssh"
+chmod 0700 "$h/.ssh"
+t=$(mktemp "$h/.ssh/.fettle.XXXXXX")
+trap 'rm -f "$t"' EXIT
+cat >"$t"
+chown "$n:$g" "$t"
+chmod 0600 "$t"
+mv -f "$t" "$h/.ssh/authorized_keys"
+trap - EXIT
+## input
+## end

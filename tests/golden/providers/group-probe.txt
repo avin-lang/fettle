@@ -1,0 +1,7 @@
+n=admins
+if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow
+elif command -v busybox >/dev/null 2>&1; then echo tools=busybox
+else echo tools=none; fi
+if command -v getent >/dev/null 2>&1; then e=$(getent group "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '$1 == n { print; exit }' /etc/group); fi
+printf 'group=%s\n' "$e"

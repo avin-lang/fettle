@@ -1,0 +1,5 @@
+if [ -e /var/lib/app/migrated ] || [ -L /var/lib/app/migrated ]; then echo creates=yes; else echo creates=no; fi
+----
+/bin/sh -c 'app status | grep -q current'
+----
+test -x /usr/local/bin/migrate

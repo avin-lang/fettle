@@ -1,0 +1,19 @@
+## fetch 'https://example.com/caddy?os=linux&arch=amd64' to /usr/local/bin/caddy
+set -e
+t=$(mktemp /usr/local/bin/.fettle.XXXXXX)
+trap 'rm -f "$t"' EXIT
+curl -fsSL -o "$t" 'https://example.com/caddy?os=linux&arch=amd64'
+if command -v sha256sum >/dev/null 2>&1; then h=$(cat "$t" | sha256sum)
+elif command -v shasum >/dev/null 2>&1; then h=$(cat "$t" | shasum -a 256)
+else h=$(cat "$t" | openssl dgst -sha256 -r); fi
+h=${h%% *}
+if [ "$h" != d6e0ff2b7a534a9750d13545971476557164f72cb92ad74be7f145491ec4acf4 ]; then
+  printf 'fettle: %s gave a file whose SHA-256 is %s, not %s\n' 'https://example.com/caddy?os=linux&arch=amd64' "$h" d6e0ff2b7a534a9750d13545971476557164f72cb92ad74be7f145491ec4acf4 >&2
+  exit 1
+fi
+chown root:root "$t"
+chmod 0755 "$t"
+mv -f "$t" /usr/local/bin/caddy
+trap - EXIT
+## input
+## end

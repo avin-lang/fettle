@@ -154,6 +154,25 @@ groupKind()
   ])
   assertEq(roundTrip(text), text)
 
+@test("a field may be named `group`, in a user, a file and a directory, beside a `group` resource")
+groupField()
+  val text = src([
+    "role r()",
+    "  group \"staff\"",
+    "  user \"ana\"",
+    "    group = \"staff\"",
+    "    groups = [\"admins\"]",
+    "  file \"/etc/a\"",
+    "    group = \"adm\"",
+    "  directory \"/srv/d\"",
+    "    owner = \"ana\"",
+    "    group = \"staff\"",
+    "  group \"after\""
+  ])
+  assertEq(syntaxOf(text), "")
+  assertEq(roundTrip(text), text)
+  assertEq(syntaxOf(src(["role r()", "  user \"ana\"", "    group = "])).contains("E0150"), true)
+
 @test("spans point at the source: a declaration, a statement, an expression")
 treeSpans()
   val f =parseSource("t.fettle", src(["", "role r()", "  package \"git\"", "  val n = 1 + 22"])).file

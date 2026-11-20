@@ -18,9 +18,9 @@ data FieldType
   // The text of a file: a `string`, or a `secret` where the field is secret-capable.
   ContentT
 
-// One field: its name, its type, whether a secret may stand in it, and its default as written in
-// the design (empty where the field is unset unless given).
-data FieldSpec(name: string, kind: FieldType, secret: bool = false, default: string = "")
+// One field: its name, its type, whether a secret may stand in it, its default as written in the
+// design (empty where the field is unset unless given), and whether every resource must set it.
+data FieldSpec(name: string, kind: FieldType, secret: bool = false, default: string = "", required: bool = false)
 
 // A kind: its name, the type of its title, its reference type's name (`File`), its fields and its
 // actions.
@@ -84,15 +84,34 @@ val symlinkKind: KindSpec = KindSpec("symlink", PathT, "Symlink", [
 ])
 
 val commandKind: KindSpec = KindSpec("command", StringT, "Command", [
-  FieldSpec("run", CommandT),
+  FieldSpec("run", CommandT, required = true),
   FieldSpec("creates", PathT),
   FieldSpec("unless", CommandT),
   FieldSpec("onlyIf", CommandT),
   FieldSpec("always", BoolT, false, "false")
 ], ["run"])
 
+// A single file fetched from a URL and pinned by its SHA-256 (section 10, decision 17).
+val downloadKind: KindSpec = KindSpec("download", PathT, "Download", [
+  FieldSpec("url", StringT, required = true),
+  FieldSpec("sha256", StringT, required = true),
+  FieldSpec("owner", StringT),
+  FieldSpec("group", StringT),
+  FieldSpec("mode", ModeT)
+])
+
 // Every built-in kind of phase 1, in the order the design lists them.
-val builtinKinds: List[KindSpec] = [packageKind, serviceKind, userKind, groupKind, fileKind, directoryKind, symlinkKind, commandKind]
+val builtinKinds: List[KindSpec] = [
+  packageKind,
+  serviceKind,
+  userKind,
+  groupKind,
+  fileKind,
+  directoryKind,
+  symlinkKind,
+  commandKind,
+  downloadKind
+]
 
 // The built-in kind named `name`.
 kindNamed(name: string) -> Option[KindSpec] = builtinKinds.find(k -> k.name == name)

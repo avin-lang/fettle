@@ -1,0 +1,12 @@
+## addgroup ana docker; addgroup ana audio; delgroup ana wheel
+set -e
+addgroup ana docker
+addgroup ana audio
+delgroup ana wheel
+## input
+## end
+## delgroup ana wheel
+set -e
+delgroup ana wheel
+## input
+## end

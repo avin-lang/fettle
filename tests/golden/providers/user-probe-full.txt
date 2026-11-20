@@ -1,0 +1,30 @@
+n=ana
+if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow
+elif command -v busybox >/dev/null 2>&1; then echo tools=busybox
+else echo tools=none; fi
+if command -v getent >/dev/null 2>&1; then e=$(getent passwd "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '$1 == n { print; exit }' /etc/passwd); fi
+if [ -z "$e" ]; then echo passwd=; exit 0; fi
+printf 'passwd=%s\n' "$e"
+printf 'primary=%s\n' "$(id -gn "$n")"
+printf 'groups=%s\n' "$(id -Gn "$n")"
+if [ -r /etc/shadow ]; then
+s=$(awk -F: -v n="$n" '$1 == n { print $2; exit }' /etc/shadow)
+if command -v sha256sum >/dev/null 2>&1; then h=$(printf '%s' "$s" | sha256sum)
+elif command -v shasum >/dev/null 2>&1; then h=$(printf '%s' "$s" | shasum -a 256)
+else h=$(printf '%s' "$s" | openssl dgst -sha256 -r); fi
+h=${h%% *}
+printf 'password=%s\n' "$h"
+else echo password=unreadable; fi
+h=$(printf '%s\n' "$e" | cut -d: -f6)
+if [ -L "$h/.ssh" ]; then echo ssh=link
+else
+if [ -d "$h/.ssh" ]; then printf 'ssh=%s\n' "$(stat -c '%a %U %G' "$h/.ssh" 2>/dev/null || stat -f '%Lp %Su %Sg' "$h/.ssh")"
+elif [ -e "$h/.ssh" ]; then echo ssh=other
+else echo ssh=absent; fi
+k="$h/.ssh/authorized_keys"
+if [ -L "$k" ]; then echo keys=link
+elif [ -f "$k" ]; then printf 'keys=%s\n' "$(stat -c '%a %U %G' "$k" 2>/dev/null || stat -f '%Lp %Su %Sg' "$k")"; echo --; cat "$k"
+elif [ -e "$k" ]; then echo keys=other
+else echo keys=absent; fi
+fi

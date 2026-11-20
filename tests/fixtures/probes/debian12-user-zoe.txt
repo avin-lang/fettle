@@ -1,0 +1,4 @@
+tools=shadow
+passwd=zoe:x:1003:1003:Zoë Ångström-Øberg 🎻,Raum 3,,:/home/zoe:/bin/bash
+primary=zoe
+groups=zoe

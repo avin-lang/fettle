@@ -1,0 +1,5 @@
+## groupadd admins
+set -e
+groupadd admins
+## input
+## end

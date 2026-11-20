@@ -1,0 +1,4 @@
+tools=shadow
+passwd=ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash
+primary=ubuntu
+groups=ubuntu adm cdrom sudo dip lxd

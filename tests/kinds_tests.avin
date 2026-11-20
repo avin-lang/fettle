@@ -4,10 +4,18 @@ import dev.avinlang.fettle.kinds.{ContentT, ModeT, PathT, builtinKinds, kindName
 
 @test("phase 1's kinds are known by name, and nothing else is")
 kindNames()
-  assertEq(builtinKinds.map(k -> k.name).mkString(" "), "package service user group file directory symlink command")
+  assertEq(builtinKinds.map(k -> k.name).mkString(" "), "package service user group file directory symlink command download")
   assertEq(kindNamed("file").isDefined, true)
   assertEq(kindNamed("sysctl").isDefined, false)
   assertEq(kindNamed("File").isDefined, false)
+
+@test("only a command's `run` and a download's `url` and `sha256` must be set")
+requiredSchema()
+  val required = builtinKinds.flatMap(k -> k.fields.filter(f -> f.required).map(f -> s"${k.name}.${f.name}"))
+  assertEq(required.mkString(" "), "command.run download.url download.sha256")
+  assertEq(kindNamed("download").get.title == PathT, true)
+  assertEq(kindNamed("download").get.field("mode").get.kind == ModeT, true)
+  assertEq(kindNamed("download").get.refType, "Download")
 
 @test("a file's title is a path, its mode a mode, and its content may hold a secret")
 fileSchema()

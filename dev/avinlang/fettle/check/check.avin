@@ -547,6 +547,9 @@ class Checker(val files: List[SourceFile], val exists: (string) -> bool, val tem
         other -> stmt(other, env, Where(where.role, r.kind))
     if r.kind == "command" && !triggered && !set.contains("creates") && !set.contains("unless") && !set.contains("onlyIf") && !set.contains("always")
       error("E0222", "a `command` with no guard runs on every apply", r.span, "no guard", "give it `creates`, `unless`, `onlyIf` or `on … -> run`, or say `always = true`")
+    for f in spec.fields
+      if f.required && !set.contains(f.name)
+        error("E0245", s"a `${r.kind}` needs the field `${f.name}`", r.span, s"no `${f.name}`")
     RefTy(r.kind)
 
   // An expression `on` or `after` names: a resource reference, or for `after` a role's group.

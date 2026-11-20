@@ -1,0 +1,10 @@
+n=ana
+if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow
+elif command -v busybox >/dev/null 2>&1; then echo tools=busybox
+else echo tools=none; fi
+if command -v getent >/dev/null 2>&1; then e=$(getent passwd "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '$1 == n { print; exit }' /etc/passwd); fi
+if [ -z "$e" ]; then echo passwd=; exit 0; fi
+printf 'passwd=%s\n' "$e"
+printf 'primary=%s\n' "$(id -gn "$n")"
+printf 'groups=%s\n' "$(id -Gn "$n")"

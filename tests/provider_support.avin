@@ -1,0 +1,104 @@
+module tests
+
+import avin.fs
+
+import dev.avinlang.fettle.engine.{Context, Create, Delta, InSync, Modify, Op, Provider, Remove, Run, Step, reveal}
+import dev.avinlang.fettle.graph.{Node, ResourceId, Value}
+import dev.avinlang.fettle.shell.{Output}
+import dev.avinlang.fettle.transport.{ExitCode, Ran, Transport, TransportError}
+
+// What the provider tests share: a root context, probe outputs recorded from real hosts, a
+// transport that answers probe scripts with them, and golden files of the scripts providers write.
+
+// A context for a root login that reads secrets as `fettle apply` does.
+rootContext() -> Context = Context(true, f -> fs.readBytes(f).mapErr(e -> e.message), v -> reveal(v))
+
+// A resource of `kind` titled `title`, run as `user`.
+resourceOf(kind: string, title: string, fields: List[(string, Value)] = [], user: string = "") -> Node =
+  Node(ResourceId(kind, title), fields, at(1), user)
+
+// What a probe command printed: `text` on its standard output, status 0.
+printed(text: string) -> Output = Output(0, text, "")
+
+// The probe output recorded on a fixture host, `tests/fixtures/probes/<name>.txt`.
+probeFixture(name: string) -> Output = printed(
+  fs.readText(s"tests/fixtures/probes/$name.txt").getOrElse("(missing fixture)")
+)
+
+// The probe command texts `p` gives for `node`, each rendered, separated by a line `----`.
+probeText(p: Provider, node: Node, ctx: Context = rootContext()) -> string = p.probes(node, ctx) match
+  Ok(cs) -> cs.map(c -> c.render.getOrElse("(no render)")).mkString("\n----\n") + "\n"
+  Err(e) -> s"error: $e"
+
+// What `p` finds `node` to need from the probe outputs `outputs`, or the error.
+deltaOf(p: Provider, node: Node, outputs: Vector[Output], ctx: Context = rootContext()) -> Result[Delta, string] =
+  p.delta(node, outputs, ctx)
+
+// The plan's mark of `op`, `=` for in sync.
+markOf(op: Op) -> string = op match
+  InSync -> "="
+  Create -> "+"
+  Modify -> "~"
+  Remove -> "-"
+  Run(true) -> "!"
+  Run(false) -> ">"
+
+// The mark and plan text of a delta, as `+ summary`, or `error: …`.
+planned(d: Result[Delta, string]) -> string = d match
+  Ok(x) -> if x.summary.isEmpty then markOf(x.op) else s"${markOf(x.op)} ${x.summary}"
+  Err(e) -> s"error: $e"
+
+// The steps of `node` from the delta `d`, each as its shown text, its script and its input, or
+// `error: …`.
+stepsText(p: Provider, node: Node, d: Result[Delta, string], ctx: Context = rootContext()) -> string = d match
+  Err(e) -> s"error: $e"
+  Ok(x) -> p.steps(node, x, ctx) match
+    Ok(steps) -> steps.map(s -> stepText(s)).mkString("")
+    Err(e) -> s"error: $e"
+
+// One step as the golden files hold it.
+stepText(s: Step) -> string
+  val input = string.fromUtf8Lossy(s.input)
+  val withheld = if s.withheld then " (withheld)" else ""
+  s"## ${s.shown}$withheld\n${s.script}## input\n$input## end\n"
+
+// `actual` against the golden file `tests/golden/providers/<name>`. A missing golden file is
+// written from `actual` and fails the test, so a new one is reviewed before it is trusted.
+assertGolden(name: string, actual: string)
+  val file = s"tests/golden/providers/$name"
+  fs.readText(file) match
+    Ok(expected) -> assertEq(actual, expected)
+    Err(_) ->
+      _ = fs.createDirAll("tests/golden/providers")
+      _ = fs.writeText(file, actual)
+      fail(s"the golden file $file was missing and has been written: review it")
+
+// A transport that answers the n-th probe script it is given with the n-th entry of `answers`, in
+// the probe script's format, and every other script with success; it keeps each script (its probe
+// marker written `MARKER`) and each input.
+class Scripted(val answers: Vector[Vector[Output]]): Transport
+  val scripts = Buffer[string]()
+  val inputs = Buffer[string]()
+  private var probesRun = 0
+
+  override run(script: string, input: Array[byte]) -> Result[Ran, TransportError]
+    val begin = "printf '%s begin\\n' "
+    val at = script.indexOf(begin)
+    if at < 0
+      scripts += script
+      inputs += string.fromUtf8Lossy(input)
+      return Ok(Ran(ExitCode(0), Array.empty[byte](), Array.empty[byte]()))
+    val from = at + begin.byteLength
+    val marker = script.slice(from, script.indexOf("\n", from))
+    scripts += script.replace(marker, "MARKER")
+    inputs += string.fromUtf8Lossy(input)
+    val outputs = if probesRun < answers.length then answers(probesRun) else []
+    probesRun += 1
+    val out = StringWriter()
+    out.write(s"$marker begin\n")
+    for (o, i) in outputs.zipWithIndex
+      out.write(s"$marker $i ${o.code} ${o.stdout.byteLength} ${o.stderr.byteLength}\n${o.stdout}${o.stderr}")
+    out.write(s"$marker end\n")
+    Ok(Ran(ExitCode(0), out.text.utf8, Array.empty[byte]()))
+
+  override close() -> Result[unit, TransportError] = Ok(())

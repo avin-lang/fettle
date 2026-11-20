@@ -1,0 +1,189 @@
+## script 0
+umask 077
+fettle_d=$(mktemp -d 2>/dev/null) || { echo 'fettle: cannot make a scratch directory' >&2; exit 125; }
+trap 'rm -rf "$fettle_d"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '%s begin\n' MARKER
+(
+/bin/sh -c 'f=/var/lib/fettle/pending
+if [ -f "$f" ]; then cat "$f"; fi'
+) >"$fettle_d/o" 2>"$fettle_d/e" </dev/null
+printf '%s %s %s %s %s\n' MARKER 0 "$?" $(wc -c <"$fettle_d/o") $(wc -c <"$fettle_d/e")
+cat "$fettle_d/o" "$fettle_d/e"
+(
+/bin/sh -c 'n=admins
+if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow
+elif command -v busybox >/dev/null 2>&1; then echo tools=busybox
+else echo tools=none; fi
+if command -v getent >/dev/null 2>&1; then e=$(getent group "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '\''$1 == n { print; exit }'\'' /etc/group); fi
+printf '\''group=%s\n'\'' "$e"'
+) >"$fettle_d/o" 2>"$fettle_d/e" </dev/null
+printf '%s %s %s %s %s\n' MARKER 1 "$?" $(wc -c <"$fettle_d/o") $(wc -c <"$fettle_d/e")
+cat "$fettle_d/o" "$fettle_d/e"
+(
+/bin/sh -c 'n=ana
+if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow
+elif command -v busybox >/dev/null 2>&1; then echo tools=busybox
+else echo tools=none; fi
+if command -v getent >/dev/null 2>&1; then e=$(getent passwd "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '\''$1 == n { print; exit }'\'' /etc/passwd); fi
+if [ -z "$e" ]; then echo passwd=; exit 0; fi
+printf '\''passwd=%s\n'\'' "$e"
+printf '\''primary=%s\n'\'' "$(id -gn "$n")"
+printf '\''groups=%s\n'\'' "$(id -Gn "$n")"
+h=$(printf '\''%s\n'\'' "$e" | cut -d: -f6)
+if [ -L "$h/.ssh" ]; then echo ssh=link
+else
+if [ -d "$h/.ssh" ]; then printf '\''ssh=%s\n'\'' "$(stat -c '\''%a %U %G'\'' "$h/.ssh" 2>/dev/null || stat -f '\''%Lp %Su %Sg'\'' "$h/.ssh")"
+elif [ -e "$h/.ssh" ]; then echo ssh=other
+else echo ssh=absent; fi
+k="$h/.ssh/authorized_keys"
+if [ -L "$k" ]; then echo keys=link
+elif [ -f "$k" ]; then printf '\''keys=%s\n'\'' "$(stat -c '\''%a %U %G'\'' "$k" 2>/dev/null || stat -f '\''%Lp %Su %Sg'\'' "$k")"; echo --; cat "$k"
+elif [ -e "$k" ]; then echo keys=other
+else echo keys=absent; fi
+fi'
+) >"$fettle_d/o" 2>"$fettle_d/e" </dev/null
+printf '%s %s %s %s %s\n' MARKER 2 "$?" $(wc -c <"$fettle_d/o") $(wc -c <"$fettle_d/e")
+cat "$fettle_d/o" "$fettle_d/e"
+printf '%s end\n' MARKER
+
+## input
+## end
+## script 1
+set -e
+groupadd -g 1050 admins
+
+## input
+## end
+## script 2
+umask 077
+fettle_d=$(mktemp -d 2>/dev/null) || { echo 'fettle: cannot make a scratch directory' >&2; exit 125; }
+trap 'rm -rf "$fettle_d"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '%s begin\n' MARKER
+(
+/bin/sh -c 'n=admins
+if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow
+elif command -v busybox >/dev/null 2>&1; then echo tools=busybox
+else echo tools=none; fi
+if command -v getent >/dev/null 2>&1; then e=$(getent group "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '\''$1 == n { print; exit }'\'' /etc/group); fi
+printf '\''group=%s\n'\'' "$e"'
+) >"$fettle_d/o" 2>"$fettle_d/e" </dev/null
+printf '%s %s %s %s %s\n' MARKER 0 "$?" $(wc -c <"$fettle_d/o") $(wc -c <"$fettle_d/e")
+cat "$fettle_d/o" "$fettle_d/e"
+printf '%s end\n' MARKER
+
+## input
+## end
+## script 3
+umask 077
+fettle_d=$(mktemp -d 2>/dev/null) || { echo 'fettle: cannot make a scratch directory' >&2; exit 125; }
+trap 'rm -rf "$fettle_d"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '%s begin\n' MARKER
+(
+/bin/sh -c 'n=ana
+if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow
+elif command -v busybox >/dev/null 2>&1; then echo tools=busybox
+else echo tools=none; fi
+if command -v getent >/dev/null 2>&1; then e=$(getent passwd "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '\''$1 == n { print; exit }'\'' /etc/passwd); fi
+if [ -z "$e" ]; then echo passwd=; exit 0; fi
+printf '\''passwd=%s\n'\'' "$e"
+printf '\''primary=%s\n'\'' "$(id -gn "$n")"
+printf '\''groups=%s\n'\'' "$(id -Gn "$n")"
+h=$(printf '\''%s\n'\'' "$e" | cut -d: -f6)
+if [ -L "$h/.ssh" ]; then echo ssh=link
+else
+if [ -d "$h/.ssh" ]; then printf '\''ssh=%s\n'\'' "$(stat -c '\''%a %U %G'\'' "$h/.ssh" 2>/dev/null || stat -f '\''%Lp %Su %Sg'\'' "$h/.ssh")"
+elif [ -e "$h/.ssh" ]; then echo ssh=other
+else echo ssh=absent; fi
+k="$h/.ssh/authorized_keys"
+if [ -L "$k" ]; then echo keys=link
+elif [ -f "$k" ]; then printf '\''keys=%s\n'\'' "$(stat -c '\''%a %U %G'\'' "$k" 2>/dev/null || stat -f '\''%Lp %Su %Sg'\'' "$k")"; echo --; cat "$k"
+elif [ -e "$k" ]; then echo keys=other
+else echo keys=absent; fi
+fi'
+) >"$fettle_d/o" 2>"$fettle_d/e" </dev/null
+printf '%s %s %s %s %s\n' MARKER 0 "$?" $(wc -c <"$fettle_d/o") $(wc -c <"$fettle_d/e")
+cat "$fettle_d/o" "$fettle_d/e"
+printf '%s end\n' MARKER
+
+## input
+## end
+## script 4
+set -e
+useradd -G admins -s /bin/bash -m ana
+
+## input
+## end
+## script 5
+set -e
+n=ana
+if command -v getent >/dev/null 2>&1; then e=$(getent passwd "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '$1 == n { print; exit }' /etc/passwd); fi
+h=$(printf '%s\n' "$e" | cut -d: -f6)
+g=$(id -gn "$n")
+if [ -z "$h" ] || [ ! -d "$h" ]; then echo "fettle: the home directory of $n does not exist" >&2; exit 1; fi
+if [ -L "$h/.ssh" ]; then echo "fettle: $h/.ssh is a symlink" >&2; exit 1; fi
+if [ ! -d "$h/.ssh" ]; then mkdir "$h/.ssh"; fi
+chown -h "$n:$g" "$h/.ssh"
+chmod 0700 "$h/.ssh"
+t=$(mktemp "$h/.ssh/.fettle.XXXXXX")
+trap 'rm -f "$t"' EXIT
+cat >"$t"
+chown "$n:$g" "$t"
+chmod 0600 "$t"
+mv -f "$t" "$h/.ssh/authorized_keys"
+trap - EXIT
+
+## input
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGJ5bGFwdG9wa2V5 ana@laptop
+## end
+## script 6
+umask 077
+fettle_d=$(mktemp -d 2>/dev/null) || { echo 'fettle: cannot make a scratch directory' >&2; exit 125; }
+trap 'rm -rf "$fettle_d"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf '%s begin\n' MARKER
+(
+/bin/sh -c 'n=ana
+if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow
+elif command -v busybox >/dev/null 2>&1; then echo tools=busybox
+else echo tools=none; fi
+if command -v getent >/dev/null 2>&1; then e=$(getent passwd "$n" | head -n 1)
+else e=$(awk -F: -v n="$n" '\''$1 == n { print; exit }'\'' /etc/passwd); fi
+if [ -z "$e" ]; then echo passwd=; exit 0; fi
+printf '\''passwd=%s\n'\'' "$e"
+printf '\''primary=%s\n'\'' "$(id -gn "$n")"
+printf '\''groups=%s\n'\'' "$(id -Gn "$n")"
+h=$(printf '\''%s\n'\'' "$e" | cut -d: -f6)
+if [ -L "$h/.ssh" ]; then echo ssh=link
+else
+if [ -d "$h/.ssh" ]; then printf '\''ssh=%s\n'\'' "$(stat -c '\''%a %U %G'\'' "$h/.ssh" 2>/dev/null || stat -f '\''%Lp %Su %Sg'\'' "$h/.ssh")"
+elif [ -e "$h/.ssh" ]; then echo ssh=other
+else echo ssh=absent; fi
+k="$h/.ssh/authorized_keys"
+if [ -L "$k" ]; then echo keys=link
+elif [ -f "$k" ]; then printf '\''keys=%s\n'\'' "$(stat -c '\''%a %U %G'\'' "$k" 2>/dev/null || stat -f '\''%Lp %Su %Sg'\'' "$k")"; echo --; cat "$k"
+elif [ -e "$k" ]; then echo keys=other
+else echo keys=absent; fi
+fi'
+) >"$fettle_d/o" 2>"$fettle_d/e" </dev/null
+printf '%s %s %s %s %s\n' MARKER 0 "$?" $(wc -c <"$fettle_d/o") $(wc -c <"$fettle_d/e")
+cat "$fettle_d/o" "$fettle_d/e"
+printf '%s end\n' MARKER
+
+## input
+## end

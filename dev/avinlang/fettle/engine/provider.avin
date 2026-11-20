@@ -50,6 +50,9 @@ data Op
   Modify
   // It exists and is declared `present = false`.
   Remove
+  // A `command` is to run: every time (`always`), or because its guards say so. Its exit status is
+  // its outcome, so it is not probed again after it runs.
+  Run(always: bool)
 
 // What a provider found a resource to need: the operation, its text for the plan's line, the fields
 // that differ, the current and declared text of its content where the plan shows a line diff of
@@ -110,9 +113,13 @@ class Context(
       secrets(secret) = r
       r
 
-// The providers of the built-in kinds: `file`, `directory` and `symlink`.
+// The providers of the built-in kinds.
 builtinProvider(kind: string) -> Option[Provider] = kind match
   "file" -> Some(FileProvider())
   "directory" -> Some(DirectoryProvider())
   "symlink" -> Some(SymlinkProvider())
+  "user" -> Some(UserProvider())
+  "group" -> Some(GroupProvider())
+  "command" -> Some(CommandProvider())
+  "download" -> Some(DownloadProvider())
   _ -> None

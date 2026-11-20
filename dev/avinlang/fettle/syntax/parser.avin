@@ -330,7 +330,11 @@ object Grammar: TokenParsers[Token]
 
   lazy val stmt: P[Stmt] = valStmt | ifStmt | forStmt | matchStmt | asStmt | onStmt | afterStmt | fieldStmt | callStmt | resourceStmt
 
-  lazy val fieldStmt: P[Stmt] = name ~ (sym("=") ~! (expr <~ lineEnd)) ^^ (match ((n, s), (_, v)) -> FieldS(n, v, s.through(v.extent)))
+  // `field = value`. A field may be named `group` (a user's primary group, a file's group), which is
+  // also the inventory's word.
+  lazy val fieldStmt: P[Stmt] = fieldName ~ (sym("=") ~! (expr <~ lineEnd)) ^^ (match ((n, s), (_, v)) -> FieldS(n, v, s.through(v.extent)))
+
+  lazy val fieldName: P[(string, Span)] = token("a field", t -> isName(t) || isWord(t, "group")) ^^ (t -> (textOf(t), t.extent))
 
   lazy val refs: P[List[Expr]] = rep1sep(orExpr, sym(","))
 

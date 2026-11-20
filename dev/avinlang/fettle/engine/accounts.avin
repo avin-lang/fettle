@@ -1,0 +1,547 @@
+module dev.avinlang.fettle.engine
+
+import avin.crypto
+import avin.encoding
+import dev.avinlang.fettle.graph.{BoolV, IntV, ListV, Node, SecretV, StrV, Value}
+import dev.avinlang.fettle.shell.{Command, Output, Shell, quote}
+
+// The providers of `user` and `group`. Each probe first says which tools the host manages accounts
+// with: the shadow utilities (`useradd`, `usermod`, `userdel`, `groupadd`, `groupmod`, `groupdel`;
+// Debian, Ubuntu, the RHEL family, Alpine with `shadow` installed) or busybox's `adduser`,
+// `addgroup`, `deluser` and `delgroup` (Alpine). The entry is read with `getent`, which asks every
+// name service, or from `/etc/passwd` and `/etc/group` where the host has no `getent`. A user's
+// groups come from `id -Gn`. Only what a field declares is compared; a home directory is never
+// removed.
+
+// Whether `name` may name a user or a group: 1 to 32 ASCII characters, a letter or `_` first, then
+// letters, digits, `_`, `.` and `-`, with an optional `$` last (a Samba machine account). So no name
+// is taken for an option or a number (a uid), and none holds a `:`, which separates the fields of
+// `/etc/passwd`.
+accountName(name: string) -> Result[string, string]
+  val body = if name.endsWith("$") then name.slice(0, name.byteLength - 1) else name
+  val chars = body.forall(
+    c -> 'a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9' || c == '_' || c == '.' || c == '-'
+  )
+  val first = chars && body.nonEmpty && body.slice(0, 1).forall(c -> 'a' <= c <= 'z' || 'A' <= c <= 'Z' || c == '_')
+  if first && name.byteLength <= 32 then Ok(name)
+  else Err(s"`$name` is not a user or group name: a letter or `_`, then letters, digits, `_`, `.` or `-`, at most 32")
+
+// The lines of a probe that print `tools=shadow` when the host has the shadow utilities,
+// `tools=busybox` when it has busybox instead, and `tools=none` otherwise. `/usr/sbin` and `/sbin`
+// are looked in too, which an unprivileged login's `PATH` may leave out.
+private val accountTools: string =
+  "if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ] || [ -x /sbin/useradd ]; then echo tools=shadow\n"
+    + "elif command -v busybox >/dev/null 2>&1; then echo tools=busybox\n"
+    + "else echo tools=none; fi\n"
+
+// The lines that set `e` to the first entry named `$n` in the database `db` (`passwd` or `group`),
+// or to nothing when there is none.
+private entryLines(db: string) -> string =
+  s"if command -v getent >/dev/null 2>&1; then e=$$(getent $db \"$$n\" | head -n 1)\n"
+    + s"else e=$$(awk -F: -v n=\"$$n\" '$$1 == n { print; exit }' /etc/$db); fi\n"
+
+// The lines that set `h` to the SHA-256, in hexadecimal, of what `source` prints, with whichever of
+// `sha256sum`, `shasum -a 256` and `openssl dgst` the host has.
+private hashLines(source: string) -> string =
+  s"if command -v sha256sum >/dev/null 2>&1; then h=$$($source | sha256sum)\n"
+    + s"elif command -v shasum >/dev/null 2>&1; then h=$$($source | shasum -a 256)\n"
+    + s"else h=$$($source | openssl dgst -sha256 -r); fi\n"
+    + "h=${h%% *}\n"
+
+// The command printing the octal mode, owner and group of the shell word `p`.
+private statLine(p: string) -> string = s"stat -c '%a %U %G' $p 2>/dev/null || stat -f '%Lp %Su %Sg' $p"
+
+// `line` split at every `:`, empty fields kept.
+private colonFields(line: string) -> Vector[string]
+  val out = Buffer[string]()
+  var at = 0
+  while true
+    val c = line.indexOf(":", at)
+    if c < 0
+      out += line.slice(at, line.byteLength)
+      return out.toVector
+    out += line.slice(at, c)
+    at = c + 1
+  out.toVector
+
+// A line of `/etc/passwd`.
+data PasswdEntry(name: string, uid: long, gid: long, gecos: string, home: string, shell: string)
+
+// `line` read as an entry of `/etc/passwd`: seven fields, the comment (GECOS) any text but `:`.
+passwdEntry(line: string) -> Result[PasswdEntry, string]
+  val f = colonFields(line)
+  if f.length != 7 then return Err(s"`$line` is not an entry of /etc/passwd")
+  (f(2).toLongOption(), f(3).toLongOption()) match
+    (Some(uid), Some(gid)) -> Ok(PasswdEntry(f(0), uid, gid, f(4), f(5), f(6)))
+    _ -> Err(s"`$line` is not an entry of /etc/passwd: its uid or gid is not a number")
+
+// A line of `/etc/group`.
+data GroupEntry(name: string, gid: long, members: Vector[string])
+
+// `line` read as an entry of `/etc/group`: four fields, the members separated by commas.
+groupEntry(line: string) -> Result[GroupEntry, string]
+  val f = colonFields(line)
+  if f.length != 4 then return Err(s"`$line` is not an entry of /etc/group")
+  f(2).toLongOption() match
+    Some(gid) -> Ok(GroupEntry(f(0), gid, f(3).split(',').filter(m -> m.nonEmpty).toVector))
+    None -> Err(s"`$line` is not an entry of /etc/group: its gid is not a number")
+
+// The int field `name` of `node`, if set.
+private number(node: Node, name: string) -> Result[Option[long], string] = node.field(name) match
+  None -> Ok(None)
+  Some(IntV(n)) if 0 <= n <= 4294967294 -> Ok(Some(n))
+  Some(IntV(n)) -> Err(s"`$name` is $n, outside 0 to 4294967294")
+  Some(other) -> Err(s"`$name` is a number, not `${other.shown}`")
+
+// The list of strings `name` of `node`, if set.
+private strings(node: Node, name: string) -> Result[Option[Vector[string]], string] = node.field(name) match
+  None -> Ok(None)
+  Some(ListV(items)) ->
+    val out = Buffer[string]()
+    for item in items
+      item match
+        StrV(t) -> out += t
+        other -> return Err(s"`$name` holds strings, not `${other.shown}`")
+    Ok(Some(out.toVector))
+  Some(other) -> Err(s"`$name` is a list of strings, not `${other.shown}`")
+
+// Whether the boolean field `name` of `node` is set true.
+private flag(node: Node, name: string) -> bool = node.field(name) == Some(BoolV(true))
+
+// Names as the plan lists them: `a, b`.
+private listed(items: Vector[string]) -> string = items.mkString(", ")
+
+// The tools a probe found, refused when the host has none.
+private accountToolsOf(p: Probed) -> Result[string, string] = p.value("tools") match
+  "shadow" -> Ok("shadow")
+  "busybox" -> Ok("busybox")
+  _ -> Err("the host has neither the shadow utilities (`useradd`) nor busybox's `adduser`")
+
+// The output of an account probe, which must have run.
+private accountProbed(outputs: Vector[Output]) -> Result[Probed, string]
+  if outputs.length != 1 then return Err("the probe gave no output")
+  val o = outputs(0)
+  if !o.succeeded then return Err(s"the probe failed with status ${o.code}: ${o.stderr.trim}")
+  Ok(readProbed(o.stdout))
+
+// --- group -----------------------------------------------------------------------------------------
+
+class GroupProvider(): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string]
+    val n = quote(accountName(node.id.title)?)?
+    Ok([Shell(s"n=$n\n" + accountTools + entryLines("group") + "printf 'group=%s\\n' \"$e\"")])
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    val p = accountProbed(outputs)?
+    val line = p.value("group")
+    val found = if line.isEmpty then None else Some(groupEntry(line)?)
+    val gid = number(node, "gid")?
+    if !present(node)
+      if found.isEmpty then return Ok(Delta(InSync, "", [], None, p))
+      _ = accountToolsOf(p)?
+      return Ok(Delta(Remove, "", [], None, p))
+    found match
+      None ->
+        _ = accountToolsOf(p)?
+        val words = Buffer[string]()
+        gid.foreach(g -> words += s"gid $g")
+        if flag(node, "system") then words += "system"
+        Ok(Delta(Create, words.mkString(", "), [], None, p))
+      Some(g) -> gid match
+        Some(wanted) if wanted != g.gid ->
+          if accountToolsOf(p)? == "busybox"
+            return Err("busybox cannot change a group's gid; install the `shadow` package for `groupmod`")
+          Ok(Delta(Modify, s"gid ${g.gid} -> $wanted", [FieldChange("gid", s"${g.gid}", s"$wanted")], None, p))
+        _ -> Ok(Delta(InSync, "", [], None, p))
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string]
+    val n = quote(accountName(node.id.title)?)?
+    val busybox = accountToolsOf(delta.current)? == "busybox"
+    val gid = number(node, "gid")?
+    val line = delta.op match
+      Remove -> if busybox then s"delgroup $n" else s"groupdel $n"
+      Create ->
+        val words = Buffer[string]()
+        words += if busybox then "addgroup" else "groupadd"
+        if flag(node, "system") then words += if busybox then "-S" else "-r"
+        gid.foreach(g -> words ++= ["-g", s"$g"])
+        words += n
+        words.mkString(" ")
+      _ -> s"groupmod -g ${gid.getOrElse(0)} $n"
+    Ok([Step(script(line + "\n"), Array.empty[byte](), line)])
+
+// --- user ------------------------------------------------------------------------------------------
+
+// The probe of the user `name`. It prints `tools=`, then `passwd=` with the user's entry (empty when
+// there is no such user), and for a user that exists `primary=` and `groups=` (from `id`); when
+// `password` is set, `password=` with the SHA-256 of the hash in `/etc/shadow` (the hash itself
+// never leaves the host), or `password=unreadable`; when `keys` is set, `ssh=` with the mode, owner
+// and group of `~/.ssh` (or `absent`, `link`, `other`), `keys=` the same of its `authorized_keys`,
+// and after `--` that file.
+private userProbe(name: string, keys: bool, password: bool) -> Result[Command, string]
+  val n = quote(accountName(name)?)?
+  val out = StringWriter()
+  out.write(s"n=$n\n")
+  out.write(accountTools)
+  out.write(entryLines("passwd"))
+  out.write("if [ -z \"$e\" ]; then echo passwd=; exit 0; fi\n")
+  out.write("printf 'passwd=%s\\n' \"$e\"\n")
+  out.write("printf 'primary=%s\\n' \"$(id -gn \"$n\")\"\n")
+  out.write("printf 'groups=%s\\n' \"$(id -Gn \"$n\")\"\n")
+  if password
+    out.write("if [ -r /etc/shadow ]; then\n")
+    out.write("s=$(awk -F: -v n=\"$n\" '$1 == n { print $2; exit }' /etc/shadow)\n")
+    out.write(hashLines("printf '%s' \"$s\""))
+    out.write("printf 'password=%s\\n' \"$h\"\n")
+    out.write("else echo password=unreadable; fi\n")
+  if keys
+    out.write("h=$(printf '%s\\n' \"$e\" | cut -d: -f6)\n")
+    out.write("if [ -L \"$h/.ssh\" ]; then echo ssh=link\nelse\n")
+    out.write(s"if [ -d \"$$h/.ssh\" ]; then printf 'ssh=%s\\n' \"$$(${statLine("\"$h/.ssh\"")})\"\n")
+    out.write("elif [ -e \"$h/.ssh\" ]; then echo ssh=other\nelse echo ssh=absent; fi\n")
+    out.write("k=\"$h/.ssh/authorized_keys\"\n")
+    out.write("if [ -L \"$k\" ]; then echo keys=link\n")
+    out.write(s"elif [ -f \"$$k\" ]; then printf 'keys=%s\\n' \"$$(${statLine("\"$k\"")})\"; echo --; cat \"$$k\"\n")
+    out.write("elif [ -e \"$k\" ]; then echo keys=other\nelse echo keys=absent; fi\nfi")
+  Ok(Shell(out.text.trim))
+
+// A user as its probe found it: its entry, primary group, other groups, the SHA-256 of its password
+// hash (empty when not probed, `unreadable` when `/etc/shadow` could not be read), the attributes
+// of `~/.ssh` and of `authorized_keys` (`absent`, `link`, `other`, or `<mode> <owner> <group>`), and
+// the keys in that file.
+private data FoundUser(
+    entry: PasswdEntry,
+    primary: string,
+    groups: Vector[string],
+    password: string,
+    ssh: string,
+    keysFile: string,
+    keys: Vector[string]
+)
+
+// The user a probe found, if it exists.
+private foundUser(p: Probed) -> Result[Option[FoundUser], string]
+  val line = p.value("passwd")
+  if line.isEmpty then return Ok(None)
+  val entry = passwdEntry(line)?
+  val keys = p.rest.getOrElse("").lines.map(l -> l.stripSuffix("\r").trim).filter(l -> l.nonEmpty).distinct
+  Ok(
+    Some(
+      FoundUser(
+        entry,
+        p.value("primary"),
+        p.value("groups").split(' ').filter(g -> g.nonEmpty).toVector,
+        p.value("password"),
+        p.value("ssh"),
+        p.value("keys"),
+        keys
+      )
+    )
+  )
+
+// A user as its resource declares it; `None` is a field left unmanaged.
+private data WantedUser(
+    uid: Option[long],
+    group: Option[string],
+    groups: Option[Vector[string]],
+    shell: Option[string],
+    home: Option[string],
+    system: bool,
+    keys: Option[Vector[string]],
+    password: Option[string],
+    secretPassword: bool
+)
+
+// What the user `node` declares, its names and keys checked; the password is read only when `reveal`.
+private wantedUser(node: Node, ctx: Context, reveal: bool) -> Result[WantedUser, string]
+  val group = text(node, "group")
+  group match
+    Some(g) -> _ = accountName(g)?
+    None -> ()
+  val groups = strings(node, "groups")?.map(gs -> gs.distinct)
+  for g in groups.getOrElse([])
+    _ = accountName(g)?
+  val keys = strings(node, "authorizedKeys")?.map(ks -> ks.map(k -> k.trim).distinct)
+  for k in keys.getOrElse([])
+    if k.isEmpty then return Err("an authorized key is empty")
+    if k.exists(c -> c == '\n' || c == '\r' || int(c) == 0) then return Err("an authorized key is one line")
+  val (password, secret) = node.field("password") match
+    None -> (None, false)
+    Some(StrV(t)) -> (Some(t), false)
+    Some(SecretV(source, parts)) -> (if reveal then Some(ctx.secretOf(SecretV(source, parts))?) else Some(""), true)
+    Some(other) -> return Err(s"`password` is a string or a secret, not `${other.shown}`")
+  password match
+    Some(h) if reveal -> _ = passwordHash(h)?
+    _ -> ()
+  Ok(
+    WantedUser(
+      number(node, "uid")?,
+      group,
+      groups,
+      text(node, "shell"),
+      text(node, "home"),
+      flag(node, "system"),
+      keys,
+      password,
+      secret
+    )
+  )
+
+// `hash` checked as what `chpasswd -e` takes: a crypt(3) hash (`$6$…`, `$y$…`) or a locked or
+// disabled entry (`!…`, `*`), on one line, holding no `:`.
+private passwordHash(hash: string) -> Result[string, string]
+  if hash.exists(c -> c == ':' || c == '\n' || c == '\r' || int(c) == 0)
+    return Err("`password` holds a `:` or a line end, which no password hash does")
+  if !(hash.startsWith("$") || hash.startsWith("!") || hash.startsWith("*"))
+    return Err("`password` is a crypt(3) hash (`$y$…`, `$6$…`, made with `mkpasswd`), not a password")
+  Ok(hash)
+
+// The SHA-256 of `text` in hexadecimal.
+private sha256Hex(text: string) -> string = encoding.toHex(crypto.sha256(text.utf8.toVector))
+
+// `n` keys in words: `1 key`, `2 keys`.
+private keyCount(n: int) -> string = if n == 1 then "1 key" else s"$n keys"
+
+// Whether `attrs` (`<mode> <owner> <group>`) has the mode `mode` and the owner `owner`.
+private ownedAs(attrs: string, mode: string, owner: string) -> bool
+  val words = attrs.split(' ').filter(w -> w.nonEmpty)
+  words.length >= 2 && words(0) == mode && words(1) == owner
+
+// The supplementary groups of `groups`: without the primary group `primary`, each once.
+private others(groups: Vector[string], primary: string) -> Vector[string] = groups.filter(g -> g != primary).distinct
+
+class UserProvider(): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string]
+    val on = present(node)
+    Ok(
+      [userProbe(node.id.title, on && node.field("authorizedKeys").isDefined, on && node.field("password").isDefined)?]
+    )
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    val p = accountProbed(outputs)?
+    val found = foundUser(p)?
+    if !present(node)
+      if found.isEmpty then return Ok(Delta(InSync, "", [], None, p))
+      _ = accountToolsOf(p)?
+      return Ok(Delta(Remove, "", [], None, p))
+    val w = wantedUser(node, ctx, true)?
+    val u = found match
+      Some(u) -> u
+      None ->
+        _ = accountToolsOf(p)?
+        return Ok(Delta(Create, created(w), [], None, p))
+    val changes = Buffer[FieldChange]()
+    val words = Buffer[string]()
+    w.uid match
+      Some(id) if id != u.entry.uid ->
+        changes += FieldChange("uid", s"${u.entry.uid}", s"$id")
+        words += s"uid ${u.entry.uid} -> $id"
+      _ -> ()
+    w.group match
+      Some(g) if g != u.primary ->
+        changes += FieldChange("group", u.primary, g)
+        words += s"group ${u.primary} -> $g"
+      _ -> ()
+    w.groups match
+      Some(gs) ->
+        val wanted = others(gs, w.group.getOrElse(u.primary))
+        val have = others(u.groups, u.primary)
+        val added = wanted.filter(g -> !have.contains(g))
+        val removed = have.filter(g -> !wanted.contains(g))
+        if !added.isEmpty || !removed.isEmpty
+          changes += FieldChange("groups", listed(have), listed(wanted))
+          words += "groups " + (added.map(g -> s"+$g") ++ removed.map(g -> s"-$g")).mkString(" ")
+      None -> ()
+    w.shell match
+      Some(s) if s != u.entry.shell ->
+        changes += FieldChange("shell", u.entry.shell, s)
+        words += s"shell ${u.entry.shell} -> $s"
+      _ -> ()
+    w.home match
+      Some(h) if h != u.entry.home ->
+        changes += FieldChange("home", u.entry.home, h)
+        words += s"home ${u.entry.home} -> $h"
+      _ -> ()
+    w.password match
+      Some(hash) ->
+        if u.password == "unreadable" then return Err(
+          "`/etc/shadow` cannot be read, so the password cannot be compared"
+        )
+        if sha256Hex(hash) != u.password
+          changes += FieldChange("password", "(secret)", "(secret)")
+          words += if w.secretPassword then "password: (secret) changed" else "password changed"
+      None -> ()
+    w.keys match
+      Some(ks) ->
+        if u.ssh == "link" then return Err(s"`${u.entry.home}/.ssh` is a symlink, which fettle does not write through")
+        if u.ssh == "other" then return Err(s"`${u.entry.home}/.ssh` is not a directory")
+        if u.keysFile == "other" then return Err(s"`${u.entry.home}/.ssh/authorized_keys` is not a file")
+        val added = ks.filter(k -> !u.keys.contains(k))
+        val removed = u.keys.filter(k -> !ks.contains(k))
+        val wantsFile = !ks.isEmpty || u.keysFile != "absent"
+        val owner = u.entry.name
+        val attrsWrong = wantsFile && (
+          !ownedAs(u.ssh, "700", owner) || !ownedAs(u.keysFile, "600", owner)
+        )
+        if !added.isEmpty || !removed.isEmpty
+          changes += FieldChange("authorizedKeys", keyCount(u.keys.length), keyCount(ks.length))
+          val counts = Buffer[string]()
+          if !added.isEmpty then counts += s"+${added.length}"
+          if !removed.isEmpty then counts += s"-${removed.length}"
+          words += s"authorizedKeys ${counts.mkString(" ")}"
+        else if attrsWrong
+          changes += FieldChange("authorizedKeys", "ownership and modes", "0700/0600 owned by the user")
+          words += "authorizedKeys ownership and modes"
+      None -> ()
+    if changes.isEmpty then return Ok(Delta(InSync, "", [], None, p))
+    if accountToolsOf(p)? == "busybox"
+      for c in changes
+        if c.field == "uid" || c.field == "group" || c.field == "shell" || c.field == "home"
+          return Err(
+            s"busybox cannot change a user's `${c.field}`; install the `shadow` package for `usermod`"
+          )
+    Ok(Delta(Modify, words.mkString(", "), changes.toVector, None, p))
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string]
+    val name = accountName(node.id.title)?
+    val n = quote(name)?
+    val busybox = accountToolsOf(delta.current)? == "busybox"
+    if delta.op == Remove
+      val line = if busybox then s"deluser $n" else s"userdel $n"
+      return Ok([Step(script(line + "\n"), Array.empty[byte](), line)])
+    val w = wantedUser(node, ctx, true)?
+    val out = Buffer[Step]()
+    val changed = (f: string) -> delta.op == Create || delta.changes.exists(c -> c.field == f)
+    if delta.op == Create
+      val body = if busybox then busyboxCreate(n, w)? else shadowCreate(n, w)?
+      out += Step(script(body), Array.empty[byte](), body.trim.replace("\n", "; "))
+    else
+      val found = foundUser(delta.current)?
+      val primary = found.map(u -> u.primary).getOrElse("")
+      val body = if busybox then busyboxGroups(n, w, found)? else shadowModify(n, w, delta, primary)?
+      if body.nonEmpty then out += Step(script(body), Array.empty[byte](), body.trim.replace("\n", "; "))
+    w.password match
+      Some(hash) if changed("password") -> out += Step(
+        script("chpasswd -e\n"),
+        s"$name:$hash\n".utf8,
+        s"chpasswd -e (the password of $name)",
+        w.secretPassword
+      )
+      _ -> ()
+    w.keys match
+      Some(ks) if changed("authorizedKeys") && (delta.op != Create || !ks.isEmpty) ->
+        out += Step(keysScript(n), ks.map(k -> k + "\n").mkString("").utf8, s"write the authorized keys of $name")
+      _ -> ()
+    Ok(out.toVector)
+
+// The plan's text for a new user: `uid 1001, groups admins, shell /bin/bash, 2 keys`.
+private created(w: WantedUser) -> string
+  val words = Buffer[string]()
+  w.uid.foreach(u -> words += s"uid $u")
+  w.group.foreach(g -> words += s"group $g")
+  w.groups.foreach(gs -> if !gs.isEmpty then words += s"groups ${listed(others(gs, w.group.getOrElse("")))}")
+  w.shell.foreach(s -> words += s"shell $s")
+  w.home.foreach(h -> words += s"home $h")
+  if w.system then words += "system"
+  w.keys.foreach(ks -> words += keyCount(ks.length))
+  if w.password.isDefined then words += if w.secretPassword then "password (secret)" else "password"
+  words.mkString(", ")
+
+// Whether a new user gets a home directory: every user but a system user that declares neither a
+// home nor keys.
+private makesHome(w: WantedUser) -> bool = !w.system || w.home.isDefined || w.keys.exists(ks -> !ks.isEmpty)
+
+// `useradd` for a new user, `n` its name as a shell word.
+private shadowCreate(n: string, w: WantedUser) -> Result[string, string]
+  val words = Buffer[string]()
+  words += "useradd"
+  if w.system then words += "-r"
+  w.uid.foreach(u -> words ++= ["-u", s"$u"])
+  w.group match
+    Some(g) -> words ++= ["-g", quote(g)?]
+    None -> ()
+  w.groups.map(gs -> others(gs, w.group.getOrElse(""))) match
+    Some(gs) if !gs.isEmpty -> words ++= ["-G", quote(gs.mkString(","))?]
+    _ -> ()
+  w.shell match
+    Some(s) -> words ++= ["-s", quote(s)?]
+    None -> ()
+  w.home match
+    Some(h) -> words ++= ["-d", quote(h)?]
+    None -> ()
+  words += if makesHome(w) then "-m" else "-M"
+  words += n
+  Ok(words.mkString(" ") + "\n")
+
+// busybox's `adduser` for a new user, then `addgroup` for each of its other groups.
+private busyboxCreate(n: string, w: WantedUser) -> Result[string, string]
+  val words = Buffer[string]()
+  words ++= ["adduser", "-D"]
+  if w.system then words += "-S"
+  w.uid.foreach(u -> words ++= ["-u", s"$u"])
+  w.group match
+    Some(g) -> words ++= ["-G", quote(g)?]
+    None -> ()
+  w.shell match
+    Some(s) -> words ++= ["-s", quote(s)?]
+    None -> ()
+  w.home match
+    Some(h) -> words ++= ["-h", quote(h)?]
+    None -> ()
+  if !makesHome(w) then words += "-H"
+  words += n
+  val out = StringWriter()
+  out.write(words.mkString(" ") + "\n")
+  for g in w.groups.map(gs -> others(gs, w.group.getOrElse(""))).getOrElse([])
+    out.write(s"addgroup $n ${quote(g)?}\n")
+  Ok(out.text)
+
+// `usermod` with the fields `delta` changes, or nothing when only the password or keys change.
+private shadowModify(n: string, w: WantedUser, delta: Delta, primary: string) -> Result[string, string]
+  val changed = (f: string) -> delta.changes.exists(c -> c.field == f)
+  val words = Buffer[string]()
+  words += "usermod"
+  if changed("uid") then words ++= ["-u", s"${w.uid.get}"]
+  if changed("group") then words ++= ["-g", quote(w.group.get)?]
+  if changed("groups") then words ++= ["-G", quote(others(w.groups.get, w.group.getOrElse(primary)).mkString(","))?]
+  if changed("shell") then words ++= ["-s", quote(w.shell.get)?]
+  if changed("home") then words ++= ["-d", quote(w.home.get)?]
+  if words.length == 1 then return Ok("")
+  words += n
+  Ok(words.mkString(" ") + "\n")
+
+// busybox's `addgroup` and `delgroup` for the groups the user `n` joins and leaves.
+private busyboxGroups(n: string, w: WantedUser, found: Option[FoundUser]) -> Result[string, string]
+  val out = StringWriter()
+  (w.groups, found) match
+    (Some(gs), Some(u)) ->
+      val wanted = others(gs, w.group.getOrElse(u.primary))
+      val have = others(u.groups, u.primary)
+      for g in wanted.filter(g -> !have.contains(g))
+        out.write(s"addgroup $n ${quote(g)?}\n")
+      for g in have.filter(g -> !wanted.contains(g))
+        out.write(s"delgroup $n ${quote(g)?}\n")
+    _ -> ()
+  Ok(out.text)
+
+// The script writing standard input as the `authorized_keys` of the user `n`: `~/.ssh` made if
+// missing, owned by the user and its primary group, mode 0700, and the file staged beside its place,
+// mode 0600, then moved over it. A `~/.ssh` that is a symlink is refused rather than written through.
+private keysScript(n: string) -> string = script(
+  s"n=$n\n" + entryLines(
+    "passwd"
+  ) + "h=$(printf '%s\\n' \"$e\" | cut -d: -f6)\n"
+    + "g=$(id -gn \"$n\")\n"
+    + "if [ -z \"$h\" ] || [ ! -d \"$h\" ]; then echo \"fettle: the home directory of $n does not exist\" >&2; exit 1; fi\n"
+    + "if [ -L \"$h/.ssh\" ]; then echo \"fettle: $h/.ssh is a symlink\" >&2; exit 1; fi\n"
+    + "if [ ! -d \"$h/.ssh\" ]; then mkdir \"$h/.ssh\"; fi\n"
+    + "chown -h \"$n:$g\" \"$h/.ssh\"\n"
+    + "chmod 0700 \"$h/.ssh\"\n"
+    + "t=$(mktemp \"$h/.ssh/.fettle.XXXXXX\")\n"
+    + "trap 'rm -f \"$t\"' EXIT\n"
+    + "cat >\"$t\"\n"
+    + "chown \"$n:$g\" \"$t\"\n"
+    + "chmod 0600 \"$t\"\n"
+    + "mv -f \"$t\" \"$h/.ssh/authorized_keys\"\n"
+    + "trap - EXIT\n"
+)

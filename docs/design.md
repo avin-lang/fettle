@@ -1106,3 +1106,44 @@ user.
     refuses rather than proceeding; `apply` exits 0 when everything applied and 1 when anything
     failed. Each changed, failed or skipped resource and each action prints a progress line
     `host  changed  kind title` as it ends. Review with the user.
+42. **Account tools are chosen by the probe, not by facts**: `useradd` on the `PATH` or in
+    `/usr/sbin` or `/sbin` means the shadow utilities (Debian, Ubuntu, the RHEL family, and Alpine
+    with `shadow` installed), otherwise busybox's `adduser`/`addgroup`/`deluser`/`delgroup`, as decision
+    35 chose the hash tool. busybox has no `usermod` or `groupmod`, so on it a change of a user's
+    `uid`, `group`, `shell` or `home`, or of a group's `gid`, cannot be planned and names the
+    `shadow` package; groups are joined and left with `addgroup`/`delgroup`. Entries come from
+    `getent`, else `awk` over `/etc/passwd` and `/etc/group`; groups from `id -Gn`. Review with the user.
+43. **A user's fields**: names are 1–32 ASCII characters, a letter or `_` first, then letters,
+    digits, `_ . -`, with an optional final `$`. `groups` is exclusive and compared as a set, the
+    primary group left out of both sides. `system` and a group's `system` act only at creation; a
+    new user gets a home directory (`useradd -m`) unless it is a system user declaring neither a
+    `home` nor keys. A changed `home` is `usermod -d` without moving the files. Removal is
+    `userdel`/`deluser` and never removes the home directory. Review with the user.
+44. **`authorizedKeys`** is exclusive and compared as a set of lines (order, repeats, blank lines and
+    a CRLF make no difference); `[]` with no file is in sync. The file is written staged beside
+    itself in `~/.ssh` (0700) at 0600, both owned by the user and its primary group; a `~/.ssh`
+    that is a symlink is refused, not written through. Review with the user.
+45. **`password`** is a crypt(3) hash (`$…`, or a locked `!…`/`*`), refused otherwise, so a plain
+    password is never set by mistake. The probe prints the SHA-256 of the hash in `/etc/shadow`,
+    never the hash, and the comparison is against the SHA-256 of the declared one; it is set by
+    `chpasswd -e` with `name:hash` on standard input, never in an argument. An unreadable
+    `/etc/shadow` makes a declared password unplannable. Review with the user.
+46. **A command runs when every guard it has says so** (`creates` absent, `unless` failing, `onlyIf`
+    succeeding); with no guard it runs every time when `always`, otherwise only as its `run` action.
+    `always` beside a guard changes nothing. A guard is run in the batch probe with no standard
+    input and its output ignored; status 126 or 127 (it could not be run) makes the command
+    unplannable rather than read as an answer. A command to run is the operation `Run`, marked `!`
+    (always) or `>` (guards), counted among the plan's actions, and not probed again after it
+    runs: its exit status is its outcome. The `run` action checks the guards first and exits 0
+    when they say no, so a command its own guards just ran is not run again by a trigger. `run` is
+    required (`E0245`, the code for any required field). Review with the user.
+47. **`as` runs a command, and its guards, through `su -s /bin/sh <user> -c <line>`**, which needs a
+    root login (anything else cannot be planned until `become` exists). Review with the user.
+48. **`download`** is titled by its path, with `url` (`https`, `http`, `ftp` or `file`, one line) and
+    `sha256` (64 hex digits, any case) required, and `owner`, `group`, `mode` as a file's (mode
+    0644 when not declared and nothing is replaced). The probe is the file's plus which of `curl`
+    and `wget` the host has; the fetch goes to `mktemp` beside the target, is hashed, and a mismatch
+    exits before the move, so the target is untouched. A file that matches needs no fetcher.
+    Review with the user.
+49. **A field may be named `group`** although `group` is the inventory's word, as a resource's kind
+    may (decision 23); `user`'s `group = "staff"` had been a syntax error. Review with the user.

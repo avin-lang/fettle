@@ -3,7 +3,7 @@ module dev.avinlang.fettle.report
 import avin.diff.{diffLines, renderUnified}
 
 import dev.avinlang.fettle.engine.{
-  Applied, Changed, Create, Entry, Failed, Modify, Op, Outcome, Plan, PlannedAction, Remove, Skipped, Unchanged
+  Applied, Changed, Create, Entry, Failed, Modify, Op, Outcome, Plan, PlannedAction, Remove, Run, Skipped, Unchanged
 }
 
 import dev.avinlang.fettle.facts.{Facts}
@@ -41,11 +41,14 @@ private planLine(mark: string, id: ResourceId, description: string) -> string
   val padded = if label.charCount < labelWidth then label.padEnd(labelWidth) else label + "  "
   s"  $mark $padded$description\n"
 
-// The mark of an operation: `+` create, `~` change, `-` remove.
+// The mark of an operation: `+` create, `~` change, `-` remove, `!` a command that runs every time,
+// `>` one its guards say will run.
 private mark(op: Op) -> string = op match
   Create -> "+"
   Modify -> "~"
   Remove -> "-"
+  Run(true) -> "!"
+  Run(false) -> ">"
   _ -> " "
 
 // The hunks of a unified diff of `before` and `after` with no context lines, without the `---` and
@@ -101,7 +104,7 @@ showPlan(plans: Vector[Plan]) -> string
   val creates = plans.map(p -> p.count(Create)).sum
   val changes = plans.map(p -> p.count(Modify)).sum
   val removes = plans.map(p -> p.count(Remove)).sum
-  val actions = plans.map(p -> p.actions.length).sum
+  val actions = plans.map(p -> p.actions.length + p.commandRuns).sum
   val errors = plans.map(p -> p.errors).sum
   out.write(
     s"\nPlan: ${counted(plans.length, "host")}; $creates to create, $changes to change, $removes to remove, ${counted(actions, "action")}."

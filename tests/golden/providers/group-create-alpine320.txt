@@ -1,0 +1,5 @@
+## addgroup -S -g 1050 admins
+set -e
+addgroup -S -g 1050 admins
+## input
+## end

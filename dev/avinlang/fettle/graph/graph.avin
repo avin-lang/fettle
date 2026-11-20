@@ -191,7 +191,7 @@ class GraphBuilder
     var k = 0
     for node in nodes
       val kind = node.id.kind
-      if kind == "file" || kind == "directory" || kind == "symlink"
+      if kind == "file" || kind == "directory" || kind == "symlink" || kind == "download"
         parentDirectory(node.id.title) match
           Some(i) -> order(i, k, Parent, node.span)
           None -> ()

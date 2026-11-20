@@ -37,6 +37,11 @@ readPending(text: string) -> Vector[Pending]
       _ -> ()
   out.toVector
 
+// Whether `op` runs a command.
+runs(op: Op) -> bool = op match
+  Run(_) -> true
+  _ -> false
+
 // One resource of a plan: what it needs, or why it cannot be planned.
 data Entry(node: Node, delta: Result[Delta, string])
 
@@ -74,6 +79,9 @@ impl Plan
 
   // The number of resources that cannot be planned.
   errors -> int = entries.count(e -> e.op.isEmpty)
+
+  // The number of commands that are to run.
+  commandRuns -> int = entries.count(e -> e.op.exists(o -> runs(o)))
 
   // Whether applying the plan would change anything.
   hasWork -> bool = entries.exists(e -> e.changing) || !actions.isEmpty || !dropped.isEmpty
@@ -312,12 +320,13 @@ class Engine(
       run(s) match
         Some(f) -> return Failed(f)
         None -> ()
-    val after = probeOne(provider, node) match
-      Ok(d) -> d
-      Err(e) -> return Failed(Failure(s"it cannot be verified: $e", "", "", []))
-    if !after.inSync
-      val what = if after.summary.nonEmpty then after.summary else after.changes.map(c -> c.field).mkString(", ")
-      return Failed(Failure(s"it did not converge: $what", "", "", []))
+    if !runs(delta.op)
+      val after = probeOne(provider, node) match
+        Ok(d) -> d
+        Err(e) -> return Failed(Failure(s"it cannot be verified: $e", "", "", []))
+      if !after.inSync
+        val what = if after.summary.nonEmpty then after.summary else after.changes.map(c -> c.field).mkString(", ")
+        return Failed(Failure(s"it did not converge: $what", "", "", []))
     for t in triggers
       if !fired.contains((t.target, t.action)) then fired += (t.target, t.action)
     Changed

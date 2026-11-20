@@ -1,0 +1,5 @@
+## groupmod -g 1050 admins
+set -e
+groupmod -g 1050 admins
+## input
+## end

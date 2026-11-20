@@ -1,0 +1,392 @@
+module tests
+
+import avin.crypto
+import avin.encoding
+import avin.fs
+
+import dev.avinlang.fettle.engine.{CommandProvider, DownloadProvider, InSync, Run, commandLine}
+import dev.avinlang.fettle.graph.{BoolV, CommandV, Graph, GraphBuilder, ModeV, Node, PathV, SecretV, StrV, Value}
+import dev.avinlang.fettle.report.{showApplied}
+import dev.avinlang.fettle.shell.{Output}
+
+// The `command` and `download` providers: commands and their guards run on this machine, the lines
+// a command runs as another user, and downloads fetched from `file://` URLs with `curl`.
+
+// The shell text `text` as a command.
+shc(text: string) -> Value = CommandV(text, [], None, true)
+
+// A `command` titled `title`.
+command(title: string, fields: List[(string, Value)], user: string = "") -> Node =
+  resourceOf("command", title, fields, user)
+
+// The SHA-256 of `text` in hexadecimal.
+sha(text: string) -> string = encoding.toHex(crypto.sha256(text.utf8.toVector))
+
+// The lines of a plan's text after the heading, up to the blank line before the summary.
+bodyOf(text: string) -> string = text.lines.drop(1).takeWhile(l -> l.nonEmpty).mkString("\n")
+
+// The summary line of a plan's text.
+summaryOf(text: string) -> string = text.lines.last
+
+// --- command ---------------------------------------------------------------------------------------
+
+@test("a command with `always` runs on every apply and is shown with `!`")
+alwaysRuns()
+  val dir = scratchDir("always")
+  val g = graphOf([command("c", [("run", shc(s"echo x >>${sq(dir)}/log")), ("always", BoolV(true))])])
+  val p = planWith(engineIn(dir), g)
+  assertEq(bodyOf(planText(p, dir)), " ! command c runs every time")
+  assertEq(summaryOf(planText(p, dir)), "Plan: 1 host; 0 to create, 0 to change, 0 to remove, 1 action.")
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(outcomesOf(applyWith(engineIn(dir), g)), "changed")
+  assertEq(textAt(s"$dir/log"), "x\nx\n")
+  _ = fs.removeDirAll(dir)
+
+@test("`creates` runs a command until its path exists, shown with `>`")
+createsGuard()
+  val dir = scratchDir("creates")
+  val g = graphOf([command("c", [("run", shc(s"touch ${sq(dir)}/done")), ("creates", PathV(s"$dir/done"))])])
+  val p = planWith(engineIn(dir), g)
+  assertEq(bodyOf(planText(p, dir)), " > command c /T/done does not exist")
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = shOut(s"rm -f ${sq(dir)}/done; ln -s /nonexistent ${sq(dir)}/done")
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("`unless` runs a command while it fails, and `onlyIf` while it succeeds")
+unlessAndOnlyIf()
+  val dir = scratchDir("unless")
+  val flag = s"$dir/flag"
+  val u = graphOf([command("c", [("run", shc(s"touch ${sq(flag)}")), ("unless", shc(s"test -e ${sq(flag)}"))])])
+  assertEq(bodyOf(planText(planWith(engineIn(dir), u), dir)), " > command c `unless` failed with status 1")
+  assertEq(outcomesOf(applyWith(engineIn(dir), u)), "changed")
+  assertEq(planWith(engineIn(dir), u).hasWork, false)
+  val o = graphOf([command("d", [("run", shc(s"rm ${sq(flag)}")), ("onlyIf", shc(s"test -e ${sq(flag)}"))])])
+  assertEq(bodyOf(planText(planWith(engineIn(dir), o), dir)), " > command d `onlyIf` succeeded")
+  assertEq(outcomesOf(applyWith(engineIn(dir), o)), "changed")
+  assertEq(planWith(engineIn(dir), o).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("a command runs only when every guard it has says so, in each combination")
+guardCombinations()
+  val dir = scratchDir("guards")
+  for c in [false, true]
+    for u in [false, true]
+      for o in [false, true]
+        _ = shOut(s"rm -f ${sq(dir)}/c ${sq(dir)}/u ${sq(dir)}/o")
+        if c then _ = shOut(s"touch ${sq(dir)}/c")
+        if u then _ = shOut(s"touch ${sq(dir)}/u")
+        if o then _ = shOut(s"touch ${sq(dir)}/o")
+        val g = graphOf(
+          [
+            command(
+              "c",
+              [
+                ("run", shc("true")),
+                ("creates", PathV(s"$dir/c")),
+                ("unless", shc(s"test -e ${sq(dir)}/u")),
+                ("onlyIf", CommandV("test", [StrV("-e"), StrV(s"$dir/o")], None, false))
+              ]
+            )
+          ]
+        )
+        val p = planWith(engineIn(dir), g)
+        val wanted = !c && !u && o
+        assertEq(p.entries(0).op, Some(if wanted then Run(false) else InSync))
+        if wanted
+          assertEq(
+            bodyOf(planText(p, dir)),
+            " > command c /T/c does not exist, `unless` failed with status 1, `onlyIf` succeeded"
+          )
+  _ = fs.removeDirAll(dir)
+
+@test("a guard that cannot be run makes the command one that cannot be planned")
+guardNotFound()
+  val dir = scratchDir("noguard")
+  val g = graphOf(
+    [command("c", [("run", shc("true")), ("unless", CommandV("fettle-no-such-program", [], None, false))])]
+  )
+  val line = bodyOf(planText(planWith(engineIn(dir), g), dir))
+  assert(line.startsWith(" x command c cannot be planned: the `unless` command could not be run (status 127)"))
+  val o = graphOf([command("c", [("run", shc("true")), ("onlyIf", shc("exit 126"))])])
+  assert(
+    bodyOf(planText(planWith(engineIn(dir), o), dir)).contains("the `onlyIf` command could not be run (status 126)")
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("a command's standard input is a string or a secret, and a secret step hides its errors")
+commandStdin()
+  val dir = scratchDir("stdin")
+  val out = s"$dir/out"
+  val given = CommandV("sh", [StrV("-c"), StrV(s"cat >${sq(out)}")], Some(StrV("hello\nwörld\n")), false)
+  _ = applyWith(engineIn(dir), graphOf([command("c", [("run", given), ("always", BoolV(true))])]))
+  assertEq(textAt(out), "hello\nwörld\n")
+  val secret = CommandV("sh", [StrV("-c"), StrV(s"cat >${sq(out)}")], Some(SecretV("literal", [StrV("s3cret")])), false)
+  _ = applyWith(engineIn(dir), graphOf([command("c", [("run", secret), ("always", BoolV(true))])]))
+  assertEq(textAt(out), "s3cret")
+  val failing = CommandV("sh", [StrV("-c"), StrV("cat >&2; exit 3")], Some(SecretV("literal", [StrV("s3cret")])), false)
+  val a = applyWith(engineIn(dir), graphOf([command("c", [("run", failing), ("always", BoolV(true))])]))
+  val report = showApplied([a], 1)
+  assert(report.contains("(not shown: the step handles a secret)"))
+  assert(!report.contains("s3cret"))
+  assertEq(
+    probeText(
+      CommandProvider(),
+      command("c", [("run", shc("true")), ("unless", CommandV("true", [], Some(StrV("x")), false))])
+    ),
+    "error: an `unless` command takes no standard input"
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("a command that fails fails its resource with its status and error output")
+commandFails()
+  val dir = scratchDir("fails")
+  val a = applyWith(
+    engineIn(dir),
+    graphOf([command("c", [("run", shc("echo boom >&2; exit 4")), ("always", BoolV(true))])])
+  )
+  assertEq(outcomesOf(a), "failed")
+  val report = showApplied([a], 1)
+  assert(report.contains("exited with status 4"))
+  assert(report.contains("| boom"))
+  _ = fs.removeDirAll(dir)
+
+@test("a command runs as another user through su, which needs a root login")
+commandAs()
+  assertEq(commandLine(CommandV("createdb", [StrV("app")], None, false), ""), Ok("createdb app"))
+  assertEq(
+    commandLine(CommandV("createdb", [StrV("app")], None, false), "postgres"),
+    Ok("su -s /bin/sh postgres -c 'createdb app'")
+  )
+  assertEq(
+    commandLine(shc("createdb app"), "postgres"),
+    Ok("su -s /bin/sh postgres -c '/bin/sh -c '\\''createdb app'\\'''")
+  )
+  assert(commandLine(shc("x"), "-root").isErr)
+  assert(commandLine(CommandV("", [], None, false), "").isErr)
+  val node = command(
+    "db",
+    [("run", CommandV("createdb", [StrV("app")], None, false)), ("unless", shc("psql -lqt | grep -q app"))],
+    "postgres"
+  )
+  assertEq(probeText(CommandProvider(), node, testContext()), "error: running as `postgres` needs a root login")
+  assertGolden("command-as-probe.txt", probeText(CommandProvider(), node))
+
+@test("the probe of every guard, and the action, which checks the guards before it runs")
+commandScripts()
+  val node = command(
+    "migrate",
+    [
+      ("run", CommandV("/usr/local/bin/migrate", [StrV("--all"), StrV("it's")], None, false)),
+      ("creates", PathV("/var/lib/app/migrated")),
+      ("unless", shc("app status | grep -q current")),
+      ("onlyIf", CommandV("test", [StrV("-x"), StrV("/usr/local/bin/migrate")], None, false))
+    ]
+  )
+  assertGolden("command-probe.txt", probeText(CommandProvider(), node))
+  val steps = CommandProvider().action(node, "run", rootContext()).map(ss -> ss.map(s -> stepText(s)).mkString(""))
+  assertGolden("command-action.txt", steps.getOrElse("(error)"))
+  assertEq(CommandProvider().action(node, "stop", rootContext()).map(_ -> ""), Err("`command` has no action `stop`"))
+  assertEq(probeText(CommandProvider(), command("c", [("always", BoolV(true))])), "error: a command needs `run`")
+
+// The file `<dir>/conf` holding `content`, and the command `c` of `fields`, which `on conf -> run`
+// triggers.
+confAndCommand(dir: string, fields: List[(string, Value)], content: string) -> Graph
+  val b = GraphBuilder()
+  val c = b.add(node("file", s"$dir/conf", 1, [("content", StrV(content))]))
+  val r = b.add(command("c", fields))
+  b.trigger([c], r, "run", at(2))
+  b.finish()
+
+@test("a triggered command runs as the action; its guards still decide, so it runs once")
+commandTriggered()
+  val dir = scratchDir("triggered")
+  val log = s"$dir/log"
+  val marker = s"$dir/marker"
+  val graph = (fields: List[(string, Value)], content: string) -> confAndCommand(dir, fields, content)
+  val plain: List[(string, Value)] = [("run", shc(s"echo ran >>${sq(log)}"))]
+  val p = planWith(engineIn(dir), graph(plain, "v1\n"))
+  assertEq(bodyOf(planText(p, dir)), " + file /T/conf 1 line\n > command c run (file /T/conf)")
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed ok")
+  assertEq(textAt(log), "ran\n")
+  val guarded: List[(string, Value)] = [
+    ("run", shc(s"echo ran >>${sq(log)}; touch ${sq(marker)}")),
+    ("creates", PathV(marker))
+  ]
+  val q = planWith(engineIn(dir), graph(guarded, "v2\n"))
+  assertEq(
+    bodyOf(planText(q, dir)),
+    " ~ file /T/conf\n @@ -1 +1 @@\n -v1\n +v2\n > command c /T/marker does not exist\n > command c run (file /T/conf)"
+  )
+  assertEq(outcomesOf(engineIn(dir).apply(q)), "changed changed")
+  assertEq(textAt(log), "ran\nran\n")
+  _ = applyWith(engineIn(dir), graph(guarded, "v3\n"))
+  assertEq(textAt(log), "ran\nran\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a command needs `run`, and a download its `url` and `sha256`, at `fettle check`")
+requiredFields()
+  assertEq(
+    errorsIn(["role r()", "  command \"c\"", "    always = true"]),
+    "main.fettle:2:3 E0245 a `command` needs the field `run`"
+  )
+  assertEq(
+    errorsIn(["role r()", "  download \"/usr/local/bin/x\"", "    url = \"https://example.com/x\""]),
+    "main.fettle:2:3 E0245 a `download` needs the field `sha256`"
+  )
+  assertEq(
+    errorsIn(["role r()", "  download \"/usr/local/bin/x\"", "    mode = 0o755"]),
+    "main.fettle:2:3 E0245 a `download` needs the field `url`\nmain.fettle:2:3 E0245 a `download` needs the field `sha256`"
+  )
+
+// --- download --------------------------------------------------------------------------------------
+
+// A `download` of `url` to `path`, pinned to `hash`.
+download(path: string, url: string, hash: string, fields: List[(string, Value)] = []) -> Node =
+  resourceOf("download", path, ("url", StrV(url)) :: ("sha256", StrV(hash)) :: fields)
+
+@test("a download is fetched, checked and moved into place with its mode, then left alone")
+downloadCreates()
+  val dir = scratchDir("download")
+  _ = fs.writeText(s"$dir/src", "#!/bin/sh\necho tool\n")
+  _ = fs.createDirAll(s"$dir/bin")
+  val g = graphOf(
+    [download(s"$dir/bin/tool", s"file://$dir/src", sha("#!/bin/sh\necho tool\n"), [("mode", ModeV(0o755))])]
+  )
+  val p = planWith(engineIn(dir), g)
+  assertEq(bodyOf(planText(p, dir)), " + download /T/bin/tool from file:///T/src, mode 0755")
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(textAt(s"$dir/bin/tool"), "#!/bin/sh\necho tool\n")
+  assertEq(modeOf(s"$dir/bin/tool"), "755")
+  assertEq(entriesOf(s"$dir/bin"), "tool\n")
+  assertEq(planWith(engineIn(dir), g).hasWork, false)
+  _ = fs.removeDirAll(dir)
+
+@test("a download whose hash does not match fails and leaves the target as it was")
+downloadMismatch()
+  val dir = scratchDir("mismatch")
+  _ = fs.writeText(s"$dir/src", "tampered\n")
+  val g = graphOf([download(s"$dir/tool", s"file://$dir/src", sha("genuine\n"))])
+  val a = applyWith(engineIn(dir), g)
+  assertEq(outcomesOf(a), "failed")
+  assert(showApplied([a], 1).contains(s"gave a file whose SHA-256 is ${sha("tampered\n")}, not ${sha("genuine\n")}"))
+  assertEq(entriesOf(dir), "src\n")
+  _ = fs.writeText(s"$dir/tool", "old\n")
+  val b = applyWith(engineIn(dir), g)
+  assertEq(outcomesOf(b), "failed")
+  assertEq(textAt(s"$dir/tool"), "old\n")
+  assertEq(entriesOf(dir), "src\ntool\n")
+  _ = fs.removeDirAll(dir)
+
+@test("a download whose file differs is fetched again; a mode alone is changed in place")
+downloadChanges()
+  val dir = scratchDir("dlchange")
+  _ = fs.writeText(s"$dir/src", "v2\n")
+  _ = fs.writeText(s"$dir/tool", "v1\n")
+  val g = graphOf([download(s"$dir/tool", s"file://$dir/src", sha("v2\n"))])
+  val p = planWith(engineIn(dir), g)
+  assertEq(
+    bodyOf(planText(p, dir)),
+    s" ~ download /T/tool fetch file:///T/src (sha256 ${sha("v1\n").slice(0, 12)} -> ${sha("v2\n").slice(0, 12)})"
+  )
+  assertEq(outcomesOf(engineIn(dir).apply(p)), "changed")
+  assertEq(textAt(s"$dir/tool"), "v2\n")
+  _ = shOut(s"chmod 644 ${sq(dir)}/tool")
+  val inode = inodeOf(s"$dir/tool")
+  val m = graphOf([download(s"$dir/tool", s"file://$dir/src", sha("v2\n").toUpper, [("mode", ModeV(0o700))])])
+  assertEq(bodyOf(planText(planWith(engineIn(dir), m), dir)), " ~ download /T/tool mode 0644 -> 0700")
+  assertEq(outcomesOf(applyWith(engineIn(dir), m)), "changed")
+  assertEq(modeOf(s"$dir/tool"), "700")
+  assertEq(inodeOf(s"$dir/tool"), inode)
+  _ = fs.removeDirAll(dir)
+
+@test("a download replaces a symlink, and refuses a directory at its path")
+downloadReplaces()
+  val dir = scratchDir("dlreplace")
+  _ = fs.writeText(s"$dir/src", "x\n")
+  _ = shOut(s"ln -s ${sq(dir)}/src ${sq(dir)}/tool")
+  val g = graphOf([download(s"$dir/tool", s"file://$dir/src", sha("x\n"))])
+  assertEq(bodyOf(planText(planWith(engineIn(dir), g), dir)), " ~ download /T/tool replace the symlink with a download")
+  assertEq(outcomesOf(applyWith(engineIn(dir), g)), "changed")
+  assertEq(linkOf(s"$dir/tool"), "")
+  assertEq(textAt(s"$dir/tool"), "x\n")
+  _ = fs.createDirAll(s"$dir/d")
+  val d = graphOf([download(s"$dir/d", s"file://$dir/src", sha("x\n"))])
+  assertEq(
+    bodyOf(planText(planWith(engineIn(dir), d), dir)),
+    " x download /T/d cannot be planned: the path is a directory, not a file"
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("a download's URL and hash are checked, and a host with neither curl nor wget cannot fetch")
+downloadChecks()
+  val absent = [printed("type=absent\n"), printed("fetcher=curl\n")]
+  val good = sha("x")
+  val plan = (url: string, hash: string) -> planned(
+    deltaOf(DownloadProvider(), download("/usr/local/bin/x", url, hash), absent)
+  )
+  assertEq(plan("https://example.com/x", good), "+ from https://example.com/x")
+  assertEq(plan("https://example.com/x", good.toUpper), "+ from https://example.com/x")
+  assertEq(plan("https://example.com/x", "abc"), "error: `sha256` is 64 hexadecimal digits")
+  assertEq(plan("https://example.com/x", good.slice(0, 63) + "g"), "error: `sha256` is 64 hexadecimal digits")
+  assertEq(plan("https://example.com/x", ""), "error: `sha256` is 64 hexadecimal digits")
+  assertEq(plan("/srv/x", good), "error: `/srv/x` is not an https, http, ftp or file URL")
+  assertEq(plan("-o/etc/passwd", good), "error: `-o/etc/passwd` is not an https, http, ftp or file URL")
+  assertEq(
+    plan("https://example.com/a b", good),
+    "error: the URL `https://example.com/a b` holds a space or a control character"
+  )
+  val none = (probe: string) -> planned(
+    deltaOf(
+      DownloadProvider(),
+      download("/usr/local/bin/x", "https://e.com/x", good),
+      [printed(probe), printed("fetcher=none\n")]
+    )
+  )
+  assertEq(none("type=absent\n"), "error: the host has neither `curl` nor `wget` to fetch with")
+  assertEq(none(s"type=file\nattrs=644 root root\nsize=1\nsha256=$good\n"), "=")
+  assertEq(
+    none(s"type=file\nattrs=644 root root\nsize=1\nsha256=${sha("y")}\n"),
+    "error: the host has neither `curl` nor `wget` to fetch with"
+  )
+
+// The steps of the download `node` from the probe outputs `outputs`.
+downloadSteps(node: Node, outputs: Vector[Output]) -> string =
+  stepsText(DownloadProvider(), node, deltaOf(DownloadProvider(), node, outputs))
+
+@test("a download's steps fetch with curl or wget, as root setting its owner and group")
+downloadScripts()
+  val node = download(
+    "/usr/local/bin/caddy",
+    "https://example.com/caddy?os=linux&arch=amd64",
+    sha("caddy"),
+    [("owner", StrV("root")), ("group", StrV("root")), ("mode", ModeV(0o755))]
+  )
+  val steps = (fetcher: string, probe: string) -> downloadSteps(node, [printed(probe), printed(s"fetcher=$fetcher\n")])
+  assertGolden("download-curl.txt", steps("curl", "type=absent\n"))
+  assertGolden("download-wget.txt", steps("wget", s"type=file\nattrs=755 root root\nsize=9\nsha256=${sha("old")}\n"))
+  assertEq(
+    steps("curl", s"type=file\nattrs=700 root root\nsize=9\nsha256=${sha("caddy")}\n"),
+    "## chmod 0755 /usr/local/bin/caddy\nset -e\nchmod 0755 /usr/local/bin/caddy\n## input\n## end\n"
+  )
+  assertGolden("download-probe.txt", probeText(DownloadProvider(), node))
+
+@test("a download is ordered after its directory and its owner")
+downloadOrdering()
+  val g = graphText(
+    [
+      "role r()",
+      "  download \"/opt/app/bin/app\"",
+      "    url = \"https://example.com/app\"",
+      "    sha256 = \"" + sha("app") + "\"",
+      "    owner = \"app\"",
+      "  directory \"/opt/app/bin\"",
+      "  user \"app\"",
+      "    system = true"
+    ]
+  )
+  val d = g.indexOf("download \"/opt/app/bin/app\"")
+  assert(d >= 0)
+  assert(g.indexOf("directory \"/opt/app/bin\"") < d)
+  assert(g.indexOf("user \"app\"") < d)

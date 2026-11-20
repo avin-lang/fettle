@@ -1,0 +1,441 @@
+module tests
+
+import dev.avinlang.fettle.engine.{
+  Engine, GroupProvider, UserProvider, accountName, builtinProvider, groupEntry, passwdEntry
+}
+
+import dev.avinlang.fettle.graph.{BoolV, IntV, ListV, Node, PathV, SecretV, StrV, Value}
+import dev.avinlang.fettle.report.{outcomeWord, showPlan}
+import dev.avinlang.fettle.shell.{Output}
+
+// The `user` and `group` providers against probe output recorded on Debian 12, Ubuntu 24.04,
+// Alpine 3.20 and Rocky 9: what each declaration needs, and the exact scripts that make it so.
+
+// A password hash, and the SHA-256 the probe of `debian12-user-ana` reports for it.
+val anaHash: string = "$y$j9T$7Pq0V3KQ1m3o9JxR8kz7r.$Cq3n9ho0pW6Qx3oGVgk3tqkL2b7n8m4Uo9F5YQx0kA1"
+
+val laptopKey: string = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGJ5bGFwdG9wa2V5 ana@laptop"
+val phoneKey: string = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHBob25la2V5aGVyZQ ana@phone"
+val newKey: string = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINRhYmxldGtleQ ana@tablet"
+
+strs(items: List[string]) -> Value = ListV(items.map(s -> StrV(s)))
+
+secretText(t: string) -> Value = SecretV("literal", [StrV(t)])
+
+user(name: string, fields: List[(string, Value)] = []) -> Node = resourceOf("user", name, fields)
+
+group(name: string, fields: List[(string, Value)] = []) -> Node = resourceOf("group", name, fields)
+
+// What the user provider finds `fields` to need on the host whose probe printed `fixture`.
+userPlan(fixture: string, name: string, fields: List[(string, Value)]) -> string =
+  planned(deltaOf(UserProvider(), user(name, fields), [probeFixture(fixture)]))
+
+// The steps the user provider writes for `fields` against `fixture`.
+userSteps(fixture: string, name: string, fields: List[(string, Value)]) -> string
+  val n = user(name, fields)
+  stepsText(UserProvider(), n, deltaOf(UserProvider(), n, [probeFixture(fixture)]))
+
+groupPlan(output: Output, name: string, fields: List[(string, Value)] = []) -> string =
+  planned(deltaOf(GroupProvider(), group(name, fields), [output]))
+
+groupSteps(output: Output, name: string, fields: List[(string, Value)] = []) -> string
+  val n = group(name, fields)
+  stepsText(GroupProvider(), n, deltaOf(GroupProvider(), n, [output]))
+
+// Everything `ana` has on Debian, declared as it is.
+val anaAsIs: List[(string, Value)] = [
+  ("uid", IntV(1001)),
+  ("group", StrV("ana")),
+  ("groups", strs(["sudo", "users"])),
+  ("shell", PathV("/bin/bash")),
+  ("home", PathV("/home/ana")),
+  ("authorizedKeys", strs([laptopKey, phoneKey])),
+  ("password", secretText(anaHash))
+]
+
+// --- names and entries -----------------------------------------------------------------------------
+
+@test("a user or group name is a letter or `_`, then letters, digits, `_`, `.`, `-`, and a final `$`")
+accountNames()
+  for ok in ["ana", "_apt", "www-data", "svc.app", "MACHINE$", "a", "a23456789012345678901234567890bc"]
+    assertEq(accountName(ok), Ok(ok))
+  for bad in [
+    "",
+    "-rf",
+    "1000",
+    "0day",
+    "a:b",
+    "a b",
+    "ünï",
+    "a/b",
+    "$",
+    ".hidden",
+    "a\n",
+    "a234567890123456789012345678901bc"
+  ]
+    assert(accountName(bad).isErr)
+  assert(probeText(UserProvider(), user("-rf")).startsWith("error: `-rf` is not a user or group name"))
+  assert(probeText(GroupProvider(), group("a:b")).startsWith("error: `a:b` is not a user or group name"))
+  assertEq(
+    planned(
+      deltaOf(UserProvider(), user("ana", [("groups", strs(["ok", "bad name"]))]), [probeFixture("debian12-user-ana")])
+    ),
+    "error: `bad name` is not a user or group name: a letter or `_`, then letters, digits, `_`, `.` or `-`, at most 32"
+  )
+
+@test("a passwd entry keeps a Unicode comment, and empty fields, and a malformed one is refused")
+passwdEntries()
+  val zoe = passwdEntry("zoe:x:1003:1003:Zoë Ångström-Øberg 🎻,Raum 3,,:/home/zoe:/bin/bash").getOrElse(
+    fail("no entry")
+  )
+  assertEq(zoe.gecos, "Zoë Ångström-Øberg 🎻,Raum 3,,")
+  assertEq(s"${zoe.name} ${zoe.uid} ${zoe.gid} ${zoe.home} ${zoe.shell}", "zoe 1003 1003 /home/zoe /bin/bash")
+  val bare = passwdEntry("a:x:1:2:::").getOrElse(fail("no entry"))
+  assertEq(s"[${bare.gecos}][${bare.home}][${bare.shell}]", "[][][]")
+  assert(passwdEntry("a:x:1:2:/home/a:/bin/sh").isErr)
+  assert(passwdEntry("a:x:one:2::/home/a:/bin/sh").isErr)
+  assert(passwdEntry("").isErr)
+  assertEq(userPlan("debian12-user-zoe", "zoe", [("shell", PathV("/bin/bash")), ("uid", IntV(1003))]), "=")
+  assertEq(userPlan("debian12-user-zoe", "zoe", [("shell", PathV("/bin/zsh"))]), "~ shell /bin/bash -> /bin/zsh")
+
+@test("a group entry lists its members, none when the field is empty")
+groupEntries()
+  assertEq(
+    groupEntry("admins:x:1002:ana,bo").map(g -> s"${g.name} ${g.gid} ${g.members.mkString("|")}"),
+    Ok("admins 1002 ana|bo")
+  )
+  assertEq(groupEntry("users:x:100:").map(g -> g.members.length), Ok(0))
+  assert(groupEntry("users:x:100").isErr)
+  assert(groupEntry("users:x:x:").isErr)
+
+// --- group -----------------------------------------------------------------------------------------
+
+@test("the group probe's text")
+groupProbe()
+  assertGolden("group-probe.txt", probeText(GroupProvider(), group("admins")))
+
+@test("a missing group is created with its gid and as a system group, by groupadd or addgroup")
+groupCreates()
+  val fields: List[(string, Value)] = [("gid", IntV(1050)), ("system", BoolV(true))]
+  assertEq(groupPlan(probeFixture("debian12-group-absent"), "admins", fields), "+ gid 1050, system")
+  assertEq(groupPlan(probeFixture("rocky9-group-absent"), "admins"), "+")
+  assertGolden("group-create-debian12.txt", groupSteps(probeFixture("debian12-group-absent"), "admins", fields))
+  assertGolden("group-create-rocky9.txt", groupSteps(probeFixture("rocky9-group-absent"), "admins"))
+  assertGolden("group-create-alpine320.txt", groupSteps(printed("tools=busybox\ngroup=\n"), "admins", fields))
+
+@test("a group as declared needs nothing; a different gid is changed by groupmod, not by busybox")
+groupChanges()
+  assertEq(groupPlan(probeFixture("debian12-group-admins"), "admins"), "=")
+  assertEq(groupPlan(probeFixture("debian12-group-admins"), "admins", [("gid", IntV(1002))]), "=")
+  assertEq(groupPlan(probeFixture("debian12-group-admins"), "admins", [("system", BoolV(true))]), "=")
+  assertEq(groupPlan(probeFixture("ubuntu2404-group-sudo"), "sudo", [("gid", IntV(27))]), "=")
+  assertEq(groupPlan(probeFixture("debian12-group-admins"), "admins", [("gid", IntV(1050))]), "~ gid 1002 -> 1050")
+  assertGolden(
+    "group-gid-debian12.txt",
+    groupSteps(probeFixture("debian12-group-admins"), "admins", [("gid", IntV(1050))])
+  )
+  assertEq(
+    groupPlan(probeFixture("alpine320-group-wheel"), "wheel", [("gid", IntV(11))]),
+    "error: busybox cannot change a group's gid; install the `shadow` package for `groupmod`"
+  )
+  assertEq(groupPlan(probeFixture("alpine320-group-wheel"), "wheel", [("gid", IntV(10))]), "=")
+  assertEq(
+    groupPlan(probeFixture("debian12-group-admins"), "admins", [("gid", IntV(-1))]),
+    "error: `gid` is -1, outside 0 to 4294967294"
+  )
+
+@test("a group declared absent is removed when it exists, by groupdel or delgroup")
+groupRemoves()
+  val gone: List[(string, Value)] = [("present", BoolV(false))]
+  assertEq(groupPlan(probeFixture("debian12-group-admins"), "admins", gone), "-")
+  assertEq(groupPlan(probeFixture("debian12-group-absent"), "admins", gone), "=")
+  assertEq(
+    groupSteps(probeFixture("debian12-group-admins"), "admins", gone),
+    "## groupdel admins\nset -e\ngroupdel admins\n## input\n## end\n"
+  )
+  assertEq(
+    groupSteps(probeFixture("alpine320-group-wheel"), "wheel", gone),
+    "## delgroup wheel\nset -e\ndelgroup wheel\n## input\n## end\n"
+  )
+
+@test("a host with neither the shadow utilities nor busybox cannot have a group or user made")
+noAccountTools()
+  assertEq(
+    groupPlan(printed("tools=none\ngroup=\n"), "admins"),
+    "error: the host has neither the shadow utilities (`useradd`) nor busybox's `adduser`"
+  )
+  assertEq(groupPlan(printed("tools=none\ngroup=admins:x:5:\n"), "admins"), "=")
+  assertEq(
+    planned(deltaOf(UserProvider(), user("ana"), [printed("tools=none\npasswd=\n")])),
+    "error: the host has neither the shadow utilities (`useradd`) nor busybox's `adduser`"
+  )
+  assertEq(
+    planned(deltaOf(GroupProvider(), group("admins"), [Output(2, "", "sh: syntax error")])),
+    "error: the probe failed with status 2: sh: syntax error"
+  )
+
+// --- user ------------------------------------------------------------------------------------------
+
+@test("the user probe reads keys and the password hash only when they are declared")
+userProbes()
+  assertGolden("user-probe-plain.txt", probeText(UserProvider(), user("ana", [("shell", PathV("/bin/bash"))])))
+  assertGolden("user-probe-full.txt", probeText(UserProvider(), user("ana", anaAsIs)))
+  val gone = probeText(UserProvider(), user("ana", [("present", BoolV(false)), ("authorizedKeys", strs([laptopKey]))]))
+  assert(!gone.contains("authorized_keys"))
+  assert(!gone.contains("/etc/shadow"))
+  assert(!probeText(UserProvider(), user("ana", anaAsIs)).contains("$y$"))
+
+@test("a user as declared needs nothing, on every distribution")
+userInSync()
+  assertEq(userPlan("debian12-user-ana", "ana", anaAsIs), "=")
+  assertEq(userPlan("debian12-user-ana", "ana", []), "=")
+  assertEq(
+    userPlan("ubuntu2404-user-ubuntu", "ubuntu", [("groups", strs(["adm", "cdrom", "sudo", "dip", "lxd"]))]),
+    "="
+  )
+  assertEq(userPlan("alpine320-user-ana", "ana", [("shell", PathV("/bin/ash")), ("groups", strs(["wheel"]))]), "=")
+  assertEq(userPlan("rocky9-user-ana", "ana", [("password", StrV("!!")), ("groups", strs(["wheel"]))]), "=")
+
+@test("groups are compared as a set: order, repeats and the primary group make no difference")
+groupsAsASet()
+  assertEq(userPlan("debian12-user-ana", "ana", [("groups", strs(["users", "sudo", "ana", "sudo"]))]), "=")
+  assertEq(userPlan("debian12-user-ana", "ana", [("groups", strs(["users", "sudo"])), ("group", StrV("ana"))]), "=")
+
+@test("groups are exclusive: groups not listed are left, and an empty list leaves every one")
+groupsExclusive()
+  assertEq(userPlan("debian12-user-ana", "ana", [("groups", strs(["sudo", "admins"]))]), "~ groups +admins -users")
+  assertEq(userPlan("debian12-user-ana", "ana", [("groups", strs([]))]), "~ groups -sudo -users")
+  assertGolden("user-groups-empty-debian12.txt", userSteps("debian12-user-ana", "ana", [("groups", strs([]))]))
+  assertEq(
+    userPlan("ubuntu2404-user-ubuntu", "ubuntu", [("groups", strs(["adm", "sudo"]))]),
+    "~ groups -cdrom -dip -lxd"
+  )
+  assertGolden(
+    "user-groups-ubuntu2404.txt",
+    userSteps("ubuntu2404-user-ubuntu", "ubuntu", [("groups", strs(["adm", "sudo"]))])
+  )
+  assertEq(userPlan("alpine320-user-ana", "ana", [("groups", strs(["wheel", "docker"]))]), "~ groups +docker")
+  assertEq(userPlan("alpine320-user-ana", "ana", [("groups", strs([]))]), "~ groups -wheel")
+  assertGolden(
+    "user-groups-alpine320.txt",
+    userSteps(
+      "alpine320-user-ana",
+      "ana",
+      [("groups", strs(["docker", "audio"]))]
+    ) + userSteps("alpine320-user-ana", "ana", [("groups", strs([]))])
+  )
+
+@test("every field of an existing user changes through one usermod")
+userChangesEveryField()
+  val fields: List[(string, Value)] = [
+    ("uid", IntV(1005)),
+    ("group", StrV("staff")),
+    ("groups", strs(["sudo", "admins"])),
+    ("shell", PathV("/bin/zsh")),
+    ("home", PathV("/srv/ana")),
+    ("authorizedKeys", strs([laptopKey, newKey])),
+    ("password", secretText("$6$salt$newhash"))
+  ]
+  assertEq(
+    userPlan("debian12-user-ana", "ana", fields),
+    "~ uid 1001 -> 1005, group ana -> staff, groups +admins -users, shell /bin/bash -> /bin/zsh, home /home/ana -> /srv/ana, password: (secret) changed, authorizedKeys +1 -1"
+  )
+  assertGolden("user-modify-debian12.txt", userSteps("debian12-user-ana", "ana", fields))
+  for (f, v, plan) in [
+    ("uid", IntV(1005), "~ uid 1000 -> 1005"),
+    ("shell", PathV("/bin/zsh"), "~ shell /bin/bash -> /bin/zsh"),
+    ("home", PathV("/srv/ana"), "~ home /home/ana -> /srv/ana"),
+    ("group", StrV("wheel"), "~ group ana -> wheel")
+  ]
+    assertEq(userPlan("rocky9-user-ana", "ana", [(f, v)]), plan)
+
+@test("busybox cannot change a user's uid, primary group, shell or home")
+busyboxLimits()
+  for (f, v) in [
+    ("uid", IntV(1005)),
+    ("group", StrV("wheel")),
+    ("shell", PathV("/bin/bash")),
+    ("home", PathV("/srv/ana"))
+  ]
+    assertEq(
+      userPlan("alpine320-user-ana", "ana", [(f, v)]),
+      s"error: busybox cannot change a user's `$f`; install the `shadow` package for `usermod`"
+    )
+
+@test("a new user is made by useradd on glibc distributions and by adduser on Alpine")
+userCreates()
+  val fields: List[(string, Value)] = [
+    ("uid", IntV(1001)),
+    ("group", StrV("admins")),
+    ("groups", strs(["sudo", "admins"])),
+    ("shell", PathV("/bin/bash")),
+    ("authorizedKeys", strs([laptopKey, phoneKey])),
+    ("password", secretText(anaHash))
+  ]
+  assertEq(
+    userPlan("debian12-user-absent", "ana", fields),
+    "+ uid 1001, group admins, groups sudo, shell /bin/bash, 2 keys, password (secret)"
+  )
+  assertGolden("user-create-debian12.txt", userSteps("debian12-user-absent", "ana", fields))
+  assertGolden("user-create-alpine320.txt", userSteps("alpine320-user-absent", "ana", fields))
+  assertEq(userPlan("debian12-user-absent", "ana", []), "+")
+  assertEq(
+    userSteps("debian12-user-absent", "ana", []),
+    "## useradd -m ana\nset -e\nuseradd -m ana\n## input\n## end\n"
+  )
+
+@test("a system user gets no home directory unless it declares one or keys")
+systemUsers()
+  assertEq(userPlan("debian12-user-absent", "caddy", [("system", BoolV(true))]), "+ system")
+  assertEq(
+    userSteps("debian12-user-absent", "caddy", [("system", BoolV(true))]),
+    "## useradd -r -M caddy\nset -e\nuseradd -r -M caddy\n## input\n## end\n"
+  )
+  assertEq(
+    userSteps("debian12-user-absent", "caddy", [("system", BoolV(true)), ("home", PathV("/var/lib/caddy"))]),
+    "## useradd -r -d /var/lib/caddy -m caddy\nset -e\nuseradd -r -d /var/lib/caddy -m caddy\n## input\n## end\n"
+  )
+  assertEq(
+    userSteps("alpine320-user-absent", "caddy", [("system", BoolV(true))]),
+    "## adduser -D -S -H caddy\nset -e\nadduser -D -S -H caddy\n## input\n## end\n"
+  )
+  assertEq(userPlan("debian12-user-ana", "ana", [("system", BoolV(true))]), "=")
+
+@test("authorized keys are exclusive, compared as a set, and written 0700/0600 as the user")
+authorizedKeys()
+  assertEq(userPlan("debian12-user-ana", "ana", [("authorizedKeys", strs([phoneKey, laptopKey, phoneKey]))]), "=")
+  assertEq(userPlan("debian12-user-ana", "ana", [("authorizedKeys", strs([laptopKey]))]), "~ authorizedKeys -1")
+  assertEq(userPlan("debian12-user-ana", "ana", [("authorizedKeys", strs([]))]), "~ authorizedKeys -2")
+  assertEq(
+    userPlan("debian12-user-ana", "ana", [("authorizedKeys", strs([laptopKey, phoneKey, newKey]))]),
+    "~ authorizedKeys +1"
+  )
+  assertGolden("user-keys-empty-debian12.txt", userSteps("debian12-user-ana", "ana", [("authorizedKeys", strs([]))]))
+  assertEq(userPlan("alpine320-user-ana", "ana", [("authorizedKeys", strs([]))]), "=")
+  assertEq(userPlan("alpine320-user-ana", "ana", [("authorizedKeys", strs([newKey]))]), "~ authorizedKeys +1")
+  assertGolden("user-keys-alpine320.txt", userSteps("alpine320-user-ana", "ana", [("authorizedKeys", strs([newKey]))]))
+
+@test("keys with the wrong modes or owner are rewritten, and a symlinked ~/.ssh is refused")
+authorizedKeysAttributes()
+  val base = "tools=shadow\npasswd=ana:x:1001:1001::/home/ana:/bin/bash\nprimary=ana\ngroups=ana\n"
+  val keys: List[(string, Value)] = [("authorizedKeys", strs([laptopKey]))]
+  val probe = (ssh: string, file: string) -> planned(
+    deltaOf(UserProvider(), user("ana", keys), [printed(base + s"ssh=$ssh\nkeys=$file\n--\n$laptopKey\r\n\n")])
+  )
+  assertEq(probe("700 ana ana", "600 ana ana"), "=")
+  assertEq(probe("755 ana ana", "600 ana ana"), "~ authorizedKeys ownership and modes")
+  assertEq(probe("700 ana ana", "644 ana ana"), "~ authorizedKeys ownership and modes")
+  assertEq(probe("700 root root", "600 ana ana"), "~ authorizedKeys ownership and modes")
+  assertEq(probe("700 ana ana", "600 root ana"), "~ authorizedKeys ownership and modes")
+  assertEq(probe("link", ""), "error: `/home/ana/.ssh` is a symlink, which fettle does not write through")
+  assertEq(probe("other", ""), "error: `/home/ana/.ssh` is not a directory")
+  assertEq(probe("700 ana ana", "other"), "error: `/home/ana/.ssh/authorized_keys` is not a file")
+  for bad in ["", "ssh-ed25519 AAAA\nssh-rsa BBBB"]
+    assert(
+      planned(
+        deltaOf(UserProvider(), user("ana", [("authorizedKeys", strs([bad]))]), [probeFixture("debian12-user-ana")])
+      ).startsWith("error: an authorized key is")
+    )
+
+@test("a password is a hash compared by its SHA-256 on the host, and a secret one is never shown")
+passwords()
+  assertEq(userPlan("debian12-user-ana", "ana", [("password", secretText(anaHash))]), "=")
+  assertEq(userPlan("debian12-user-ana", "ana", [("password", StrV(anaHash))]), "=")
+  val other = "$6$rounds=5000$salt$K8mq0"
+  val plan = userPlan("debian12-user-ana", "ana", [("password", secretText(other))])
+  assertEq(plan, "~ password: (secret) changed")
+  assertEq(userPlan("debian12-user-ana", "ana", [("password", StrV(other))]), "~ password changed")
+  val steps = userSteps("debian12-user-ana", "ana", [("password", secretText(other))])
+  assertEq(
+    steps,
+    s"## chpasswd -e (the password of ana) (withheld)\nset -e\nchpasswd -e\n## input\nana:$other\n## end\n"
+  )
+  val shown = UserProvider().steps(
+    user("ana", [("password", secretText(other))]),
+    deltaOf(
+      UserProvider(),
+      user("ana", [("password", secretText(other))]),
+      [probeFixture("debian12-user-ana")]
+    ).getOrElse(fail("no delta")),
+    rootContext()
+  ).getOrElse([]).map(s -> s.shown + s.script).mkString("")
+  assert(!shown.contains(other))
+  assert(!plan.contains("$6$"))
+  assertEq(userPlan("rocky9-user-ana", "ana", [("password", StrV("!"))]), "~ password changed")
+  assertEq(
+    userPlan("debian12-user-ana", "ana", [("password", secretText("hunter2"))]),
+    "error: `password` is a crypt(3) hash (`$y$…`, `$6$…`, made with `mkpasswd`), not a password"
+  )
+  assertEq(
+    userPlan("debian12-user-ana", "ana", [("password", StrV("$6$a:b"))]),
+    "error: `password` holds a `:` or a line end, which no password hash does"
+  )
+  val unreadable = "tools=shadow\npasswd=ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\nprimary=ubuntu\ngroups=ubuntu\npassword=unreadable\n"
+  assertEq(
+    planned(deltaOf(UserProvider(), user("ubuntu", [("password", StrV("$6$x"))]), [printed(unreadable)])),
+    "error: `/etc/shadow` cannot be read, so the password cannot be compared"
+  )
+  assertEq(
+    planned(
+      deltaOf(
+        UserProvider(),
+        user("ana", [("password", SecretV("env FETTLE_NO_SUCH_VARIABLE", []))]),
+        [probeFixture("debian12-user-ana")]
+      )
+    ),
+    "error: the secret from the environment variable `FETTLE_NO_SUCH_VARIABLE` is not set"
+  )
+
+@test("a user declared absent is removed by userdel or deluser, its home directory kept")
+userRemoves()
+  val gone: List[(string, Value)] = [("present", BoolV(false))]
+  assertEq(userPlan("debian12-user-ana", "ana", gone), "-")
+  assertEq(userPlan("debian12-user-absent", "ana", gone), "=")
+  assertEq(userSteps("debian12-user-ana", "ana", gone), "## userdel ana\nset -e\nuserdel ana\n## input\n## end\n")
+  assertEq(userSteps("alpine320-user-ana", "ana", gone), "## deluser ana\nset -e\ndeluser ana\n## input\n## end\n")
+  assertEq(userPlan("debian12-user-ana", "ana", [("present", BoolV(false)), ("password", StrV("not a hash"))]), "-")
+
+@test("a user's primary group declared in the same program is ordered before the user")
+primaryGroupOrdering()
+  val g = graphText(
+    [
+      "role r()", "  user \"ana\"", "    group = \"staff\"", "    groups = [\"admins\"]", "  group \"admins\"",
+      "  group \"staff\"", "    gid = 1050"
+    ]
+  )
+  assertEq(
+    g,
+    "1. group \"admins\"\n2. group \"staff\"\n     gid = 1050\n3. user \"ana\"\n     group = \"staff\"\n     groups = [\"admins\"]\nedges:\n  group staff -> user ana: the user is in that group\n  group admins -> user ana: the user is in that group\n"
+  )
+
+@test("a host's plan and apply of a group and a user, through a transport replaying Debian 12")
+engineOnDebian()
+  val graph = graphOf(
+    [
+      group("admins", [("gid", IntV(1050))]),
+      user("ana", [("groups", strs(["admins"])), ("shell", PathV("/bin/bash")), ("authorizedKeys", strs([laptopKey]))])
+    ]
+  )
+  val created = "tools=shadow\npasswd=ana:x:1001:1001::/home/ana:/bin/bash\nprimary=ana\ngroups=ana admins\nssh=700 ana ana\nkeys=600 ana ana\n--\n"
+    + laptopKey
+    + "\n"
+  val t = Scripted(
+    [
+      [printed(""), probeFixture("debian12-group-absent"), probeFixture("debian12-user-absent")],
+      [printed("tools=shadow\ngroup=admins:x:1050:\n")],
+      [probeFixture("debian12-user-absent")],
+      [printed(created)]
+    ]
+  )
+  val e = Engine(t, rootContext(), "/var/lib/fettle/pending", k -> builtinProvider(k))
+  val p = e.plan("web1", facts("debian12"), graph).getOrElse(fail("no plan"))
+  assertEq(
+    squeeze(showPlan([p])),
+    "web1 (debian 12, amd64)\n + group admins gid 1050\n + user ana groups admins, shell /bin/bash, 1 key\n\nPlan: 1 host; 2 to create, 0 to change, 0 to remove, 0 actions.\n"
+  )
+  val a = e.apply(p)
+  assertEq(a.outcomes.map(o -> outcomeWord(o)).mkString(" "), "changed changed")
+  val session = StringWriter()
+  for (s, i) in t.scripts.zipWithIndex
+    session.write(s"## script $i\n$s\n## input\n${t.inputs(i)}## end\n")
+  assertGolden("engine-debian12-session.txt", session.text)

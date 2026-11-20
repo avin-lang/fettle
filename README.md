@@ -7,8 +7,8 @@ a plan, and changes only that.
 
 The design is [`docs/design.md`](docs/design.md). The front end exists: the lexer, the parser, the
 checker, the evaluator into the resource graph, templates and the formatter, the facts of this
-machine through a local transport, and the engine that plans and applies `file`, `directory` and
-`symlink` resources on this machine. No remote host is contacted yet.
+machine through a local transport, and the engine that plans and applies `file`, `directory`,
+`symlink`, `user`, `group`, `command` and `download` resources on this machine. No remote host is contacted yet.
 
 ```
 fettle check [<vault options>] [dir]
@@ -36,7 +36,8 @@ The modules under the front end:
 - `transport`: the `Transport` trait (run a script with bytes on its standard input, close) and
   `LocalTransport`, which runs `/bin/sh` here; the SSH transport is built against the same trait.
 - `engine`: the plan, apply and verify loop over any `Transport`, the `Provider` trait each kind
-  implements, the `file`, `directory` and `symlink` providers, and the pending-trigger record.
+  implements, the `file`, `directory`, `symlink`, `user`, `group`, `command` and `download`
+  providers, and the pending-trigger record.
 
 ## Plan and apply
 
@@ -55,11 +56,23 @@ me (macos 15.1, arm64)
 Plan: 1 host; 1 to create, 1 to change, 0 to remove, 0 actions.
 ```
 
-Only `file`, `directory` and `symlink` have providers so far; the kinds with actions (`service`,
-`command`) come next, and until then a resource of another kind is an `x` line.
+The kinds, and which have a provider so far (a resource of a kind without one is an `x` line):
+
+| Kind | Title | Fields | Provider |
+|---|---|---|---|
+| `file` | path | `content` (string or secret), `source`, `owner`, `group`, `mode`, `validate`, `present` | yes |
+| `directory` | path | `owner`, `group`, `mode`, `present` | yes |
+| `symlink` | path | `target`, `present` | yes |
+| `user` | name | `present`, `uid`, `group`, `groups` (exclusive), `shell`, `home`, `system`, `authorizedKeys` (exclusive), `password` (a crypt hash, string or secret) | shadow utilities or busybox |
+| `group` | name | `present`, `gid`, `system` | shadow utilities or busybox |
+| `command` | name | `run` (required), `creates`, `unless`, `onlyIf`, `always`; action `run` | yes |
+| `download` | path | `url`, `sha256` (both required), `owner`, `group`, `mode` | `curl` or `wget` |
+| `package` | name | `present`, `version`, `refresh` | not yet |
+| `service` | name | `running`, `enabled`; actions `start`, `stop`, `restart`, `reload` | not yet |
 
 `+` creates, `~` changes (a line diff for text under 256 KiB), `-` removes (`present = false`), `>`
-runs an action a trigger asked for, `x` is a resource that cannot be planned. A secret is shown as
+runs an action a trigger asked for or a command its guards say will run, `!` a command that runs
+every time, `x` is a resource that cannot be planned. A secret is shown as
 `(secret)`, never its content. `plan` exits 0 when nothing would change, 2 when something would, 1 on
 an error.
 

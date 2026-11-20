@@ -1,0 +1,5 @@
+## usermod -G adm,sudo ubuntu
+set -e
+usermod -G adm,sudo ubuntu
+## input
+## end

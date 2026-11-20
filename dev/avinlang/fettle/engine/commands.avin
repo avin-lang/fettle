@@ -1,0 +1,221 @@
+module dev.avinlang.fettle.engine
+
+import dev.avinlang.fettle.graph.{BoolV, CommandV, Node, SecretV, StrV, Value}
+import dev.avinlang.fettle.shell.{Command, Output, Program, Shell, quote}
+
+// The providers of `command` and `download`.
+//
+// A command's probe is its guards: `creates` (a path that, existing, says the command has done its
+// work), `unless` (a command whose success says the same) and `onlyIf` (a command whose failure
+// says it is not wanted). It runs when every guard it has says so; with none it runs every time
+// when `always = true`, and otherwise only as the action `run` a trigger names. A command runs as
+// the login, or as the user `as` names through `su`, which needs a root login.
+//
+// A download's probe is the file's (the same as `file`'s) and which of `curl` and `wget` the host
+// has. It is fetched into a temporary file beside its place, its SHA-256 checked, its owner, group
+// and mode set, and only then moved over the target, so a hash that does not match leaves the
+// target as it was.
+
+// The line of shell running the command `c` (a `cmd(…)` or an `sh"…"`) as `user` (empty for the
+// login): a program as its quoted words, shell text through `/bin/sh -c`, and for a user `su -s
+// /bin/sh <user> -c <line>`.
+commandLine(c: Value, user: string) -> Result[string, string]
+  val line = c match
+    CommandV(t, _, _, true) -> s"/bin/sh -c ${quote(t)?}"
+    CommandV(program, args, _, false) -> Program(program, args.map(a -> word(a)).toVector).render?
+    other -> return Err(s"`${other.shown}` is not a command")
+  if user.isEmpty then Ok(line) else Ok(s"su -s /bin/sh ${quote(accountName(user)?)?} -c ${quote(line)?}")
+
+// The bytes the command `c` takes on its standard input, and whether they are a secret.
+private stdinOf(c: Value, ctx: Context) -> Result[(Array[byte], bool), string] = c match
+  CommandV(_, _, None, _) -> Ok((Array.empty[byte](), false))
+  CommandV(_, _, Some(StrV(t)), _) -> Ok((t.utf8, false))
+  CommandV(_, _, Some(SecretV(source, parts)), _) -> Ok((ctx.secretOf(SecretV(source, parts))?.utf8, true))
+  CommandV(_, _, Some(other), _) -> Err(s"a command's standard input is a string or a secret, not `${other.shown}`")
+  other -> Err(s"`${other.shown}` is not a command")
+
+// A command's guards, each as a line of shell: the `creates` path as a shell word, and the `unless`
+// and `onlyIf` commands.
+private data Guards(creates: Option[string], unless: Option[string], onlyIf: Option[string])
+
+impl Guards
+  // Whether the command has no guard.
+  none -> bool = creates.isEmpty && unless.isEmpty && onlyIf.isEmpty
+
+  // The probe commands of the guards, in the order `creates`, `unless`, `onlyIf`.
+  probes -> Vector[Command]
+    val out = Buffer[Command]()
+    creates.foreach(p -> out += Shell(s"if [ -e $p ] || [ -L $p ]; then echo creates=yes; else echo creates=no; fi"))
+    unless.foreach(l -> out += Shell(l))
+    onlyIf.foreach(l -> out += Shell(l))
+    out.toVector
+
+  // The lines that end a script with status 0 when a guard says the command is not to run.
+  skipLines -> string
+    val out = StringWriter()
+    creates.foreach(p -> out.write(s"if [ -e $p ] || [ -L $p ]; then exit 0; fi\n"))
+    unless.foreach(l -> out.write(s"if $l </dev/null >/dev/null 2>&1; then exit 0; fi\n"))
+    onlyIf.foreach(l -> out.write(s"if ! $l </dev/null >/dev/null 2>&1; then exit 0; fi\n"))
+    out.text
+
+// The guards of the command `node`, checked.
+private guardsOf(node: Node, ctx: Context) -> Result[Guards, string]
+  if node.user.nonEmpty && !ctx.root then return Err(s"running as `${node.user}` needs a root login")
+  val creates = text(node, "creates") match
+    Some(p) -> Some(quote(p)?)
+    None -> None
+  Ok(Guards(creates, guardLine(node, "unless")?, guardLine(node, "onlyIf")?))
+
+// The guard `name` of `node` as a line of shell, if set; a guard takes no standard input.
+private guardLine(node: Node, name: string) -> Result[Option[string], string] = node.field(name) match
+  None -> Ok(None)
+  Some(CommandV(_, _, Some(_), _)) -> Err(s"an `$name` command takes no standard input")
+  Some(c) -> Ok(Some(commandLine(c, node.user)?))
+
+// The `run` command of `node`.
+private runOf(node: Node) -> Result[Value, string] = node.field("run") match
+  Some(c) -> Ok(c)
+  None -> Err("a command needs `run`")
+
+// The step running the command of `node`, after `before` (lines that may end the script first).
+private runStep(node: Node, before: string, ctx: Context) -> Result[Step, string]
+  val c = runOf(node)?
+  val line = commandLine(c, node.user)?
+  val (input, secret) = stdinOf(c, ctx)?
+  Ok(Step(before + line + "\n", input, line, secret))
+
+class CommandProvider(): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string]
+    _ = commandLine(runOf(node)?, node.user)?
+    Ok(guardsOf(node, ctx)?.probes)
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    val g = guardsOf(node, ctx)?
+    val none = Probed([], None)
+    if g.none
+      if flag(node, "always") then return Ok(Delta(Run(true), "runs every time", [], None, none))
+      return Ok(Delta(InSync, "", [], None, none))
+    if outputs.length != g.probes.length then return Err("the guards gave no output")
+    var at = 0
+    var runs = true
+    val why = Buffer[string]()
+    if g.creates.isDefined
+      val o = outputs(at)
+      at += 1
+      if !o.succeeded then return Err(s"the `creates` probe failed with status ${o.code}: ${o.stderr.trim}")
+      if readProbed(o.stdout).value("creates") == "yes" then runs = false
+      else why += s"${text(node, "creates").getOrElse("")} does not exist"
+    for (name, line) in [("unless", g.unless), ("onlyIf", g.onlyIf)]
+      if line.isDefined
+        val o = outputs(at)
+        at += 1
+        if o.code == 126 || o.code == 127
+          return Err(s"the `$name` command could not be run (status ${o.code}): ${o.stderr.trim}")
+        if name == "unless"
+          if o.succeeded then runs = false else why += s"`unless` failed with status ${o.code}"
+        else if o.succeeded then why += "`onlyIf` succeeded"
+        else runs = false
+    if runs then Ok(Delta(Run(false), why.mkString(", "), [], None, none)) else Ok(Delta(InSync, "", [], None, none))
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string] = Ok([runStep(node, "", ctx)?])
+
+  override action(node: Node, action: string, ctx: Context) -> Result[Vector[Step], string]
+    if action != "run" then return Err(s"`command` has no action `$action`")
+    Ok([runStep(node, guardsOf(node, ctx)?.skipLines, ctx)?])
+
+// --- download --------------------------------------------------------------------------------------
+
+// The probe printing `fetcher=curl`, `fetcher=wget` or `fetcher=none`: which the host fetches with.
+private val fetcherProbe: string =
+  "if command -v curl >/dev/null 2>&1; then echo fetcher=curl\n"
+    + "elif command -v wget >/dev/null 2>&1; then echo fetcher=wget\n"
+    + "else echo fetcher=none; fi"
+
+// The `url` of a download, checked: `https://`, `http://`, `ftp://` or `file://`, on one line.
+private urlOf(node: Node) -> Result[string, string]
+  val url = text(node, "url") match
+    Some(u) -> u
+    None -> return Err("a download needs a `url`")
+  val schemes = ["https://", "http://", "ftp://", "file://"]
+  if !schemes.exists(s -> url.startsWith(s)) then return Err(s"`$url` is not an https, http, ftp or file URL")
+  if url.exists(c -> int(c) <= 32 || int(c) == 127) then return Err(
+    s"the URL `$url` holds a space or a control character"
+  )
+  Ok(url)
+
+// The `sha256` of a download, checked as 64 hexadecimal digits, in lower case.
+private sha256Of(node: Node) -> Result[string, string]
+  val h = text(node, "sha256").getOrElse("").toLower
+  val hex = h.forall(c -> '0' <= c <= '9' || 'a' <= c <= 'f')
+  if h.byteLength != 64 || !hex then return Err("`sha256` is 64 hexadecimal digits")
+  Ok(h)
+
+// Whether the host can fetch: the probe found `curl` or `wget`.
+private fetchable(fetcher: string) -> Result[string, string] =
+  if fetcher == "curl" || fetcher == "wget" then Ok(fetcher) else Err(
+    "the host has neither `curl` nor `wget` to fetch with"
+  )
+
+// The first twelve digits of a SHA-256, as the plan shows it.
+private shortHash(h: string) -> string = if h.byteLength > 12 then h.slice(0, 12) else h
+
+class DownloadProvider(): Provider
+  override probes(node: Node, ctx: Context) -> Result[Vector[Command], string] = Ok(
+    [pathProbe(node.id.title, None)?, Shell(fetcherProbe)]
+  )
+
+  override delta(node: Node, outputs: Vector[Output], ctx: Context) -> Result[Delta, string]
+    val url = urlOf(node)?
+    val sha = sha256Of(node)?
+    if outputs.length != 2 then return Err("the probe gave no output")
+    val (f, probed) = found([outputs(0)])?
+    val fetcher = readProbed(outputs(1).stdout).value("fetcher")
+    val p = Probed(probed.entries ++ [("fetcher", fetcher)], None)
+    f.kind match
+      "absent" ->
+        _ = fetchable(fetcher)?
+        Ok(Delta(Create, ([s"from $url"] ++ declaredAttributes(node)).mkString(", "), [], None, p))
+      "link" ->
+        _ = fetchable(fetcher)?
+        Ok(Delta(Modify, "replace the symlink with a download", [FieldChange("type", "symlink", "file")], None, p))
+      "file" ->
+        val changes = Buffer[FieldChange]()
+        val words = Buffer[string]()
+        if f.sha256 != sha
+          _ = fetchable(fetcher)?
+          changes += FieldChange("sha256", f.sha256, sha)
+          words += s"fetch $url (sha256 ${shortHash(f.sha256)} -> ${shortHash(sha)})"
+        val attrs = attributeChanges(node, f)
+        changes ++= attrs
+        if !attrs.isEmpty then words += changesText(attrs)
+        if changes.isEmpty then Ok(Delta(InSync, "", [], None, p))
+        else Ok(Delta(Modify, words.mkString(", "), changes.toVector, None, p))
+      k -> Err(s"the path is ${kindWords(k)}, not a file")
+
+  override steps(node: Node, delta: Delta, ctx: Context) -> Result[Vector[Step], string]
+    val path = node.id.title
+    val p = quote(path)?
+    val f = foundIn(delta.current)?
+    val fetch = delta.op == Create || f.kind == "link" || delta.changes.exists(c -> c.field == "sha256")
+    if !fetch
+      val lines = changedAttributeLines(node, p, delta.changes)?
+      return Ok([Step(script(lines), Array.empty[byte](), lines.trim)])
+    val url = quote(urlOf(node)?)?
+    val sha = sha256Of(node)?
+    val get = if delta.current.value(
+      "fetcher"
+    ) == "curl" then s"curl -fsSL -o \"$$t\" $url" else s"wget -q -O \"$$t\" $url"
+    val body = StringWriter()
+    body.write(s"t=$$(mktemp ${quote(parentOf(path) + "/.fettle.XXXXXX")?})\n")
+    body.write("trap 'rm -f \"$t\"' EXIT\n")
+    body.write(get + "\n")
+    body.write(hashLines("cat \"$t\""))
+    body.write(s"if [ \"$$h\" != $sha ]; then\n")
+    body.write(s"  printf 'fettle: %s gave a file whose SHA-256 is %s, not %s\\n' $url \"$$h\" $sha >&2\n")
+    body.write("  exit 1\nfi\n")
+    val existing = if f.kind == "file" then Some(f) else None
+    body.write(attributeLines(node, "\"$t\"", existing, 420, ctx.root)?)
+    if f.kind == "link" then body.write(s"rm -f $p\n")
+    body.write(s"mv -f \"$$t\" $p\n")
+    body.write("trap - EXIT\n")
+    Ok([Step(script(body.text), Array.empty[byte](), s"fetch $url to $p")])

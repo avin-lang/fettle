@@ -1,0 +1,10 @@
+tools=shadow
+passwd=ana:x:1001:1001:Ana Lima,,,:/home/ana:/bin/bash
+primary=ana
+groups=ana sudo users
+password=c63c3473a4bcb89a8a4136383179c5b7253658c14b47fe06f29a49939eb31354
+ssh=700 ana ana
+keys=600 ana ana
+--
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGJ5bGFwdG9wa2V5 ana@laptop
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHBob25la2V5aGVyZQ ana@phone

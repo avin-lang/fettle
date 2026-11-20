@@ -1,0 +1,5 @@
+## usermod -G '' ana
+set -e
+usermod -G '' ana
+## input
+## end
